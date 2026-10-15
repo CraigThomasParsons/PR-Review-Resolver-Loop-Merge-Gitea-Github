@@ -57,8 +57,17 @@ would just keep re-claiming and re-failing forever. All five are addressed below
 the original design with footnotes, the claim/staleness/handoff section and verification plan
 were both revised to fix them structurally.
 
+### Mailbox revision
+
+Recovery notices now live in a durable, provider-independent worker mailbox owned by
+`prod-common.sh`. Agent-talk is optional transport, not a recovery prerequisite. This
+supersedes the earlier reset-on-read mutable prompt design.
+
 ## Decisions made this session (do not re-litigate)
 
+- **Worker mailbox:** local atomic files for v1, addressed by stable `worker_id`
+  (for example `ubuntu-cursor-1`), not provider name. Launchers deliver pending notices
+  through each provider's normal prompt input; native live inbox integration is unnecessary.
 - **Repo shape:** one shared repo/codebase, deployed as five systemd timer instances — not five
   separate repos.
 - **Job queue:** existing per-project Gitea issue/label queues, not a new unified queue.
@@ -116,9 +125,10 @@ agent-pool/
     prod-common.sh       # shared claim -> invoke -> verify -> release; provider-parameterized
     prod-claude.sh       # thin entrypoint, sources prod-common.sh
     prod-codex.sh
-    doctor.sh            # zero-LLM driver; only ever shells out to git/gitea-pr.py/tea/retalk
+    doctor.sh            # zero-LLM driver; uses deterministic helpers, systemctl and git/Gitea; optional retalk
   scripts/
     claim-record.py      # atomic per-job claim file; attempt_id fencing; reconciliation (see below)
+    mailbox.py           # atomic enqueue/pending/ack; stable worker IDs and message IDs
     effort-baseline.py   # parses pool.log -> rolling avg per provider; seeds at 2700s
     eligible.py           # cooldown-gated next-eligible selection (adapted from lease.py)
     record-cooldown.py    # single place cooldowns get written; called by both the EXIT trap and doctor.sh
@@ -139,8 +149,11 @@ agent-pool/
 
 Runtime state (not checked in), `~/.local/state/agent-pool/`:
 `pool.log` (same `date -Is [MODE] msg` format as `pr-loop.log`, keyed by `repo#issue` **and**
-`attempt_id` — see below), `claims/<repo>__<issue>.json`, `prompts/<provider>.txt` (the mutable
-file each service reads), `cooldowns.json`, `doctor.log`, `prod-<provider>.log`.
+`attempt_id` — see below), `claims/<repo>__<issue>.json`,
+`mailboxes/<worker_id>/<message_id>.json`, `cooldowns.json`, `doctor.log`,
+`prod-<provider>.log`. Prompt templates remain static; per-launch prompts are rendered
+from templates plus pending notices. Worker IDs are configured explicitly and stable
+across restarts; multiple workers using one provider have separate mailboxes.
 
 ## The claim / staleness / handoff design
 
@@ -160,6 +173,7 @@ reconciliation rule** that makes every partial-crash state self-healing on the n
 ```json
 {
   "version": 2, "repo_slug": "...", "issue_number": 42, "provider": "claude",
+  "worker_id": "ubuntu-claude-1",
   "attempt_id": "<uuid4>", "branch": "...", "worktree": "...",
   "claimed_at": "2026-10-16T09:00:00Z",
   "expected_deadline_at": "2026-10-16T09:45:00Z"
@@ -221,13 +235,16 @@ detail above shouldn't obscure it: on each 5-minute tick, for every claim record
 
 1. Reconcile label vs. record (table above); skip jobs that are already consistent and not
    expired.
-2. For a genuinely stale `agent:claimed` job (expired deadline, matching record, no terminal
-   line for *this* `attempt_id`): stop the stale systemd unit if still active (Ownership
-   fencing); inspect the worktree read-only for uncommitted work; `retalk send` a handoff note
-   to that provider's agent-talk inbox if an identity exists for it (log-and-skip otherwise —
-   see Prerequisites); relabel `agent:claimed` → `agent:ready` and delete the claim record;
-   call `record-cooldown.py` for that provider; overwrite `prompts/<provider>.txt` with
-   `reassigned.txt`.
+2. For a genuinely stale `agent:claimed` job (expired deadline, matching record, no
+   terminal line for this `attempt_id`): under the job lock, persist an idempotent
+   reassignment notice for its `worker_id` before removing recovery evidence. Stop
+   the stale unit if active and inspect the worktree read-only. Record its location
+   and observed WIP in the notice; record provider cooldown; relabel to `agent:ready`
+   and delete the matching claim. The notice records recovery progress so the next
+   doctor tick can finish an interrupted transition, even after claim deletion.
+   Only completed reassignments become deliverable. Optionally send a copy through
+   retalk; missing identity, missing CLI or delivery failure is logged and never
+   blocks recovery. Do not overwrite or consume a mutable provider prompt file.
 3. For the `agent:claimed`-with-no-record row: relabel straight to `agent:needs-human` instead —
    there's no deadline to evaluate, so no automatic decision is safe here.
 
@@ -265,12 +282,35 @@ the first thing to see it and never told the cooldown system — the doctor's co
 alone only covers *silent* (undetected-by-the-worker-itself) failures, not fast, self-detected
 ones.
 
-### Return-from-sick
+### Durable mailbox and return-from-sick
 
-Unchanged from the original draft, and still correct: the next time a reassigned provider's
-service fires, it reads `prompts/<provider>.txt` and resets it to the default claim prompt
-**immediately on read**, before doing any work — not after successful completion, which would
-leave the reassignment notice stuck repeating forever if the next run also failed.
+`mailbox.py` reuses same-directory atomic writes, fsync and advisory locks. Each notice
+contains `message_id`, `worker_id`, provider, repository, issue, superseded `attempt_id`,
+reason, worktree/branch references, creation time, recovery progress, and acknowledgment
+state. Enqueue is idempotent by worker + repository + issue + attempt + event kind.
+Pending notices are delivered oldest first; acknowledgments name exact message IDs.
+Acknowledged records remain available for audit. Read, render and spawn never delete them.
+
+Before invoking any provider, `prod-common.sh` reads that worker's pending completed
+notices and includes them in the normal prompt. Claude, Codex, Cursor, Agy and Grok use
+this same interface; only their CLI adapters differ. No native plugin, live session
+injection, retalk identity or model call is required to store or retrieve notices.
+A cooldown-skipped tick leaves them pending.
+
+The agent returns a structured receipt naming the supplied message IDs. The launcher
+validates it against this invocation's worker ID and supplied notices, then atomically
+acknowledges those IDs. Process startup or exit zero alone is not acknowledgment.
+Failed startup, missing/invalid receipt, or a crash before acknowledgment leaves notices
+pending for the next launch. Delivery is at least once: repeated message IDs must be
+harmless, including a crash after receipt but before acknowledgment. Receipt confirms
+reported acceptance, not proof of comprehension or job completion.
+
+Messages are informational. Ownership must be checked under the job lock at every
+controller-mediated completion, release and publication boundary. A superseded attempt
+cannot publish simply because it missed its notice; provider workers must not bypass
+those guarded publication paths. Late traps remain no-ops. Retalk is an optional copy
+for conversation/cross-machine notifications, never authority to claim or complete work.
+V1 mailboxes are local to the single pool host; distributed ownership is deferred.
 
 **Effort baseline ("scrum effort"):** `effort-baseline.py` parses `pool.log`'s paired
 spawned/terminal lines per provider (now attempt-scoped — see above), rolling average over the
@@ -305,7 +345,7 @@ StandardError=append:/home/craigpar/.local/state/agent-pool/prod-claude.log
 ```
 `prod-codex.timer` at `*:15:00`. `doctor.timer` at `*:0/5:00` (5-minute cadence, not hourly),
 `AccuracySec=30s`, `TimeoutStartSec=120`. `doctor.service`'s `ExecStart` must never invoke
-`claude`/`codex`/any LLM CLI — only `git`, `gitea-pr.py`, `tea`, `retalk` — this is the literal
+`claude`/`codex`/any LLM CLI — only deterministic Python/shell helpers, `systemctl`, `git`, `gitea-pr.py`, `tea`, and optional `retalk` — this is the literal
 mechanism by which it can't itself be rate-limited.
 
 ## Prerequisites (block parts of this, don't block starting)
@@ -313,11 +353,11 @@ mechanism by which it can't itself be rate-limited.
 - **Immediate, before any new build:** relabel the ~12 audit-identified PRs to
   `review:requested` for a real re-review (separate small action, not part of this plan's
   build).
-- **Blocks Agy/Grok/Cursor specifically, not Claude/Codex:** `retalk init` for each (none have
-  an agent-talk identity today); confirm Grok's actual non-interactive invocation shape (never
+- **Blocks Agy/Grok/Cursor specifically, not Claude/Codex:** confirm Grok's actual non-interactive invocation shape (never
   tested this session, only referenced secondhand); confirm Cursor's edit-capable headless mode
   (only its read-only `ask` mode was tested); confirm Agy's auth state (subscription vs.
   pay-per-token — user said they'd check, not yet confirmed).
+- **Optional notifications:** agent-talk identities are not a prerequisite for any provider.
 - **Doesn't block anything, but worth deciding before `doctor.sh`'s worktree inspection grows
   teeth:** whether a stalled job's uncommitted WIP should be mechanically rescued (plain
   `git commit`+push to a rescue branch, no LLM) before releasing the claim. Read-only inspection
@@ -326,7 +366,7 @@ mechanism by which it can't itself be rate-limited.
 ## Phasing
 
 - **Phase 0** (now): relabel the audited PRs; nothing else below depends on this.
-- **Phase 1**: `claim-record.py`, `effort-baseline.py` (seed-only), the `agent:*` labels,
+- **Phase 1**: `claim-record.py`, `mailbox.py`, `effort-baseline.py` (seed-only), the `agent:*` labels,
   `prod-common.sh` + `prod-claude.sh` + `prod-codex.sh`, their timer/service pairs, `pool.log`.
   Run a day or two against a low-stakes test repo to accumulate real duration history before
   trusting the computed average over the seed.
@@ -355,15 +395,15 @@ Claim it with an injectable `AGENT_POOL_FAKE_DEADLINE_OFFSET` forcing `expected_
 into the past, relabel to `agent:claimed`, then deliberately exit without invoking any CLI and
 without the trap running (simulating `kill -9`) — "went dark with no self-release." Fire
 `doctor.sh` once by hand and assert: staleness detected; stale systemd unit check attempted;
-worktree inspected without crashing; agent-talk send attempted and logged (even if skipped for a
-missing identity); relabeled back to `agent:ready`; claim record deleted;
-`prompts/<provider>.txt` now holds `reassigned.txt`'s content; a cooldown recorded. Fire
-`prod-claude.sh` by hand and assert it reads the reassigned prompt, resets the prompt file to
-default *immediately on read*, and proceeds to claim normally. Clean up the disposable issue.
+worktree inspected without crashing; durable notice recorded for the correct worker;
+relabeled back to `agent:ready`; claim record deleted; cooldown recorded. Assert this
+works with retalk absent. Fire `prod-claude.sh`: its rendered prompt includes the pending
+notice, which remains pending until a valid acknowledgment receipt is recorded.
+Clean up the disposable issue.
 
 **Scenario 2 — concurrent completion vs. reassignment (ownership fencing).** Claim a job,
-capture its `attempt_id`. Force the deadline into the past and fire `doctor.sh`, which writes a
-new claim (new `attempt_id`) and relabels. *Then*, simulate the original attempt's EXIT trap
+capture its `attempt_id`. Force the deadline into the past and fire `doctor.sh` to requeue it, then let a replacement worker acquire a
+new claim (new `attempt_id`). *Then*, simulate the original attempt's EXIT trap
 firing late, using its stale captured `attempt_id`. Assert: the trap's re-read sees a mismatch
 and no-ops (does not relabel, does not delete the new claim record, does not touch
 `cooldowns.json`); the doctor's reassignment is the one that stands.
@@ -392,6 +432,16 @@ same provider's *next* prod firing while the cooldown is still active: assert it
 runs first, the probe is made to fail too, and the service skips claiming entirely for that
 tick (no job touched, no second failure logged) — rather than claiming a real job and
 immediately failing it the same way again.
+
+**Scenario 6 — mailbox delivery and crash recovery.** Use stub provider adapters for all
+five providers. Assert identical notice delivery without retalk or native inbox hooks;
+failed spawn and missing/invalid receipt retain notices; valid receipt acknowledges only
+supplied IDs. Crash after receipt before ack and verify safe redelivery. Two workers with
+the same provider must never read or acknowledge each other's notices. Repeated doctor
+ticks enqueue one notice per attempt. Inject crashes before/after label release and claim
+deletion: recovery progress remains durable and unfinished notices are not delivered as
+completed reassignments. Optional retalk failure never prevents local recovery. Verify
+superseded attempts cannot complete or publish even without reading a notice.
 
 Also build `DOCTOR_DRY_RUN=1` (mirroring `pr-loop.sh`'s `DRY_RUN`) so the doctor can run in
 observation-only mode against real current claims for a while before being trusted to execute
