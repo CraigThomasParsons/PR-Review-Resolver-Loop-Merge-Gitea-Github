@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""
+Read the hidden markers the PR review and resolve loops leave on a pull request.
+
+The review worker ends its posted comment with one HTML comment:
+
+    <!-- pulse-review:v1 head=<40 hex sha> findings=<int> -->
+
+The loop treats that marker, not GitHub's own review state, as the record of what was
+reviewed. A PR whose latest marker names the current head has been reviewed already and is
+skipped, so a re-run of the loop, a duplicate label event, or a crashed-and-restarted tick can
+never post a second review of the same commit.
+
+The resolve worker ends its comment with the companion:
+
+    <!-- pulse-resolve:v1 head=<40 hex sha> reviewed=<40 hex sha> fixed=<int> noted=<int> deferred=<int> -->
+
+`reviewed` names the head the findings were about, so a resolve run cannot be credited against a
+review of some other commit. `fixed` and `deferred` are the per-finding disposition, and they
+exist because a pushed commit is not evidence that the findings were dealt with: on the first
+live run the resolver fixed two findings, left a third as a human decision, and the loop still
+labelled the pull request resolved, because all it checked was that the head had moved.
+
+`noted` counts findings left for the author that do not block merging: suggestions, conventions,
+process ideas. It was split out of `deferred` on 2026-10-05 after a docs PR with eight findings,
+three fixed and five of them preferences, landed on review:needs-human although nothing in it was
+wrong. Only `deferred` (a blocking problem the resolver could not fix) stops a PR now. `noted` is
+optional so markers written before the split still parse, as noted=0.
+
+Usage:
+  marker.py latest  <pr>       prints "<head> <findings>" for the newest review marker
+  marker.py count   <pr>       prints how many review markers the PR carries (round count)
+  marker.py resolve <pr>       prints "<head> <reviewed> <fixed> <deferred> <noted>" for the
+                               newest resolve marker, or nothing
+
+Shells out to the authenticated gh CLI; no token handling here.
+"""
+
+import json
+import re
+import os
+import subprocess
+from pathlib import Path
+import sys
+
+REPO = os.environ.get("PR_LOOP_REPO", "craigpars/AgileMedievalPeasantBoard")
+MARKER = re.compile(r"<!--\s*pulse-review:v1\s+head=([0-9a-f]{40})\s+findings=(\d+)\s*-->")
+# Envelope first, fields second. The original pinned an exact field ORDER with nothing
+# between fixed= and deferred=, and on 2026-09-22 a resolve worker emitted
+#   fixed=2 declined=1 deferred=0
+# which that pattern could not match. A marker the gate cannot read is a resolve that can
+# never be accepted, so the strictness bought nothing and cost a whole run. Parse the
+# key=value pairs instead: extra keys are ignored, missing required keys still fail.
+RESOLVE_ENVELOPE = re.compile(r"<!--\s*pulse-resolve:v1\s+(.*?)-->", re.S)
+_FIELD = re.compile(r"([a-z_]+)=(\S+)")
+
+
+def parse_resolve(body: str):
+    """Return (head, reviewed, fixed, deferred, noted) for the first valid marker, else None."""
+    for env in RESOLVE_ENVELOPE.finditer(body or ""):
+        f = dict(_FIELD.findall(env.group(1)))
+        head, reviewed = f.get("head", ""), f.get("reviewed", "")
+        if not (re.fullmatch(r"[0-9a-f]{40}", head) and re.fullmatch(r"[0-9a-f]{40}", reviewed)):
+            continue
+        try:
+            return head, reviewed, int(f["fixed"]), int(f["deferred"]), int(f.get("noted", 0))
+        except (KeyError, ValueError):
+            continue
+    return None
+
+
+def comments(pr: int) -> list[dict]:
+    # Gitea, via the loops' adapter: one JSON array, already paginated there.
+    adapter = str(Path(__file__).with_name("gitea-pr.py"))
+    out = subprocess.run(
+        [sys.executable, adapter, "comments", "--repo", REPO, "--pr", str(pr)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return json.loads(out or "[]")
+
+
+def markers(pr: int) -> list[tuple[str, int]]:
+    found = []
+    for c in comments(pr):
+        m = MARKER.search(c.get("body") or "")
+        if m:
+            found.append((m.group(1), int(m.group(2))))
+    return found
+
+
+def resolve_markers(pr: int) -> list[tuple[str, str, int, int, int]]:
+    found = []
+    for c in comments(pr):
+        parsed = parse_resolve(c.get("body") or "")
+        if parsed:
+            found.append(parsed)
+    return found
+
+
+def main() -> None:
+    if len(sys.argv) != 3 or sys.argv[1] not in ("latest", "count", "resolve"):
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    pr = int(sys.argv[2])
+    if sys.argv[1] == "resolve":
+        got = resolve_markers(pr)
+        if got:
+            print("{} {} {} {} {}".format(*got[-1]))
+        return
+    found = markers(pr)
+    if sys.argv[1] == "count":
+        print(len(found))
+        return
+    if found:
+        head, findings = found[-1]
+        print(f"{head} {findings}")
+
+
+if __name__ == "__main__":
+    main()

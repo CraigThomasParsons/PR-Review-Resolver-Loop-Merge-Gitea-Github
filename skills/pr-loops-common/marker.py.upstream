@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""
+Read the hidden markers the PR review and resolve loops leave on a pull request.
+
+The review worker ends its posted comment with one HTML comment:
+
+    <!-- pulse-review:v1 head=<40 hex sha> findings=<int> -->
+
+The loop treats that marker, not GitHub's own review state, as the record of what was
+reviewed. A PR whose latest marker names the current head has been reviewed already and is
+skipped, so a re-run of the loop, a duplicate label event, or a crashed-and-restarted tick can
+never post a second review of the same commit.
+
+The resolve worker ends its comment with the companion:
+
+    <!-- pulse-resolve:v1 head=<40 hex sha> reviewed=<40 hex sha> fixed=<int> deferred=<int> -->
+
+`reviewed` names the head the findings were about, so a resolve run cannot be credited against a
+review of some other commit. `fixed` and `deferred` are the per-finding disposition, and they
+exist because a pushed commit is not evidence that the findings were dealt with: on the first
+live run the resolver fixed two findings, left a third as a human decision, and the loop still
+labelled the pull request resolved, because all it checked was that the head had moved.
+
+Usage:
+  marker.py latest  <pr>       prints "<head> <findings>" for the newest review marker
+  marker.py count   <pr>       prints how many review markers the PR carries (round count)
+  marker.py resolve <pr>       prints "<head> <reviewed> <fixed> <deferred>" for the newest
+                               resolve marker, or nothing
+
+Shells out to the authenticated gh CLI; no token handling here.
+"""
+
+import json
+import re
+import subprocess
+import sys
+
+REPO = "ThePulse-Golf/The-Pulse"
+MARKER = re.compile(r"<!--\s*pulse-review:v1\s+head=([0-9a-f]{40})\s+findings=(\d+)\s*-->")
+RESOLVE = re.compile(
+    r"<!--\s*pulse-resolve:v1\s+head=([0-9a-f]{40})\s+reviewed=([0-9a-f]{40})"
+    r"\s+fixed=(\d+)\s+deferred=(\d+)\s*-->"
+)
+
+
+def comments(pr: int) -> list[dict]:
+    out = subprocess.run(
+        ["gh", "api", f"repos/{REPO}/issues/{pr}/comments", "--paginate"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    # --paginate concatenates JSON arrays; split defensively.
+    items: list[dict] = []
+    for chunk in re.findall(r"\[.*?\](?=\s*\[|\s*$)", out, flags=re.S):
+        items.extend(json.loads(chunk))
+    return items
+
+
+def markers(pr: int) -> list[tuple[str, int]]:
+    found = []
+    for c in comments(pr):
+        m = MARKER.search(c.get("body") or "")
+        if m:
+            found.append((m.group(1), int(m.group(2))))
+    return found
+
+
+def resolve_markers(pr: int) -> list[tuple[str, str, int, int]]:
+    found = []
+    for c in comments(pr):
+        m = RESOLVE.search(c.get("body") or "")
+        if m:
+            found.append((m.group(1), m.group(2), int(m.group(3)), int(m.group(4))))
+    return found
+
+
+def main() -> None:
+    if len(sys.argv) != 3 or sys.argv[1] not in ("latest", "count", "resolve"):
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    pr = int(sys.argv[2])
+    if sys.argv[1] == "resolve":
+        got = resolve_markers(pr)
+        if got:
+            print("{} {} {} {}".format(*got[-1]))
+        return
+    found = markers(pr)
+    if sys.argv[1] == "count":
+        print(len(found))
+        return
+    if found:
+        head, findings = found[-1]
+        print(f"{head} {findings}")
+
+
+if __name__ == "__main__":
+    main()

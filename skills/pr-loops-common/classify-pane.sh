@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# classify-pane.sh: capture a tmux worker pane and classify its state for one pipeline tick.
+#
+# Usage: classify-pane.sh <target> <sentinel> [lines] [state-file]
+#   <target>     tmux session/pane, e.g. 0 or mysess:0.1
+#   <sentinel>   the current phase's completion sentinel, e.g. PHASE_TDD_DONE
+#   [lines]      how many scrollback lines to inspect (default 40)
+#   [state-file] writable path persisting the idle streak between stateless ticks;
+#                with it, the second consecutive idle tick reports STALLED directly
+#
+# Eval seam: CLASSIFY_INPUT_FILE=<capture.txt> bypasses tmux and classifies that
+# file's content instead. Use it to check a change against a saved pane capture.
+#
+# This is the PR loops' own copy. It is not the tmux-pipeline skill's classifier, which takes two
+# arguments and has no PARKED or STALLED state; pr-loop.sh depends on both.
+#
+# Prints one of:
+#   STATE=WORKING  worker is actively running (or busy in a shell/subagent wait)
+#   STATE=BLOCKED  a tool-approval prompt is waiting (safe to answer per policy)
+#   STATE=PARKED   a Claude Code PRODUCT dialog needs a human (usage limit, login,
+#                  auto-mode setup, credits). NEVER approvable; the orchestrator
+#                  must not keep ticking against it.
+#   STATE=DONE     sentinel present as a standalone line AND worker idle
+#   STATE=IDLE     worker idle, no sentinel (first idle tick, or no state-file)
+#   STATE=STALLED  second consecutive idle tick (state-file mode only)
+# followed by the captured tail for context.
+set -euo pipefail
+
+target="${1:?tmux target, e.g. 0}"
+sentinel="${2:?phase sentinel, e.g. PHASE_TDD_DONE}"
+lines="${3:-40}"
+state_file="${4:-}"
+
+if [ -n "${CLASSIFY_INPUT_FILE:-}" ]; then
+  out="$(cat "$CLASSIFY_INPUT_FILE")"
+else
+  out="$(tmux capture-pane -t "$target" -p -S "-${lines}")"
+fi
+tail="$(printf '%s\n' "$out" | tail -20)"
+
+# Idle when the "esc to interrupt" affordance is absent from the live footer.
+# A backgrounded shell or a subagent wait also means the worker is busy: both
+# drop "esc to interrupt" while work continues, so treating them as idle
+# produces a spurious nudge into a worker that is waiting correctly.
+idle=1
+printf '%s\n' "$tail" | grep -qE "esc to interrupt|[0-9]+ shells? still running|↓ to manage|Waiting for [0-9]+ background agents?|background agents to finish|/tasks to see subagents|[◯●][[:space:]]+(general-purpose|main)" && idle=0
+
+# PRODUCT dialogs: things only a human keypress or account action can clear.
+# These are categorically NOT tool-approval prompts. Checked against the full
+# capture, not just the tail: the dialog text scrolls up as ticks pass while
+# the pane stays frozen (the 2026-08-24 incident held one for 821 ticks).
+parked=0
+printf '%s\n' "$out" | grep -qiE \
+  "You've reached your .* limit|/usage-credits|Set up auto mode for your environment|Select login method|log in to continue|purchase more credits|upgrade your plan to continue" && parked=1
+
+# Sentinel must be its OWN standalone line (optionally a leading bullet), never
+# merely embedded in the instruction text echoed back into the pane.
+hit=0
+printf '%s\n' "$out" | grep -qE "^[[:space:]]*(.[[:space:]]*)?${sentinel}[[:space:]]*$" && hit=1
+
+# Tool-approval prompt patterns.
+blocked=0
+printf '%s\n' "$tail" | grep -qiE "Do you want to (proceed|create|make|run|allow)|^[[:space:]]*1\. Yes" && blocked=1
+
+# Idle-streak persistence (state-file mode). Any non-idle tick resets the streak.
+streak=0
+if [ -n "$state_file" ]; then
+  [ -f "$state_file" ] && streak="$(cat "$state_file" 2>/dev/null || echo 0)"
+  case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+fi
+
+emit() { echo "STATE=$1"; }
+
+# Sentinel + no live "esc to interrupt" means done. Claude Code 2.1+ keeps
+# chrome like "↓ to manage" in the footer forever, which would otherwise keep
+# idle=0 and strand a finished worker until WORKER_TIMEOUT.
+if [ "$hit" -eq 1 ] && ! printf '%s\n' "$tail" | grep -q "esc to interrupt"; then
+  emit DONE
+  [ -n "$state_file" ] && echo 0 > "$state_file"
+elif [ "$parked" -eq 1 ] && [ "$idle" -eq 1 ]; then
+  # A frozen pane wearing a product dialog. Parked wins over blocked: the
+  # dialog is the reason nothing is progressing.
+  emit PARKED
+  [ -n "$state_file" ] && echo 0 > "$state_file"
+elif [ "$blocked" -eq 1 ]; then
+  emit BLOCKED
+  [ -n "$state_file" ] && echo 0 > "$state_file"
+elif [ "$idle" -eq 1 ]; then
+  if [ -n "$state_file" ] && [ "$streak" -ge 1 ]; then
+    emit STALLED
+    echo 0 > "$state_file"
+  else
+    emit IDLE
+    [ -n "$state_file" ] && echo $((streak + 1)) > "$state_file"
+  fi
+else
+  emit WORKING
+  [ -n "$state_file" ] && echo 0 > "$state_file"
+fi
+
+echo "----TAIL----"
+printf '%s\n' "$tail"

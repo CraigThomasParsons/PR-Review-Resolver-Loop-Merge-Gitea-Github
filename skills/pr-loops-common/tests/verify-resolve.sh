@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Cases for the resolve verification gate, the thing that got PR 754 wrong (and, the other way,
+# feudal-frontiers PR 39: suggestions counted as blocking).
+#
+# verify() shells out to the Gitea adapter, git and marker.py, so each case stubs all three and
+# calls the real function out of pr-loop.sh. No network, no repository.
+#
+# Ported from the gh original: the head now comes from `python3 $ADAPTER head`, not `gh pr view`,
+# so the stub is a python file the driver points ADAPTER at rather than a gh on PATH.
+set -uo pipefail
+
+LOOP="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/pr-loop.sh"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/bin" "$TMP/common"
+export PATH="$TMP/bin:$PATH"
+OLD=0000000000000000000000000000000000000000
+NEW=1111111111111111111111111111111111111111
+
+stub() { # newhead resolve-marker review-marker ff
+  cat > "$TMP/common/gitea-pr.py" <<E
+import sys
+print("$1")
+E
+  cat > "$TMP/bin/git" <<E
+#!/usr/bin/env bash
+case " \$* " in *" --is-ancestor "*) exit $4 ;; esac
+exit 0
+E
+  cat > "$TMP/common/marker.py" <<E
+import sys
+print("$2" if sys.argv[1] == "resolve" else "$3")
+E
+  chmod +x "$TMP/bin/git"
+}
+
+# Build the driver once: the real verify() lifted out of the loop, plus the two associative
+# arrays it reads. A file rather than an inline bash -c, because splicing a function body through
+# nested quoting is how you end up testing your quoting instead of your gate.
+{
+  echo 'set -uo pipefail'
+  echo 'REPO=owner/repo'
+  echo "ADAPTER=$TMP/common/gitea-pr.py"
+  echo 'declare -A W_SHA W_HEADREF'
+  echo "W_SHA[1]=$OLD; W_HEADREF[1]=branch"
+  sed -n '/^verify()/,/^}/p' "$LOOP"
+  echo 'verify 1'
+} > "$TMP/driver.sh"
+
+run() { # -> verify's verdict
+  MODE=resolve COMMON="$TMP/common" MAIN=/nonexistent bash "$TMP/driver.sh"
+}
+
+pass=0; fail=0
+check() { # label expected-prefix
+  local got; got="$(run)"
+  if [[ "$got" == "$2"* ]]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail+1)); printf '  FAIL  %s\n         wanted %s*\n         got    %s\n' "$1" "$2" "$got"; fi
+}
+
+echo "resolve verification gate"
+
+stub "$NEW" "$NEW $OLD 3 0" "$OLD 3" 0
+check "all three findings fixed and pushed fast-forward" "ok"
+
+stub "$NEW" "$NEW $OLD 2 1" "$OLD 3" 0
+check "the PR 754 case: two fixed, one left for a person" "fail:1 of 3"
+
+stub "$OLD" "$OLD $OLD 0 3" "$OLD 3" 0
+check "nothing fixed, nothing pushed" "fail:3 of 3"
+
+stub "$NEW" "" "$OLD 3" 0
+check "no disposition marker at all" "fail:the resolver left no disposition"
+
+stub "$NEW" "$NEW $NEW 3 0" "$OLD 3" 0
+check "disposition answers a review of a different head" "fail:the resolver answered a review of"
+
+stub "$NEW" "$NEW $OLD 1 0" "$OLD 3" 0
+check "accounts for one finding when the review raised three" "fail:the review raised 3"
+
+stub "$OLD" "$OLD $OLD 2 0" "$OLD 2" 0
+check "claims fixes but the head never moved" "fail:the resolver claims 2 fix"
+
+stub "$NEW" "$OLD $OLD 0 0" "$OLD 0" 0
+check "claims no fixes yet the head moved" "fail:the resolver claims no fixes"
+
+stub "$NEW" "$NEW $OLD 3 0" "$OLD 3" 1
+check "pushed, but not as a fast-forward" "fail:the PR head moved to"
+
+stub "" "$NEW $OLD 3 0" "$OLD 3" 0
+check "the head could not be read at all" "fail:could not read the PR head"
+
+# noted= (2026-10-05): non-blocking findings left for the author. The marker.py stub prints the
+# fields in marker.py's order: head reviewed fixed deferred noted.
+
+stub "$NEW" "$NEW $OLD 3 0 5" "$OLD 8" 0
+check "the PR 39 case: three fixed, five suggestions noted, nothing blocking" "ok"
+
+stub "$OLD" "$OLD $OLD 0 0 3" "$OLD 3" 0
+check "every finding noted, nothing pushed" "ok"
+
+stub "$NEW" "$NEW $OLD 2 1 2" "$OLD 5" 0
+check "one blocking finding among notes still stops the PR" "fail:1 of 5 finding(s) are blocking"
+
+stub "$NEW" "$NEW $OLD 3 0 1" "$OLD 3" 0
+check "notes counted on top of a full account do not balance" "fail:the review raised 3 finding(s) but the resolver accounted for 4"
+
+stub "$OLD" "$OLD $OLD 0 0 2" "$OLD 2" 0
+check "notes only must not move the head (and here it did not)" "ok"
+
+stub "$NEW" "$OLD $OLD 0 0 2" "$OLD 2" 0
+check "notes only, yet the head moved" "fail:the resolver claims no fixes"
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

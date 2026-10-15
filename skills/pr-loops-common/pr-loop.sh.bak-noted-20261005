@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# pr-loop.sh MODE
+#
+# One tick of the label-driven PR loop for The-Pulse. MODE is "review" or "resolve".
+#
+#   review  : every open PR labelled review:requested gets its own tmux Claude worker that runs
+#             /code-review and posts the report as a PR comment. Label moves to review:findings
+#             (or review:clean when the report counts zero findings).
+#   resolve : every open PR labelled review:findings gets a worker that runs /pr-review-resolver,
+#             commits fixes, and pushes fast-forward to the PR branch. Label moves to
+#             review:resolved.
+#
+# The loop itself is deterministic bash: list, filter, spawn, wait, verify, relabel. The model runs
+# only inside the workers. Every label change is gated on what gh can verify after the worker
+# finishes, never on the worker's own claim of success.
+#
+# Skips, before any worker is spawned: Dependabot and other bot authors, drafts, PRs whose head
+# was already reviewed (hidden marker), and the whole tick when the box is busy or short of memory.
+#
+# Never merges, never enables auto-merge, never force-pushes, never deletes branches. The worker
+# launch denies those tools; the resolver skill refuses them; and the repo hook denies them again
+# once .claude/hooks/pipeline-guardrails.mjs is on develop.
+#
+# Environment knobs (all optional):
+#   DRY_RUN=1          list candidates and print what would happen; spawn nothing, relabel nothing
+#   MAX_PARALLEL=2     workers per tick (memory is the constraint on this box)
+#   WORKER_TIMEOUT=2700  seconds before a worker is abandoned and the PR marked needs-human
+#   POLL=30            seconds between pane checks
+#   MIN_FREE_GB=6      skip the tick when less memory than this is available
+#   SKIP_BUSY_GUARD=1  run even if another pulse-* tmux worker is mid-task
+#   PR_LOOP_WORKTREES  where worker worktrees go (default: .prloop-worktrees next to the clone)
+#   PR_LOOP_STATE      lock, log and per-run files (default: ~/.local/state/pulse-pr-loops)
+#
+# Exit codes: 0 always for a normal tick (including "nothing to do"); 2 for a setup fault.
+
+set -uo pipefail
+
+# Run from a private copy of this file.
+#
+# Bash reads a script by byte offset as it goes, so editing this file while a tick is running makes
+# the running tick seek into the wrong place once it leaves the compound command it is inside. It
+# happened: an edit during a live review tick left the loop executing a fragment of a function it
+# had never parsed. The work had already finished by then, but the tick died on the fragment
+# instead of logging its own completion. A tick that lasts three quarters of an hour will overlap
+# an edit sooner or later, so it gets its own copy and the file on disk is free to change.
+# The copy lives in a temp directory, so the real location is recorded first; everything the loop
+# ships with (prompts, marker.py, classify-pane.sh) is found relative to it.
+if [ -z "${PR_LOOP_PINNED:-}" ]; then
+  PR_LOOP_HOME="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  export PR_LOOP_HOME
+  pinned="$(mktemp -t pr-loop.XXXXXX.sh)"
+  cat "${BASH_SOURCE[0]}" > "$pinned"
+  export PR_LOOP_PINNED="$pinned"
+  bash "$pinned" "$@"
+  rc=$?
+  rm -f "$pinned"
+  exit $rc
+fi
+
+MODE="${1:-}"
+case "$MODE" in review|resolve) ;; *) echo "usage: pr-loop.sh review|resolve" >&2; exit 2 ;; esac
+
+# ---------------------------------------------------------------- configuration
+REPO="${PR_LOOP_REPO:-craigpars/AgileMedievalPeasantBoard}"
+COMMON="$PR_LOOP_HOME"
+ADAPTER="$COMMON/gitea-pr.py"   # Gitea replacement for every gh call
+# The main checkout, even when this script is run from a linked worktree: worker worktrees are
+# added from it and must outlive whichever worktree launched the tick.
+# Upstream lived inside the repo (.agents/skills/...) and found the clone from its own
+# location. This copy lives in ~/.claude/skills, which is not a git repo, and it serves 32
+# repos rather than one -- so the checkout is named explicitly. PR_LOOP_MAIN wins; otherwise
+# fall back to the script's own location for anyone who does vendor it into a repo.
+MAIN="${PR_LOOP_MAIN:-}"
+if [ -z "$MAIN" ]; then
+  MAIN="$(git -C "$COMMON" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  MAIN="${MAIN%/.git}"
+fi
+WT_ROOT="${PR_LOOP_WORKTREES:-$(dirname "$MAIN")/.prloop-worktrees}"
+mkdir -p "$WT_ROOT"
+STATE="${PR_LOOP_STATE:-$HOME/.local/state/gitea-pr-loops}"
+LOG="$STATE/pr-loop.log"
+MAX_PARALLEL="${MAX_PARALLEL:-2}"
+WORKER_TIMEOUT="${WORKER_TIMEOUT:-2700}"
+POLL="${POLL:-30}"
+MIN_FREE_GB="${MIN_FREE_GB:-6}"
+DRY_RUN="${DRY_RUN:-0}"
+SKIP_BUSY_GUARD="${SKIP_BUSY_GUARD:-0}"
+CLASSIFY="$COMMON/classify-pane.sh"
+
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+case "$MODE" in
+  review)
+    TRIGGER="review:requested"; CLAIM="review:in-progress"; OK="review:findings"; CLEAN="review:clean"
+    SENTINEL="PR_REVIEW_DONE"; PROMPT_TMPL="$COMMON/prompts/review.txt" ;;
+  resolve)
+    TRIGGER="review:findings"; CLAIM="review:resolving"; OK="review:resolved"; CLEAN=""
+    SENTINEL="PR_RESOLVE_DONE"; PROMPT_TMPL="$COMMON/prompts/resolve.txt" ;;
+esac
+FAIL="review:needs-human"
+
+# Tools the worker may use without a prompt. Auto mode's classifier covers the rest; the deny list
+# below is what it may never do, whatever mode it is in.
+ALLOW_COMMON=(Read Grep Glob Agent
+  "Bash(git log *)" "Bash(git diff *)" "Bash(git show *)" "Bash(git status *)" "Bash(git rev-parse *)"
+  "Bash(git merge-base *)" "Bash(git fetch *)" "Bash(git branch *)"
+  "Bash(tea pr list *)" "Bash(tea comments list *)"   # read-only tea
+  # PR reads/writes go through the adapter; Bash(python3 *) below already reaches it.
+  "Bash(python3 *)" "Bash(node *)" "Bash(cat *)" "Bash(sed *)" "Bash(wc *)" "Bash(ls *)" "Bash(head *)" "Bash(tail *)")
+ALLOW_RESOLVE=(Edit Write MultiEdit
+  "Bash(git add *)" "Bash(git commit *)" "Bash(git push origin HEAD:*)"
+  "Bash(npm run *)" "Bash(npm ci *)" "Bash(npx *)" "Bash(dotnet build *)" "Bash(dotnet test *)" "Bash(just *)")
+DENY=("Bash(tea pr merge *)" "Bash(tea pr approve *)" "Bash(tea pr close *)" "Bash(tea pr reject *)"
+  "Bash(gh pr merge *)" "Bash(git push * --force*)" "Bash(git push * -f *)" "Bash(git push --force*)"
+  "Bash(git reset --hard *)" "Bash(git branch -D *)" "Bash(git push * --delete *)" "Bash(gh api *auto*merge*)"
+  "Bash(gh pr ready *)" "Bash(gh pr edit *)" "Bash(gh pr close *)" "Bash(sudo *)" "Bash(rm -rf *)"
+  # Only the loop relabels; a worker moving its own label would defeat the marker gate.
+  # NB: no blanket *merge* pattern -- it would also block git merge-base, which is allowed.
+  "Bash(*gitea-pr.py label*)" "Bash(*gitea-pr.py merge*)" "Bash(tea pr edit *)")
+
+mkdir -p "$STATE" "$WT_ROOT"
+log() { printf '%s [%s] %s\n' "$(date -Is)" "$MODE" "$*" | tee -a "$LOG" >&2; }
+die() { log "FATAL: $*"; exit 2; }
+
+# ---------------------------------------------------------------- preconditions
+command -v claude >/dev/null || die "claude not on PATH"
+command -v tea >/dev/null || [ -x "$HOME/.local/bin/tea" ] || die "tea not on PATH"
+[ -f "$ADAPTER" ] || die "missing Gitea adapter: $ADAPTER"
+command -v tmux >/dev/null || die "tmux not on PATH"
+[ -x "$CLASSIFY" ] || die "missing or not executable: $CLASSIFY"
+[ -f "$PROMPT_TMPL" ] || die "missing prompt template $PROMPT_TMPL"
+[ -n "$MAIN" ] && [ -e "$MAIN/.git" ] || die "no checkout for $REPO: set PR_LOOP_MAIN to its clone (got '$MAIN')"
+
+exec 9>"$STATE/$MODE.lock"
+if ! flock -n 9; then log "previous $MODE tick still running; exiting"; exit 0; fi
+
+if [ "$DRY_RUN" != "1" ]; then
+  if [ "$SKIP_BUSY_GUARD" != "1" ]; then
+    # A run launched by hand from inside a pulse-* pane would otherwise see that pane running this
+    # very script and call the box busy on account of itself. Cron has no session, so $TMUX is
+    # empty there and nothing is excluded.
+    SELF="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
+    for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep -E '^(pulse-|ampb-)'); do
+      [ "$s" = "$SELF" ] && continue
+      if tmux capture-pane -t "$s" -p 2>/dev/null | grep -q 'esc to interrupt'; then
+        log "box busy: tmux session $s is mid-task; skipping this tick"; exit 0
+      fi
+    done
+  fi
+  free_gb="$(free -g | awk '/^Mem:/{print $7}')"
+  if [ "${free_gb:-0}" -lt "$MIN_FREE_GB" ]; then
+    log "only ${free_gb}G available (< ${MIN_FREE_GB}G); skipping this tick"; exit 0
+  fi
+fi
+
+git -C "$MAIN" fetch origin --quiet --prune || log "warning: fetch failed; continuing with what is local"
+
+# ---------------------------------------------------------------- candidates
+# Bots (Dependabot included) and drafts never reach a worker. review mode also skips a head that
+# already carries a marker; resolve mode requires the marker to name the CURRENT head, otherwise
+# the findings are stale and the PR goes back to review:requested.
+# Filtered client-side on labels[].name rather than with --label: the --label form goes through
+# GitHub's search index, which can lag a label edit by seconds, and this list must reflect the
+# labels as they are right now.
+# A failing gh call must be a fault, not an empty list; otherwise a broken query reads as "nothing
+# to do" and the loop silently never reviews anything.
+if ! LISTING="$(TRIGGER="$TRIGGER" python3 "$ADAPTER" list --repo "$REPO" --state open \
+  | TRIGGER="$TRIGGER" python3 -c '
+import json, os, re, sys
+trigger = os.environ["TRIGGER"]
+# Gitea has no is_bot flag and AMPB nightly PRs are authored by craigpars, so the
+# upstream dependabot check cannot catch them. Skip by pattern instead.
+raw = os.environ.get("PR_LOOP_SKIP_PATTERN", r"docblock-backfill|^chore\(#152\)")
+rx = re.compile(raw) if raw else None
+for pr in json.load(sys.stdin):
+    if trigger not in pr["labels"]:      continue
+    if pr["draft"] or pr["is_bot"]:      continue
+    if rx and (rx.search(pr["title"]) or rx.search(pr["head_ref"])): continue
+    print("\t".join([str(pr["number"]), pr["head_ref"], pr["head_sha"], pr["base_ref"]]))
+')"; then
+  die "gitea pr list failed; not treating that as an empty queue"
+fi
+mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
+
+if [ "${#CANDIDATES[@]}" -eq 0 ]; then log "no open, non-draft, non-bot PR carries $TRIGGER"; exit 0; fi
+
+relabel() { # pr from to
+  if [ "$DRY_RUN" = "1" ]; then log "DRY: #$1 $2 -> $3"; return 0; fi
+  python3 "$ADAPTER" label --repo "$REPO" --pr "$1" --remove "$2" --add "$3" >/dev/null 2>&1 || log "warning: relabel #$1 $2 -> $3 failed"
+}
+comment() { # pr body
+  if [ "$DRY_RUN" = "1" ]; then log "DRY: would comment on #$1: $2"; return 0; fi
+  local bf; bf="$(mktemp)"; printf '%s\n' "$2" > "$bf"
+  python3 "$ADAPTER" comment --repo "$REPO" --pr "$1" --body-file "$bf" >/dev/null 2>&1 || log "warning: comment on #$1 failed"
+  rm -f "$bf"
+}
+
+declare -a QUEUE=()
+for row in "${CANDIDATES[@]}"; do
+  IFS=$'\t' read -r pr headref sha base <<<"$row"
+  marker="$(python3 "$COMMON/marker.py" latest "$pr" 2>/dev/null || true)"
+  mhead="${marker%% *}"
+  if [ "$MODE" = "review" ] && [ "$mhead" = "$sha" ]; then
+    log "#$pr head $sha already reviewed (marker); skipping"; continue
+  fi
+  if [ "$MODE" = "resolve" ] && [ "$mhead" != "$sha" ]; then
+    log "#$pr findings are for $mhead but head is $sha; stale, sending back to review:requested"
+    relabel "$pr" "$TRIGGER" "review:requested"; continue
+  fi
+  QUEUE+=("$row")
+done
+if [ "${#QUEUE[@]}" -eq 0 ]; then log "nothing to do after skips"; exit 0; fi
+
+# ---------------------------------------------------------------- workers
+declare -A W_SESS W_WT W_SHA W_HEADREF W_START W_STALLS W_BLOCKS
+spawned=0
+
+# Mark a worktree path trusted in ~/.claude.json so Claude Code skips the
+# "I trust this folder" dialog (default No/exit) that otherwise kills the pane
+# and produces a false review:needs-human. Claude stores trust per exact path;
+# trusting the parent WT_ROOT alone is not enough for a new prloop-* worktree.
+pretrust_worktree() {
+  local wt="$1"
+  python3 - "$wt" "$WT_ROOT" <<'PY'
+import json, os, sys, tempfile
+from pathlib import Path
+
+paths = [p for p in sys.argv[1:] if p]
+cfg = Path.home() / ".claude.json"
+if not cfg.is_file():
+    sys.exit(0)
+
+data = json.loads(cfg.read_text())
+projects = data.setdefault("projects", {})
+template = {
+    "allowedTools": [],
+    "mcpContextUris": [],
+    "mcpServers": {},
+    "enabledMcpjsonServers": [],
+    "disabledMcpjsonServers": [],
+    "hasTrustDialogAccepted": True,
+    "hasClaudeMdExternalIncludesApproved": False,
+    "hasClaudeMdExternalIncludesWarningShown": False,
+}
+changed = False
+for path in paths:
+    entry = projects.get(path)
+    if not isinstance(entry, dict):
+        projects[path] = dict(template)
+        changed = True
+        continue
+    if entry.get("hasTrustDialogAccepted") is not True:
+        entry["hasTrustDialogAccepted"] = True
+        changed = True
+if not changed:
+    sys.exit(0)
+
+fd, tmp = tempfile.mkstemp(prefix=".claude.json.", dir=str(cfg.parent))
+try:
+    with os.fdopen(fd, "w") as out:
+        json.dump(data, out, indent=2)
+        out.write("\n")
+    os.replace(tmp, cfg)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+}
+
+
+spawn() { # row
+  IFS=$'\t' read -r pr headref sha base <<<"$1"
+  local sess="prloop-$MODE-$pr" wt="$WT_ROOT/prloop-$MODE-$pr" prompt="$STATE/prompt-$MODE-$pr.txt" launch="$STATE/launch-$MODE-$pr.sh"
+  if [ "$DRY_RUN" = "1" ]; then log "DRY: would spawn $sess at $sha ($headref -> $base)"; return 0; fi
+  if tmux has-session -t "$sess" 2>/dev/null; then log "#$pr: session $sess already exists; leaving it alone"; return 1; fi
+  relabel "$pr" "$TRIGGER" "$CLAIM"
+  git -C "$MAIN" fetch origin --quiet "$headref" || { log "#$pr: fetch $headref failed"; relabel "$pr" "$CLAIM" "$FAIL"; return 1; }
+  [ -d "$wt" ] && git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1
+  git -C "$MAIN" worktree add --detach "$wt" "$sha" >/dev/null 2>&1 || { log "#$pr: worktree add failed"; relabel "$pr" "$CLAIM" "$FAIL"; return 1; }
+  pretrust_worktree "$wt"
+  sed -e "s|__PR__|$pr|g" -e "s|__HEADREF__|$headref|g" -e "s|__SHA__|$sha|g" -e "s|__BASE__|$base|g" -e "s|__SENTINEL__|$SENTINEL|g" -e "s|__REPO__|$REPO|g" -e "s|__ADAPTER__|$ADAPTER|g" \
+    "$PROMPT_TMPL" > "$prompt"
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'cd %q\n' "$wt"
+    printf 'exec claude --permission-mode auto'
+    printf ' --allowedTools'; for t in "${ALLOW_COMMON[@]}"; do printf ' %q' "$t"; done
+    if [ "$MODE" = "resolve" ]; then for t in "${ALLOW_RESOLVE[@]}"; do printf ' %q' "$t"; done; fi
+    printf ' --disallowedTools'; for t in "${DENY[@]}"; do printf ' %q' "$t"; done
+    echo
+  } > "$launch"; chmod +x "$launch"
+  tmux new-session -d -s "$sess" -c "$wt" "$launch"
+  # wait for the prompt box, then paste the prompt and submit it.
+  # Claude may first show a workspace-trust dialog whose default is "No, exit";
+  # that dialog also contains ❯, so treat it explicitly: pick "Yes, I trust this folder".
+  local i pane
+  for i in $(seq 1 30); do
+    pane="$(tmux capture-pane -t "$sess" -p 2>/dev/null || true)"
+    if printf '%s\n' "$pane" | grep -q 'I trust this folder'; then
+      tmux send-keys -t "$sess" Down; sleep 0.3; tmux send-keys -t "$sess" Enter
+      sleep 2
+      continue
+    fi
+    printf '%s\n' "$pane" | grep -qE '❯|for agents' && break
+    sleep 2
+  done
+  tmux load-buffer -b "prloop-$pr" "$prompt"
+  tmux paste-buffer -b "prloop-$pr" -t "$sess" -d
+  sleep 2; tmux send-keys -t "$sess" Enter
+  for i in $(seq 1 15); do tmux capture-pane -t "$sess" -p 2>/dev/null | grep -q 'esc to interrupt' && break; sleep 2; done
+  if ! tmux capture-pane -t "$sess" -p 2>/dev/null | grep -q 'esc to interrupt'; then
+    tmux send-keys -t "$sess" Enter; sleep 5
+  fi
+  W_SESS[$pr]="$sess"; W_WT[$pr]="$wt"; W_SHA[$pr]="$sha"; W_HEADREF[$pr]="$headref"; W_START[$pr]="$(date +%s)"; W_STALLS[$pr]=0; W_BLOCKS[$pr]=0
+  rm -f "$STATE/classify-$sess.state"
+  log "#$pr: spawned $sess in $wt at $sha"
+}
+
+finish() { # pr outcome reason
+  local pr="$1" outcome="$2" reason="$3" sess="${W_SESS[$pr]}" wt="${W_WT[$pr]}"
+  tmux kill-session -t "$sess" 2>/dev/null
+  case "$outcome" in
+    ok)    relabel "$pr" "$CLAIM" "$OK" ;;
+    clean) relabel "$pr" "$CLAIM" "$CLEAN" ;;
+    fail)  relabel "$pr" "$CLAIM" "$FAIL"; comment "$pr" "Automated $MODE loop stopped on this PR: $reason. A human needs to look; the loop log on the review host has the detail." ;;
+  esac
+  if git -C "$MAIN" worktree remove "$wt" >/dev/null 2>&1; then :; else log "#$pr: worktree $wt kept (uncommitted changes or busy); inspect and remove by hand"; fi
+  rm -f "$STATE/classify-$sess.state" "$STATE/launch-$MODE-$pr.sh"
+  log "#$pr: $outcome ($reason)"
+  unset "W_SESS[$pr]" "W_WT[$pr]" "W_SHA[$pr]" "W_HEADREF[$pr]" "W_START[$pr]" "W_STALLS[$pr]" "W_BLOCKS[$pr]"
+}
+
+verify() { # pr -> prints ok|clean|fail:<reason>
+  # Declared separately: bash expands a whole `local a=... b=${x[$a]}` word list before making any
+  # of the assignments, so the array lookups would read whatever `pr` happened to be in the
+  # caller's scope. It worked only because the caller's loop variable is also called pr.
+  local pr="$1"
+  local sha="${W_SHA[$pr]}"
+  local headref="${W_HEADREF[$pr]}"
+  if [ "$MODE" = "review" ]; then
+    local m; m="$(python3 "$COMMON/marker.py" latest "$pr" 2>/dev/null || true)"
+    if [ "${m%% *}" != "$sha" ]; then echo "fail:worker finished but no review comment carrying the marker for $sha was found"; return; fi
+    if [ "${m##* }" = "0" ]; then echo clean; else echo ok; fi
+  else
+    # A pushed commit says work happened, not that the findings were dealt with. The first live
+    # run fixed two findings, left a third as a human decision, and this function said "ok" purely
+    # because the head had moved. So the head check stays, and the disposition is checked too.
+    local newsha; newsha="$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)"
+    if [ -z "$newsha" ]; then echo "fail:could not read the PR head after the run"; return; fi
+    git -C "$MAIN" fetch origin --quiet "$headref"
+
+    local rm; rm="$(python3 "$COMMON/marker.py" resolve "$pr" 2>/dev/null || true)"
+    if [ -z "$rm" ]; then echo "fail:the resolver left no disposition marker, so what it did to each finding is unknown"; return; fi
+    local r_head r_reviewed r_fixed r_deferred
+    read -r r_head r_reviewed r_fixed r_deferred <<<"$rm"
+
+    # The disposition must answer the review that triggered this run, not an older one.
+    local review; review="$(python3 "$COMMON/marker.py" latest "$pr" 2>/dev/null || true)"
+    local review_head="${review%% *}" review_count="${review##* }"
+    if [ "$r_reviewed" != "$review_head" ]; then
+      echo "fail:the resolver answered a review of $r_reviewed but the findings on this PR are from $review_head"; return
+    fi
+    if [ "$((r_fixed + r_deferred))" -ne "${review_count:-0}" ]; then
+      echo "fail:the review raised $review_count finding(s) but the resolver accounted for $((r_fixed + r_deferred))"; return
+    fi
+
+    # Nothing fixed means nothing should have been pushed, and vice versa.
+    if [ "$r_fixed" -gt 0 ]; then
+      if [ "$newsha" = "$sha" ]; then echo "fail:the resolver claims $r_fixed fix(es) but the PR head never moved"; return; fi
+      if [ "$r_head" != "$newsha" ]; then echo "fail:the resolver named head $r_head but the PR is at $newsha"; return; fi
+      if ! git -C "$MAIN" merge-base --is-ancestor "$sha" "$newsha"; then
+        echo "fail:the PR head moved to $newsha but not as a fast-forward of $sha"; return
+      fi
+    elif [ "$newsha" != "$sha" ]; then
+      echo "fail:the resolver claims no fixes yet the PR head moved to $newsha"; return
+    fi
+
+    # Anything left for a person is not resolved, however well the push went.
+    if [ "$r_deferred" -gt 0 ]; then
+      echo "fail:$r_deferred of $review_count finding(s) need a human decision; $r_fixed were fixed and pushed"; return
+    fi
+    echo ok
+  fi
+}
+
+# spawn the first batch
+pretrust_worktree "$WT_ROOT"
+for row in "${QUEUE[@]}"; do
+  [ "$spawned" -ge "$MAX_PARALLEL" ] && break
+  spawn "$row" && spawned=$((spawned + 1))
+done
+if [ "$DRY_RUN" = "1" ]; then log "DRY: ${#QUEUE[@]} candidate(s), would run up to $MAX_PARALLEL in parallel"; exit 0; fi
+[ "${#W_SESS[@]}" -eq 0 ] && { log "no worker started"; exit 0; }
+
+# supervise until every worker has finished or timed out
+while [ "${#W_SESS[@]}" -gt 0 ]; do
+  sleep "$POLL"
+  for pr in "${!W_SESS[@]}"; do
+    sess="${W_SESS[$pr]}"
+    if ! tmux has-session -t "$sess" 2>/dev/null; then finish "$pr" fail "the worker session disappeared"; continue; fi
+    if [ $(( $(date +%s) - W_START[$pr] )) -gt "$WORKER_TIMEOUT" ]; then finish "$pr" fail "worker exceeded ${WORKER_TIMEOUT}s"; continue; fi
+    state="$("$CLASSIFY" "$sess" "$SENTINEL" 40 "$STATE/classify-$sess.state" 2>/dev/null | head -1)"
+    case "$state" in
+      STATE=WORKING) W_STALLS[$pr]=0; W_BLOCKS[$pr]=0 ;;
+      STATE=DONE)
+        v="$(verify "$pr")"
+        case "$v" in ok) finish "$pr" ok "verified";; clean) finish "$pr" clean "zero findings";; *) finish "$pr" fail "${v#fail:}";; esac ;;
+      STATE=PARKED) finish "$pr" fail "Claude Code is parked on a product dialog (usage limit or login)" ;;
+      STATE=BLOCKED)
+        W_BLOCKS[$pr]=$(( W_BLOCKS[$pr] + 1 ))
+        [ "${W_BLOCKS[$pr]}" -ge 3 ] && finish "$pr" fail "worker is waiting on a permission prompt the loop will not answer" ;;
+      STATE=STALLED)
+        W_STALLS[$pr]=$(( W_STALLS[$pr] + 1 ))
+        if [ "${W_STALLS[$pr]}" -eq 1 ]; then
+          tmux send-keys -t "$sess" "continue - finish the task, then print $SENTINEL on its own line"; sleep 1; tmux send-keys -t "$sess" Enter
+          log "#$pr: nudged"
+        else finish "$pr" fail "worker stalled twice"; fi ;;
+      *) : ;;
+    esac
+  done
+done
+log "tick complete"
+exit 0
