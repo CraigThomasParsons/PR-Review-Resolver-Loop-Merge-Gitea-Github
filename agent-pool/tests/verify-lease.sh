@@ -19,6 +19,10 @@ expect() { # name got wanted-substring
   if [[ "$2" == *"$3"* ]]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
   else fail=$((fail+1)); printf '  FAIL  %s\n         wanted *%s*\n         got %s\n' "$1" "$3" "$2"; fi
 }
+expect_not() { # name got unwanted-substring
+  if [[ "$2" != *"$3"* ]]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail+1)); printf '  FAIL  %s\n         did not want *%s*\n         got %s\n' "$1" "$3" "$2"; fi
+}
 expect_rc() { # name got-rc wanted-rc
   if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
   else fail=$((fail+1)); printf '  FAIL  %s\n         wanted exit %s, got %s\n' "$1" "$3" "$2"; fi
@@ -166,6 +170,65 @@ expect "| & and backslashes in a branch name survive rendering" "$(cat "$TMP/ren
 expect "no placeholder is left" "$(grep -c '__[A-Z]*__' "$TMP/rendered")" "0"
 python3 "$SCRIPTS/render-prompt.py" "$TMP/tpl" "$TMP/rendered" 'NOEQUALS' 2>/dev/null
 expect_rc "a malformed KEY=VALUE is refused" "$?" "1"
+
+echo
+echo "worker permission policy"
+AD_ABS=/opt/pool/skills/pr-loops-common/gitea-pr.py
+pol() { # family job command
+  python3 "$SCRIPTS/policy.py" check --family "$1" --job "$2" --adapter "$AD_ABS" --worktree /wt --report /runs/r.md -- "$3"
+}
+for fam in glob prefix; do
+  for job in review resolve; do
+    expect "$fam/$job: git push HEAD:main is denied" "$(pol $fam $job 'git push origin HEAD:main')" deny
+    expect "$fam/$job: a + refspec push is denied" "$(pol $fam $job 'git push origin +HEAD:refs/heads/feature/x')" deny
+    expect "$fam/$job: a trailing -f push is denied" "$(pol $fam $job 'git push origin feature/x -f')" deny
+    expect "$fam/$job: any worker push is denied" "$(pol $fam $job 'git push origin HEAD:refs/heads/feature/x')" deny
+    expect "$fam/$job: git -C . push --force is denied" "$(pol $fam $job 'git -C . push --force')" deny
+    expect "$fam/$job: a relative-path adapter comment is denied" "$(pol $fam $job 'python3 ./gitea-pr.py comment --repo o/r --pr 1 --body-file x')" deny
+    expect "$fam/$job: a bare adapter label is denied" "$(pol $fam $job 'python3 gitea-pr.py label --repo o/r --pr 1 --add x')" deny
+    expect "$fam/$job: the absolute adapter's comment is denied" "$(pol $fam $job "python3 $AD_ABS comment --repo o/r --pr 1 --body-file x")" deny
+    expect "$fam/$job: python3 -c is denied" "$(pol $fam $job "python3 -c 'import os'")" deny
+    expect "$fam/$job: an arbitrary python3 script is denied" "$(pol $fam $job 'python3 /tmp/x.py')" deny
+    expect "$fam/$job: node -e is denied" "$(pol $fam $job "node -e 'x'")" deny
+    expect "$fam/$job: git reset --hard is denied" "$(pol $fam $job 'git reset --hard HEAD~1')" deny
+    expect "$fam/$job: git merge is denied" "$(pol $fam $job 'git merge origin/master')" deny
+    expect "$fam/$job: git add -A is denied" "$(pol $fam $job 'git add -A')" deny
+    expect "$fam/$job: curl is denied" "$(pol $fam $job 'curl https://example.invalid')" deny
+    expect "$fam/$job: a push hidden behind && is denied" "$(pol $fam $job 'git status && git push origin HEAD:main')" deny
+    expect "$fam/$job: the adapter's head read is allowed" "$(pol $fam $job "python3 $AD_ABS head --repo o/r --pr 1")" allow
+    expect "$fam/$job: the adapter's threads read is allowed" "$(pol $fam $job "python3 $AD_ABS threads --repo o/r --pr 1")" allow
+    expect "$fam/$job: git diff is allowed" "$(pol $fam $job 'git diff origin/master...HEAD')" allow
+    expect "$fam/$job: a read pipeline is allowed" "$(pol $fam $job 'git log --oneline | head -5')" allow
+  done
+  expect "$fam/review: staging is denied" "$(pol $fam review 'git add src/a.php')" deny
+  expect "$fam/review: committing is denied" "$(pol $fam review 'git commit -m x')" deny
+  expect "$fam/review: running the gate is not allowed" "$(pol $fam review 'npm test')" deny
+  expect "$fam/resolve: staging a named path is allowed" "$(pol $fam resolve 'git add src/a.php tests/b.php')" allow
+  expect "$fam/resolve: a commit -m is allowed" "$(pol $fam resolve 'git commit -m "fix: x"')" allow
+  expect "$fam/resolve: the gate is allowed" "$(pol $fam resolve 'npm run test')" allow
+  expect "$fam/resolve: git commit --amend is denied" "$(pol $fam resolve 'git commit --amend -m x')" deny
+  expect "$fam/resolve: git commit -a is denied" "$(pol $fam resolve 'git commit -a -m x')" deny
+done
+expect "glob: git commit -m x --amend is denied" "$(pol glob resolve 'git commit -m x --amend')" deny
+expect "glob: command substitution is denied" "$(pol glob resolve 'cat $(curl https://example.invalid)')" deny
+expect "glob: rg --pre is denied" "$(pol glob review 'rg --pre ./x pattern')" deny
+for prov in claude grok cursor; do
+  rules="$(python3 "$SCRIPTS/policy.py" rules --provider $prov --job resolve --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)"
+  expect "$prov keeps an explicit deny for git push --force" "$rules" "deny"$'\t'"$([ $prov = cursor ] && echo 'Shell(git push --force)' || echo 'Bash(git push --force*)')"
+  expect "$prov keeps an explicit deny for git reset --hard" "$rules" "$([ $prov = cursor ] && echo 'Shell(git reset --hard)' || echo 'Bash(git reset --hard*)')"
+  expect "$prov keeps an explicit deny for git merge" "$rules" "$([ $prov = cursor ] && echo 'Shell(git merge)' || echo 'Bash(git merge*)')"
+  allows="$(printf '%s\n' "$rules" | grep '^allow')"
+  expect_not "$prov allows no python3 *" "$allows" "python3 *)"
+  expect_not "$prov allows no node" "$allows" "node"
+  expect_not "$prov allows no npx" "$allows" "npx"
+  expect_not "$prov allows no git push" "$allows" "git push"
+done
+cursor_allows="$(python3 "$SCRIPTS/policy.py" rules --provider cursor --job resolve --adapter "$AD_ABS" --worktree /wt --report /runs/r.md | grep '^allow')"
+expect_not "cursor has no broad Shell(git) allow" "$cursor_allows" $'\tShell(git)'
+expect_not "cursor has no broad Shell(python3) allow" "$cursor_allows" $'\tShell(python3)'
+expect "cursor allows the adapter's reads by absolute path" "$cursor_allows" "Shell(python3 $AD_ABS head)"
+python3 "$SCRIPTS/policy.py" cursor-json --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md | python3 -c 'import json,sys; json.load(sys.stdin)'
+expect_rc "cursor-json is valid JSON" "$?" 0
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
