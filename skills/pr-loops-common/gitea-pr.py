@@ -21,6 +21,7 @@ Subcommands:
   list   --repo O/R [--state open]   PRs as JSON with number, draft, labels,
                                      head_sha, author, is_bot, assignees
   head   --repo O/R --pr N           print the current head SHA (the gate)
+  labels --repo O/R --pr N           the PR's current label names as JSON (read live)
   label  --repo O/R --pr N [--add L] [--remove L]
   comment --repo O/R --pr N --body-file F
   comments --repo O/R --pr N         existing comments as JSON (marker lookup)
@@ -128,6 +129,10 @@ def cmd_head(a):
     print(sha)
 
 
+def cmd_labels(a):
+    print(json.dumps([l.get("name") for l in api(f"/repos/{a.repo}/issues/{a.pr}/labels")]))
+
+
 def cmd_label(a):
     if not a.add and not a.remove:
         raise SystemExit("gitea-pr: label needs --add and/or --remove")
@@ -229,6 +234,7 @@ def main():
     s.set_defaults(fn=cmd_list)
 
     add("head", cmd_head)
+    add("labels", cmd_labels)
     s = add("label", cmd_label); s.add_argument("--add"); s.add_argument("--remove")
     s = add("comment", cmd_comment); s.add_argument("--body-file", required=True)
     add("comments", cmd_comments)

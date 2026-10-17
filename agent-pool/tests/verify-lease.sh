@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Offline unit cases for the agent pool's lease, cooldown and classification helpers.
-# A pinned clock (AGENT_POOL_NOW) steps across TTLs and cooldowns; nothing sleeps, nothing
-# touches the network, and all state lives in a temp directory.
+# Offline unit cases for the agent pool's claim records, holds, cooldowns, limit classification,
+# prompt rendering and worker permission policy. A pinned clock (AGENT_POOL_NOW) steps across
+# deadlines and cooldowns; nothing sleeps, nothing touches the network, and all state lives in a
+# temp directory.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -10,7 +11,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export AGENT_POOL_STATE="$TMP/state"
 R=owner/repo
 
-lease() { python3 "$SCRIPTS/lease.py" "$@"; }
+claimrec() { python3 "$SCRIPTS/claim-record.py" "$@"; }
 cooldown() { python3 "$SCRIPTS/cooldown.py" "$@"; }
 at() { local t="$1"; shift; AGENT_POOL_NOW="$t" "$@"; }
 
@@ -28,68 +29,150 @@ expect_rc() { # name got-rc wanted-rc
   else fail=$((fail+1)); printf '  FAIL  %s\n         wanted exit %s, got %s\n' "$1" "$3" "$2"; fi
 }
 
-echo "leases and fence tokens"
-f1="$(at 1000 lease claim --repo $R --pr 7 --mode review --worker w1 --provider claude --ttl 100)"
-expect "first claim gets fence 1" "$f1" "1"
-at 1050 lease claim --repo $R --pr 7 --mode review --worker w2 --ttl 100 2>/dev/null
-expect_rc "a live lease cannot be claimed" "$?" 3
-at 1050 lease renew --repo $R --pr 7 --worker w1 --fence 1 --ttl 100
-expect_rc "the holder renews (heartbeat)" "$?" 0
-at 1140 lease check --repo $R --pr 7 --worker w1 --fence 1
-expect_rc "renewal moved expiry past the original TTL" "$?" 0
-at 1150 lease check --repo $R --pr 7 --worker w1 --fence 1 2>/dev/null
-expect_rc "exactly at expires_at the lease is no longer held" "$?" 4
-f2="$(at 1151 lease claim --repo $R --pr 7 --mode review --worker w2 --ttl 100)"
-expect "an expired lease is reclaimable, with a higher fence" "$f2" "2"
-at 1152 lease renew --repo $R --pr 7 --worker w1 --fence 1 2>/dev/null
-expect_rc "the superseded holder cannot renew" "$?" 4
+# A stub Gitea adapter for the label reads and flips reconcile and requeue make.
+cat > "$TMP/adapter.py" <<'PY'
+import json, os, sys
+path = os.environ["STUB_LABELS"]
+a = sys.argv[1:]
+arg = lambda n: a[a.index(n) + 1] if n in a else None
+labels = json.load(open(path)) if os.path.exists(path) else {}
+pr = arg("--pr")
+if a[0] == "labels":
+    print(json.dumps(labels.get(pr, [])))
+elif a[0] == "label":
+    if os.environ.get("STUB_LABEL_FAIL"):
+        sys.exit("stub: label write failed")
+    cur = [l for l in labels.get(pr, []) if l not in (arg("--remove") or "").split(",")]
+    cur += [x for x in (arg("--add") or "").split(",") if x and x not in cur]
+    labels[pr] = cur
+    json.dump(labels, open(path, "w"))
+    print("stub label output that must not leak into the attempt id")
+PY
+export STUB_LABELS="$TMP/labels.json"
+AD="$TMP/adapter.py"
+setlabels() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])) if __import__("os").path.exists(sys.argv[1]) else {}; d[sys.argv[2]]=json.loads(sys.argv[3]); json.dump(d,open(sys.argv[1],"w"))' "$STUB_LABELS" "$1" "$2"; }
+getlabels() { python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1])).get(sys.argv[2],[])))' "$STUB_LABELS" "$1"; }
+field() { python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1"; }
+FLIP=(-- python3 "$AD" label --repo $R --pr 7 --remove agent:ready --add agent:claimed)
 
-out="$(at 1152 lease guard --repo $R --pr 7 --worker w1 --fence 1 -- touch "$TMP/stale-write" 2>&1)"; rc=$?
-expect_rc "a stale fence token blocks the write" "$rc" 4
-expect "the blocked write is reported" "$out" "fence 1 is stale; current fence is 2"
+echo "write-once claim records keyed by attempt_id"
+setlabels 7 '["agent:ready"]'
+a1="$(at 1000 claimrec claim --repo $R --pr 7 --worker w1 --provider claude --job review --branch feature/x \
+  --deadline-secs 100 "${FLIP[@]}")"
+expect "a claim prints a uuid4 attempt_id" "$a1" "-4"
+expect_not "the label command's stdout does not leak into the attempt id" "$a1" "stub"
+expect "the claim flipped the label" "$(getlabels 7)" "agent:claimed"
+rec="$(claimrec show --repo $R --pr 7)"
+expect "the record is schema version 2" "$(field version <<<"$rec")" "2"
+expect "the record carries the attempt_id" "$(field attempt_id <<<"$rec")" "$a1"
+expect "the record names the provider" "$(field provider <<<"$rec")" "claude"
+expect "claimed_at is ISO Z" "$(field claimed_at <<<"$rec")" "1970-01-01T00:16:40Z"
+expect "expected_deadline_at is absolute, claim time plus the deadline" "$(field expected_deadline_at <<<"$rec")" "1970-01-01T00:18:20Z"
+expect_not "there is no renewable expiry or fence counter" "$rec" "expires_at"
+at 1050 claimrec claim --repo $R --pr 7 --worker w2 --provider grok "${FLIP[@]}" 2>/dev/null
+expect_rc "a second claim is refused while a record exists" "$?" 3
+expect "and the record is unchanged (write-once)" "$(claimrec show --repo $R --pr 7 | field attempt_id)" "$a1"
+
+at 1050 claimrec check --repo $R --pr 7 --attempt "$a1"
+expect_rc "the current attempt checks out" "$?" 0
+at 1050 claimrec check --repo $R --pr 7 --attempt not-the-attempt 2>/dev/null
+expect_rc "any other attempt_id is not current" "$?" 4
+at 1050 claimrec guard --repo $R --pr 7 --attempt "$a1" -- touch "$TMP/fresh-write"
+[ -e "$TMP/fresh-write" ] && got=ran || got=not-run
+expect "the current attempt's guarded write runs" "$got" "ran"
+
+echo
+echo "fallback is a new attempt naming the provider actually used"
+a2="$(at 1060 claimrec reattempt --repo $R --pr 7 --attempt "$a1" --provider cursor --deadline-secs 100)"
+rec="$(claimrec show --repo $R --pr 7)"
+expect "reattempt issues a fresh attempt_id" "$(field attempt_id <<<"$rec")" "$a2"
+expect_not "different from the first" "$a2" "$a1"
+expect "the record names the fallback provider" "$(field provider <<<"$rec")" "cursor"
+expect "and records which attempt it superseded" "$(field supersedes <<<"$rec")" "$a1"
+expect "the worker id carries over" "$(field worker_id <<<"$rec")" "w1"
+expect "the new attempt has its own deadline" "$(field expected_deadline_at <<<"$rec")" "1970-01-01T00:19:20Z"
+out="$(at 1061 claimrec guard --repo $R --pr 7 --attempt "$a1" -- touch "$TMP/stale-write" 2>&1)"; rc=$?
+expect_rc "the superseded attempt's write is fenced off" "$rc" 4
+expect "the blocked write says why" "$out" "superseded by $a2"
 [ -e "$TMP/stale-write" ] && got=ran || got=not-run
 expect "the blocked command never ran" "$got" "not-run"
-at 1152 lease guard --repo $R --pr 7 --worker w2 --fence 2 -- touch "$TMP/fresh-write"
-[ -e "$TMP/fresh-write" ] && got=ran || got=not-run
-expect "the current holder's write runs" "$got" "ran"
-at 1152 lease guard --repo $R --pr 7 --worker w1 --fence 2 -- true 2>/dev/null
-expect_rc "the right fence under the wrong worker is refused" "$?" 4
+at 1061 claimrec reattempt --repo $R --pr 7 --attempt "$a1" --provider grok 2>/dev/null
+expect_rc "a superseded attempt cannot reattempt" "$?" 4
+at 1061 claimrec release --repo $R --pr 7 --attempt "$a1" -- touch "$TMP/stale-release" 2>/dev/null
+expect_rc "a superseded attempt cannot release" "$?" 4
+[ -e "$TMP/stale-release" ] && got=ran || got=not-run
+expect "and its release label flip never ran" "$got" "not-run"
 
-at 1300 lease claim --repo $R --pr 9 --mode review --worker same --ttl 100 >/dev/null
-at 1500 lease claim --repo $R --pr 9 --mode review --worker same --ttl 100 >/dev/null
-at 1501 lease guard --repo $R --pr 9 --worker same --fence 1 -- touch "$TMP/restart-write" 2>/dev/null
-expect_rc "a restarted worker with the same id still cannot write on its old fence" "$?" 4
-[ -e "$TMP/restart-write" ] && got=ran || got=not-run
-expect "only the fence tells the two runs apart, and it held" "$got" "not-run"
+echo
+echo "staleness is now > expected_deadline_at, nothing else"
+at 1160 claimrec requeue --repo $R --pr 7 --attempt "$a2" --adapter "$AD" 2>/dev/null
+expect_rc "exactly at the deadline the attempt is not stale" "$?" 4
+expect "so nothing was relabelled" "$(getlabels 7)" "agent:claimed"
+expect "reconcile before the deadline says live" "$(at 1159 claimrec reconcile --repo $R --pr 7 --adapter "$AD")" "live"
+expect "reconcile at the deadline still says live" "$(at 1160 claimrec reconcile --repo $R --pr 7 --adapter "$AD")" "live"
+expect "reconcile one second after says stale" "$(at 1161 claimrec reconcile --repo $R --pr 7 --adapter "$AD")" "stale"
+out="$(at 1161 claimrec requeue --repo $R --pr 7 --attempt "$a2" --adapter "$AD")"
+expect "requeue names the stale provider for its cooldown" "$out" "cursor"
+expect "requeue flips claimed back to ready" "$(getlabels 7)" "agent:ready"
+expect "and deletes the record" "$(claimrec show --repo $R --pr 7)" "{}"
 
-at 1160 lease release --repo $R --pr 7 --worker w2 --fence 2 --outcome ok
-at 1161 lease guard --repo $R --pr 7 --worker w2 --fence 2 -- true 2>/dev/null
-expect_rc "a released lease authorises no more writes" "$?" 4
-f3="$(at 1161 lease claim --repo $R --pr 7 --mode resolve --worker w3 --ttl 100)"
-expect "a released lease is claimable and the fence keeps rising" "$f3" "3"
+echo
+echo "release: label first, then the record"
+setlabels 7 '["agent:ready"]'
+a3="$(at 2000 claimrec claim --repo $R --pr 7 --worker w1 --provider claude "${FLIP[@]}")"
+STUB_LABEL_FAIL=1 at 2001 claimrec release --repo $R --pr 7 --attempt "$a3" \
+  -- python3 "$AD" label --repo $R --pr 7 --remove agent:claimed --add agent:done 2>/dev/null
+expect_rc "a failed release flip reports failure" "$?" 1
+expect "and keeps the record for reconciliation" "$(claimrec show --repo $R --pr 7 | field attempt_id)" "$a3"
+at 2002 claimrec release --repo $R --pr 7 --attempt "$a3" -- python3 "$AD" label --repo $R --pr 7 --remove agent:claimed --add agent:done
+expect_rc "the holder releases" "$?" 0
+expect "the release flipped the label" "$(getlabels 7)" "agent:done"
+expect "then deleted the record" "$(claimrec show --repo $R --pr 7)" "{}"
+at 2003 claimrec guard --repo $R --pr 7 --attempt "$a3" -- true 2>/dev/null
+expect_rc "a released attempt authorises no more writes" "$?" 4
+setlabels 7 '["agent:ready"]'
+STUB_LABEL_FAIL=1 at 2004 claimrec claim --repo $R --pr 7 --worker w1 --provider claude "${FLIP[@]}" 2>/dev/null
+expect_rc "a claim whose label flip fails exits 5" "$?" 5
+expect "and its record is rolled back" "$(claimrec show --repo $R --pr 7)" "{}"
+
+echo
+echo "reconcile (issue #1's table, against live labels)"
+setlabels 11 '["agent:claimed"]'
+expect "claimed with no record goes to needs-human" "$(at 3000 claimrec reconcile --repo $R --pr 11 --adapter "$AD")" "needs-human"
+expect "the label really moved" "$(getlabels 11)" "agent:needs-human"
+setlabels 12 '["agent:ready"]'
+at 3000 claimrec claim --repo $R --pr 12 --worker w1 --provider claude >/dev/null
+setlabels 12 '["agent:done"]'
+expect "a record whose label is no longer claimed is dropped" "$(at 3001 claimrec reconcile --repo $R --pr 12 --adapter "$AD")" "orphan-dropped"
+expect "the orphan record is gone" "$(claimrec show --repo $R --pr 12)" "{}"
+setlabels 13 '["agent:ready"]'
+expect "no label, no record is free" "$(at 3002 claimrec reconcile --repo $R --pr 13 --adapter "$AD")" "free"
+echo '{not json' > "$AGENT_POOL_STATE/claims/owner_repo__14.json"
+setlabels 14 '["agent:claimed"]'
+expect "an unreadable record under a claimed label goes to needs-human" "$(at 3003 claimrec reconcile --repo $R --pr 14 --adapter "$AD")" "needs-human"
 
 echo
 echo "hold state (GiteaFence::issueHeldByHuman without the permanent hold)"
-H=(--hold-labels "review:in-progress,status: in-progress" --bot pool-bot)
-at 1170 lease hold --repo $R --pr 7 --labels '["review:in-progress"]' "${H[@]}" > "$TMP/h"
-expect "a live bot lease is a bot hold" "$(cat "$TMP/h")" "live"
-at 2000 lease hold --repo $R --pr 7 --labels '["review:in-progress"]' "${H[@]}" > "$TMP/h"
-expect "in-progress after the pool's lease expired is a dead hold, reclaimable" "$(cat "$TMP/h")" "expired"
-at 2000 lease hold --repo $R --pr 7 --labels '["review:requested"]' --assignees '["craig"]' "${H[@]}" > "$TMP/h"
+H=(--hold-labels "status: in-progress" --bot pool-bot)
+setlabels 7 '["agent:ready"]'
+a4="$(at 4000 claimrec claim --repo $R --pr 7 --worker w1 --provider claude --deadline-secs 100)"
+at 4050 claimrec hold --repo $R --pr 7 --labels '["agent:claimed"]' "${H[@]}" > "$TMP/h"
+expect "a live claim is a bot hold" "$(cat "$TMP/h")" "live"
+at 4050 claimrec hold --repo $R --pr 8 --labels '["agent:ready"]' --assignees '["craig"]' "${H[@]}" > "$TMP/h"
 expect "a human assignee is a human hold" "$(cat "$TMP/h")" "human"
-at 2000 lease hold --repo $R --pr 7 --labels '["review:requested"]' --assignees '["pool-bot"]' "${H[@]}" > "$TMP/h"
+at 4050 claimrec hold --repo $R --pr 8 --labels '["agent:ready","agent:needs-human"]' "${H[@]}" > "$TMP/h"
+expect "an agent:needs-human label is a human hold" "$(cat "$TMP/h")" "human"
+at 4050 claimrec hold --repo $R --pr 8 --labels '["agent:ready"]' --assignees '["pool-bot"]' "${H[@]}" > "$TMP/h"
 expect "the bot's own assignment is not a human hold" "$(cat "$TMP/h")" "free"
-at 2000 lease hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"
-expect "status: in-progress with no pool lease starts a grace period" "$(cat "$TMP/h")" "orphan-pending"
-at 2599 lease hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"
-expect "inside the grace period it is still pending, not human" "$(cat "$TMP/h")" "orphan-pending"
-at 2600 lease hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"
-expect "after the grace period the orphan hold has expired" "$(cat "$TMP/h")" "orphan-expired"
-at 2601 lease hold --repo $R --pr 8 --labels '["review:requested"]' --grace 600 "${H[@]}" > /dev/null
-at 2602 lease hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"
-expect "a hold that went away and came back starts its grace again" "$(cat "$TMP/h")" "orphan-pending"
-f9="$(at 2603 lease claim --repo $R --pr 8 --mode review --worker w1)"
-expect "the first pool claim on an orphan-tracked PR is fence 1" "$f9" "1"
+at 5000 claimrec hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"
+expect "status: in-progress with no claim starts a grace period" "$(cat "$TMP/h")" "hold-pending"
+at 5599 claimrec hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"
+expect "inside the grace period it is still pending, not human" "$(cat "$TMP/h")" "hold-pending"
+at 5600 claimrec hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"
+expect "after the grace period the orphan hold has expired" "$(cat "$TMP/h")" "hold-expired"
+at 5601 claimrec hold --repo $R --pr 8 --labels '["agent:ready"]' --grace 600 "${H[@]}" > /dev/null
+at 5602 claimrec hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"
+expect "a hold that went away and came back starts its grace again" "$(cat "$TMP/h")" "hold-pending"
 
 echo
 echo "cooldowns"

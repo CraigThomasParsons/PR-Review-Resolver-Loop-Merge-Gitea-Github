@@ -1,56 +1,70 @@
 #!/usr/bin/env bash
-# prod-common.sh MODE
+# prod-common.sh
 #
-# One tick of the provider-parameterized PR worker pool for one Gitea repo. MODE is "review" or
-# "resolve", with the same label handoffs as skills/pr-loops-common/pr-loop.sh:
+# One tick of the provider-parameterized PR worker pool for one Gitea repo (issue #1).
 #
-#   review  : review:requested -> review:in-progress -> review:findings | review:clean
-#   resolve : review:findings  -> review:resolving   -> review:resolved
-#   either  : a real verification failure -> review:needs-human (with a comment)
+# Labels (all overridable, see below):
 #
-# What is different from pr-loop.sh:
+#   agent:ready -> agent:claimed -> agent:done | agent:ready | agent:needs-human
 #
-#   * Workers are headless CLI runs, not tmux panes, and the CLI is chosen per job from
-#     PROVIDER_ORDER (claude, cursor, grok, agy, codex). Unset, the order is claude alone.
-#   * Each PR job is held by a lease (scripts/lease.py) with a TTL, a heartbeat that renews it,
-#     and a fence token that goes up on every claim. Every label and comment write runs through
-#     `lease.py guard`, which checks under the job lock that this worker still holds the current
-#     fence and refuses the write if not. A worker that lost its lease touches nothing.
-#   * A claim label (or "status: in-progress") with no live lease is not a human hold: a dead
-#     run's hold expires with its lease and the PR is reclaimed.
-#   * A provider limit is not a needs-human. The provider gets a cooldown file (exponential
-#     backoff, scripts/cooldown.py), the next provider in the order gets the job, and if none is
-#     left the PR goes back to its trigger label. Setup faults (a permission the pool's own
-#     configuration denied, a missing binary or model) get no cooldown and are reported loudly:
-#     a SETUP FAULT log line, faults/<provider>.json, and exit 2 at the end of the tick.
+# The job kind is derived per PR from its markers; there is no mode argument:
+#   * a review marker for the current head with findings > 0          -> resolve
+#   * a review marker for the current head with no findings, or a resolve marker that already
+#     answered the latest review at the current head                  -> settled without a provider
+#   * anything else                                                   -> review
+# A review with findings goes back to agent:ready (queued for resolve); a clean review and a
+# verified resolve go to agent:done; a real verification failure goes to agent:needs-human with a
+# comment; a limit, a timeout or no provider completing goes back to agent:ready.
 #
-# Limits are recognised by scripts/classify.py's signatures (claude's PARKED product dialogs
-# and "Credit balance is too low"; 429, rate limit, quota exceeded, insufficient credits for
-# every provider) and by one behavioural signature: a run that ends inside
-# AGENT_POOL_FAST_FAIL_SECS without leaving its marker comment. That is the 32-second credit wall
-# that mislabelled a dozen PRs needs-human.
+# Claims (scripts/claim-record.py): one write-once record per PR keyed by attempt_id, carrying
+# an absolute expected_deadline_at computed at claim time. Nothing renews it. Every label write,
+# comment and push runs through `claim-record.py guard|release`, which re-reads the record under
+# the job lock and refuses if this attempt is no longer current. A provider fallback inside a
+# job is a new attempt (reattempt), so the record always names the provider actually running.
+# Each tick reconciles claimed PRs against live labels (issue #1's table): a claim past its
+# deadline is requeued and its provider cooled down, a claimed label with no record goes to
+# agent:needs-human, and a record with no claimed label is dropped.
 #
-# Permissions are per worktree and per invocation only: claude --allowedTools/--disallowedTools,
-# cursor .cursor/cli.json written into the worktree (excluded via info/exclude, never committed),
-# grok --allow/--deny, agy flags. Nothing global is widened.
+# Workers never publish. They read, edit and commit in a detached worktree and write a report
+# file (or, when they cannot write files, end with the report as their final response). The
+# controller then checks the claim is still held, validates the report's marker, pushes
+# HEAD:refs/heads/<headref> as a fast-forward (never a protected branch, never a + refspec) and
+# posts the report, all through the claim guard. Workers run in their own process group
+# (setsid) with remote.origin.pushurl overridden to a dead path, and a read-only watcher kills
+# the whole group as soon as the claim is superseded.
+#
+# Limits are a cooldown, never a needs-human: scripts/classify.py's signatures, plus a run that
+# ends inside AGENT_POOL_FAST_FAIL_SECS without a marker (the 32-second credit wall). Setup
+# faults (a permission the pool's own policy denied, a missing binary or model) get no cooldown:
+# a SETUP FAULT log line, faults/<provider>.json, and exit 2 at the end of the tick.
+#
+# Permissions come from scripts/policy.py, per worktree and per invocation only: claude
+# --allowedTools/--disallowedTools, cursor .cursor/cli.json in the worktree (no --force), grok
+# --allow/--deny. agy has no rule list: it reviews in --mode plan and is only eligible for
+# resolve with AGY_AUTO_APPROVE=1. Nothing global is widened.
 #
 # Environment knobs (all optional unless marked):
 #   AGENT_POOL_MAIN (required, or PR_LOOP_MAIN)  the repo's main clone
 #   AGENT_POOL_REPO (or PR_LOOP_REPO)            owner/name on Gitea
 #   PROVIDER_ORDER=claude          comma list; codex has a slot but is never in the default
-#   AGENT_POOL_WORKER_ID           stable worker id (default <host>-pool-<mode>)
-#   AGENT_POOL_STATE               leases, cooldowns, faults, runs, pool.log (~/.local/state/agent-pool)
+#   AGENT_POOL_WORKER_ID           stable worker id (default <host>-pool)
+#   AGENT_POOL_STATE               claims, cooldowns, faults, runs, pool.log (~/.local/state/agent-pool)
 #   AGENT_POOL_WORKTREES           where job worktrees go (default .pool-worktrees next to the clone)
-#   AGENT_POOL_LEASE_TTL=900  AGENT_POOL_HEARTBEAT=300  AGENT_POOL_ORPHAN_GRACE=3600
-#   AGENT_POOL_FAST_FAIL_SECS=90   AGENT_POOL_MAX_JOBS=2   WORKER_TIMEOUT=2700   DRY_RUN=1
+#   AGENT_POOL_LABEL_READY=agent:ready  AGENT_POOL_LABEL_CLAIMED=agent:claimed
+#   AGENT_POOL_LABEL_DONE=agent:done    AGENT_POOL_LABEL_NEEDS_HUMAN=agent:needs-human
+#   AGENT_POOL_DEADLINE_SECS=2700  a claim's expected_deadline_at, seeded once per attempt
+#   WORKER_TIMEOUT=2400            per provider run; must be shorter than the deadline
+#   AGENT_POOL_WATCH_SECS=30       how often the watcher re-reads the claim during a run
+#   AGENT_POOL_ORPHAN_GRACE=3600   AGENT_POOL_FAST_FAIL_SECS=90   AGENT_POOL_MAX_JOBS=2   DRY_RUN=1
 #   AGENT_POOL_HOLD_LABELS="status: in-progress"   extra labels that read as a hold
+#   AGENT_POOL_PROTECTED_BRANCHES=develop,main,master,release   never pushed to (nor release/*)
 #   AGENT_POOL_BOT                 the pool's Gitea login; any other assignee is a human hold
 #   AGENT_POOL_MODEL_<PROVIDER>    model per provider (claude=opus cursor=auto grok=grok-build;
 #                                  agy runs on its own default without one; codex is a setup fault)
-#   AGENT_POOL_PROMPT_<PROVIDER>   prompt template per provider (default prompts/<mode>.generic.txt)
+#   AGENT_POOL_PROMPT_<PROVIDER>_<JOB>   prompt template (default prompts/<job>.generic.txt)
 #   CLAUDE_BIN CURSOR_AGENT_BIN GROK_BIN AGY_BIN CODEX_BIN  full paths (default ~/.local/bin/<cli>)
-#   CLAUDE_PERMISSION_MODE=auto  GROK_PERMISSION_MODE=bypassPermissions  CODEX_SANDBOX_MODE=workspace-write
-#   AGY_AUTO_APPROVE=1             pass --dangerously-skip-permissions (agy has no deny list)
+#   CLAUDE_PERMISSION_MODE=default  GROK_PERMISSION_MODE=dontAsk  CODEX_SANDBOX_MODE=workspace-write
+#   AGY_AUTO_APPROVE=1             let agy take resolve jobs (--dangerously-skip-permissions)
 #   AGY_PRINT_TIMEOUT=0            agy's own print timeout; 0 leaves WORKER_TIMEOUT as the only limit
 #
 # Exit codes: 0 for a normal tick (including nothing to do); 2 for a setup fault.
@@ -71,8 +85,7 @@ if [ -z "${AGENT_POOL_PINNED:-}" ]; then
   exit $rc
 fi
 
-MODE="${1:-}"
-case "$MODE" in review|resolve) ;; *) echo "usage: prod-common.sh review|resolve" >&2; exit 2 ;; esac
+[ "$#" -eq 0 ] || { echo "usage: prod-common.sh (no arguments; the job kind is derived per PR)" >&2; exit 2; }
 
 # ---------------------------------------------------------------- configuration
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -88,16 +101,22 @@ export AGENT_POOL_STATE="$STATE"
 LOG="$STATE/pool.log"
 RUNS="$STATE/runs"
 PROVIDER_ORDER="${PROVIDER_ORDER:-claude}"
-WORKER_ID="${AGENT_POOL_WORKER_ID:-$(hostname -s 2>/dev/null || echo host)-pool-$MODE}"
-LEASE_TTL="${AGENT_POOL_LEASE_TTL:-900}"
-HEARTBEAT="${AGENT_POOL_HEARTBEAT:-300}"
-export AGENT_POOL_LEASE_TTL="$LEASE_TTL"
+WORKER_ID="${AGENT_POOL_WORKER_ID:-$(hostname -s 2>/dev/null || echo host)-pool}"
+DEADLINE_SECS="${AGENT_POOL_DEADLINE_SECS:-2700}"
+export AGENT_POOL_DEADLINE_SECS="$DEADLINE_SECS"
+WATCH_SECS="${AGENT_POOL_WATCH_SECS:-30}"
 FAST_FAIL_SECS="${AGENT_POOL_FAST_FAIL_SECS:-90}"
 MAX_JOBS="${AGENT_POOL_MAX_JOBS:-2}"
-WORKER_TIMEOUT="${WORKER_TIMEOUT:-2700}"
+WORKER_TIMEOUT="${WORKER_TIMEOUT:-2400}"
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_HOLD="${AGENT_POOL_HOLD_LABELS-status: in-progress}"
 BOT="${AGENT_POOL_BOT:-}"
+READY="${AGENT_POOL_LABEL_READY:-agent:ready}"
+CLAIMED="${AGENT_POOL_LABEL_CLAIMED:-agent:claimed}"
+DONE="${AGENT_POOL_LABEL_DONE:-agent:done}"
+HUMAN="${AGENT_POOL_LABEL_NEEDS_HUMAN:-agent:needs-human}"
+PROTECTED="${AGENT_POOL_PROTECTED_BRANCHES:-develop,main,master,release}"
+NOPUSH_URL="/nonexistent/agent-pool-workers-never-push"
 
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 CURSOR_AGENT_BIN="${CURSOR_AGENT_BIN:-$HOME/.local/bin/cursor-agent}"
@@ -105,42 +124,13 @@ GROK_BIN="${GROK_BIN:-$HOME/.local/bin/grok}"
 AGY_BIN="${AGY_BIN:-$HOME/.local/bin/agy}"
 CODEX_BIN="${CODEX_BIN:-$HOME/.local/bin/codex}"
 
-case "$MODE" in
-  review)  TRIGGER="review:requested"; CLAIM="review:in-progress"; OK="review:findings"; CLEAN="review:clean" ;;
-  resolve) TRIGGER="review:findings";  CLAIM="review:resolving";   OK="review:resolved"; CLEAN="" ;;
-esac
-FAIL="review:needs-human"
-HOLD_LABELS="$CLAIM${EXTRA_HOLD:+,$EXTRA_HOLD}"
-
 mkdir -p "$STATE" "$RUNS"
-log() { printf '%s [pool:%s] %s\n' "$(date -Is)" "$MODE" "$*" | tee -a "$LOG" >&2; }
+log() { printf '%s [pool] %s\n' "$(date -Is)" "$*" | tee -a "$LOG" >&2; }
 die() { log "FATAL: $*"; exit 2; }
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9.-' '_'; }
 SETUP_FAULTS=0
 
-# ---------------------------------------------------------------- permissions
-# One provider-neutral policy, translated per CLI. The deny list is what a worker may never do;
-# review mode also may not stage, commit or push. Staging is by named path only.
-DENY_SHELL=("git push --force*" "git push -f*" "git push * --force*" "git push * -f *" "git push --delete*"
-  "git push * --delete *" "git reset --hard*" "git branch -D*" "git add -A*" "git add --all*" "git add -u*"
-  "git add ." "git add . *" "git commit -a*" "git commit --all*" "git config --global*"
-  "tea *" "gh *" "*gitea-pr.py label*" "*gitea-pr.py merge*" "sudo *" "rm -rf*" "systemctl *" "crontab *")
-DENY_SHELL_REVIEW=("git add *" "git commit *" "git push *")
-ALLOW_SHELL=("git log *" "git diff *" "git show *" "git status*" "git rev-parse *" "git merge-base *"
-  "git fetch *" "git branch *" "python3 *" "node *" "cat *" "sed *" "wc *" "ls *" "head *" "tail *")
-ALLOW_SHELL_RESOLVE=("git add *" "git commit *" "git push origin HEAD:*" "npm run *" "npm ci*" "npx *"
-  "dotnet build*" "dotnet test*" "just *" "composer test*" "composer lint*" "php artisan test*"
-  "vendor/bin/pint*" "vendor/bin/phpunit*")
-# Cursor's Shell() rules match a command prefix, not a glob, so its list is spelled out.
-CURSOR_DENY=("git push --force" "git push -f" "git push --delete" "git reset --hard" "git branch -D"
-  "git add -A" "git add --all" "git add -u" "git add ." "git commit -a" "git commit --all"
-  "git config --global" "tea" "gh" "sudo" "rm -rf" "systemctl" "crontab")
-CURSOR_DENY_REVIEW=("git add" "git commit" "git push")
-CURSOR_ALLOW=("git" "python3" "node" "cat" "sed" "wc" "ls" "head" "tail")
-CURSOR_ALLOW_RESOLVE=("npm" "npx" "dotnet" "just" "composer" "php" "vendor/bin/pint" "vendor/bin/phpunit")
-
-shell_deny() { printf '%s\n' "${DENY_SHELL[@]}"; [ "$MODE" = review ] && printf '%s\n' "${DENY_SHELL_REVIEW[@]}"; return 0; }
-shell_allow() { printf '%s\n' "${ALLOW_SHELL[@]}"; [ "$MODE" = resolve ] && printf '%s\n' "${ALLOW_SHELL_RESOLVE[@]}"; return 0; }
-
+# ---------------------------------------------------------------- providers
 model_for() { # provider
   case "$1" in
     claude) printf '%s' "${AGENT_POOL_MODEL_CLAUDE:-opus}" ;;
@@ -156,9 +146,9 @@ bin_for() { # provider
     grok) printf '%s' "$GROK_BIN" ;; agy) printf '%s' "$AGY_BIN" ;; codex) printf '%s' "$CODEX_BIN" ;;
   esac
 }
-prompt_for() { # provider
-  local var="AGENT_POOL_PROMPT_${1^^}"
-  printf '%s' "${!var:-${AGENT_POOL_PROMPT:-$PROMPTS/$MODE.generic.txt}}"
+prompt_for() { # provider job
+  local var="AGENT_POOL_PROMPT_${1^^}_${2^^}"
+  printf '%s' "${!var:-$PROMPTS/$2.generic.txt}"
 }
 
 setup_fault() { # provider reason
@@ -170,7 +160,7 @@ setup_fault() { # provider reason
 # PROVIDERS := the providers in PROVIDER_ORDER that are not cooling down and are runnable at all.
 # Runs in the calling shell (never in $(...)) so setup faults are counted.
 select_providers() {
-  local p bin model
+  local p bin model job
   PROVIDERS=()
   for p in $(python3 "$SCRIPTS/cooldown.py" eligible --order "$PROVIDER_ORDER" 2>/dev/null); do
     case "$p" in claude|cursor|grok|agy|codex) ;; *) setup_fault "$p" "unknown provider in PROVIDER_ORDER"; continue ;; esac
@@ -178,7 +168,9 @@ select_providers() {
     case "$bin" in /*) ;; *) setup_fault "$p" "binary path '$bin' is not absolute"; continue ;; esac
     [ -x "$bin" ] || { setup_fault "$p" "binary $bin is missing or not executable"; continue; }
     [ -n "$model" ] || [ "$p" = agy ] || { setup_fault "$p" "no model configured (set AGENT_POOL_MODEL_${p^^})"; continue; }
-    [ -f "$(prompt_for "$p")" ] || { setup_fault "$p" "missing prompt template $(prompt_for "$p")"; continue; }
+    for job in review resolve; do
+      [ -f "$(prompt_for "$p" "$job")" ] || { setup_fault "$p" "missing prompt template $(prompt_for "$p" "$job")"; continue 2; }
+    done
     PROVIDERS+=("$p")
   done
 }
@@ -192,6 +184,27 @@ drop_cooling_providers() {
   PROVIDERS=("${kept[@]}")
 }
 
+# JOB_PROVIDERS := PROVIDERS that may take a job of this kind. agy has no deny list, so it only
+# resolves when the operator has opted in to running it unattended.
+job_providers() { # job
+  local p
+  JOB_PROVIDERS=()
+  for p in "${PROVIDERS[@]}"; do
+    [ "$1" = resolve ] && [ "$p" = agy ] && [ "${AGY_AUTO_APPROVE:-0}" != 1 ] && continue
+    JOB_PROVIDERS+=("$p")
+  done
+}
+
+# The only refs the controller pushes are refs/heads/<headref> for an ordinary feature branch.
+headref_safe() { # headref
+  local h="$1" b prot
+  case "$h" in ""|+*|-*|*:*|refs/*|release/*|*..*) return 1 ;; esac
+  IFS=, read -ra prot <<<"$PROTECTED"
+  for b in "${prot[@]}"; do [ "$h" = "$b" ] && return 1; done
+  git -C "$MAIN" check-ref-format --branch "$h" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- worktrees and permissions
 # Keep the pool's per-worktree tool configuration out of every commit. info/exclude is shared by
 # all worktrees of the clone; skip-worktree covers a repo that already tracks .cursor/cli.json.
 exclude_tool_config() { # wt
@@ -206,62 +219,51 @@ exclude_tool_config() { # wt
   fi
 }
 
-write_cursor_permissions() { # wt
-  local wt="$1"
-  mkdir -p "$wt/.cursor"
-  {
-    printf '%s\n' "${CURSOR_ALLOW[@]}" | sed 's/^/allow\tShell(/; s/$/)/'
-    [ "$MODE" = resolve ] && printf '%s\n' "${CURSOR_ALLOW_RESOLVE[@]}" | sed 's/^/allow\tShell(/; s/$/)/'
-    printf 'allow\tRead(**)\n'
-    [ "$MODE" = resolve ] && printf 'allow\tWrite(**)\n'
-    printf '%s\n' "${CURSOR_DENY[@]}" "python3 $ADAPTER label" "python3 $ADAPTER merge" | sed 's/^/deny\tShell(/; s/$/)/'
-    [ "$MODE" = review ] && printf '%s\n' "${CURSOR_DENY_REVIEW[@]}" | sed 's/^/deny\tShell(/; s/$/)/'
-    true
-  } | python3 -c '
-import json, sys
-perms = {"allow": [], "deny": []}
-for line in sys.stdin:
-    kind, rule = line.rstrip("\n").split("\t", 1)
-    perms[kind].append(rule)
-json.dump({"permissions": perms}, open(sys.argv[1], "w"), indent=2)
-' "$wt/.cursor/cli.json"
+policy() { # action provider job wt report
+  python3 "$SCRIPTS/policy.py" "$1" --provider "$2" --job "$3" --adapter "$ADAPTER" --worktree "$4" --report "$5"
+}
+load_policy() { # provider job wt report -> ALLOW DENY
+  local kind rule
+  ALLOW=(); DENY=()
+  while IFS=$'\t' read -r kind rule; do
+    case "$kind" in allow) ALLOW+=("$rule") ;; deny) DENY+=("$rule") ;; esac
+  done < <(policy rules "$@")
 }
 
 # ---------------------------------------------------------------- adapters
-# build_cmd provider wt prompt-file -> sets CMD (argv) and CMD_STDIN (file fed to stdin).
+# build_cmd provider job wt prompt-file report -> CMD (argv), CMD_ENV (env(1) options), CMD_STDIN.
 # Full binary paths always; never a bare `agent`, which is Cursor's alias.
 build_cmd() {
-  local p="$1" wt="$2" prompt="$3" model rule
+  local p="$1" job="$2" wt="$3" prompt="$4" report="$5" model rule
   model="$(model_for "$p")"
-  CMD=(); CMD_STDIN=/dev/null
+  CMD=(); CMD_ENV=(); CMD_STDIN=/dev/null; ALLOW=(); DENY=()
   case "$p" in
     claude)
+      load_policy claude "$job" "$wt" "$report"
       # The stale ANTHROPIC_API_KEY incident: never let an inherited API key pick the billing account.
-      CMD=(env -u ANTHROPIC_API_KEY "$CLAUDE_BIN" -p --output-format json --model "$model"
-        --permission-mode "${CLAUDE_PERMISSION_MODE:-auto}" --allowedTools Read Grep Glob)
-      [ "$MODE" = resolve ] && CMD+=(Edit Write MultiEdit)
-      while IFS= read -r rule; do CMD+=("Bash($rule)"); done < <(shell_allow)
-      CMD+=(--disallowedTools)
-      while IFS= read -r rule; do CMD+=("Bash($rule)"); done < <(shell_deny)
+      CMD_ENV=(-u ANTHROPIC_API_KEY)
+      CMD=("$CLAUDE_BIN" -p --output-format json --model "$model"
+        --permission-mode "${CLAUDE_PERMISSION_MODE:-default}" --allowedTools "${ALLOW[@]}"
+        --disallowedTools "${DENY[@]}")
       CMD_STDIN="$prompt" ;;
     cursor)
-      # Always --model: cursor-agent saves the model it is given as the global default.
-      CMD=("$CURSOR_AGENT_BIN" -p --force --trust --workspace "$wt" --output-format stream-json
+      # No --force: the per-worktree cli.json allowlist decides. Always --model: cursor-agent
+      # saves the model it is given as the global default.
+      CMD=("$CURSOR_AGENT_BIN" -p --trust --workspace "$wt" --output-format stream-json
         --model "$model" "$(cat "$prompt")") ;;
     grok)
+      load_policy grok "$job" "$wt" "$report"
       CMD=("$GROK_BIN" --cwd "$wt" --prompt-file "$prompt" --output-format json
-        --permission-mode "${GROK_PERMISSION_MODE:-bypassPermissions}")
-      while IFS= read -r rule; do CMD+=(--allow "Bash($rule)"); done < <(shell_allow)
-      CMD+=(--allow Read --allow Grep)
-      [ "$MODE" = resolve ] && CMD+=(--allow "Edit($wt/**)" --allow "Write($wt/**)")
-      while IFS= read -r rule; do CMD+=(--deny "Bash($rule)"); done < <(shell_deny)
-      [ "$MODE" = review ] && CMD+=(--deny "Edit($wt/**)")
+        --permission-mode "${GROK_PERMISSION_MODE:-dontAsk}")
+      for rule in "${ALLOW[@]}"; do CMD+=(--allow "$rule"); done
+      for rule in "${DENY[@]}"; do CMD+=(--deny "$rule"); done
       CMD+=(-m "$model") ;;
     agy)
       # No inner timeout and no print timeout by default: WORKER_TIMEOUT is the only clock.
+      # Plan mode cannot write files, so a review's report is agy's final response.
       CMD=("$AGY_BIN" -p "$(cat "$prompt")" --output-format json --print-timeout "${AGY_PRINT_TIMEOUT:-0}")
-      [ -n "$model" ] && CMD+=(--model "$model")
-      [ "${AGY_AUTO_APPROVE:-0}" = 1 ] && CMD+=(--dangerously-skip-permissions) ;;
+      if [ "$job" = review ]; then CMD+=(--mode plan); else CMD+=(--dangerously-skip-permissions); fi
+      [ -n "$model" ] && CMD+=(--model "$model") ;;
     codex)
       CMD=("$CODEX_BIN" exec --ephemeral --sandbox "${CODEX_SANDBOX_MODE:-workspace-write}"
         --model "$model" --cd "$wt" -)
@@ -270,11 +272,12 @@ build_cmd() {
 }
 
 # ---------------------------------------------------------------- verification
-# The same gates as pr-loop.sh's verify(), with one distinction the pool needs: a missing marker
-# is reported as fail-nomarker, because a fast run that left no marker is a limit, not a defect.
-verify() { # pr sha headref -> ok | clean | fail-nomarker:<reason> | fail:<reason>
-  local pr="$1" sha="$2" headref="$3"
-  if [ "$MODE" = "review" ]; then
+# The same gates as pr-loop.sh's verify(), read from Gitea after the controller has published,
+# with one distinction the pool needs: a missing marker is reported as fail-nomarker, because a
+# fast run that left no marker is a limit, not a defect.
+verify() { # job pr base-sha headref -> ok | clean | fail-nomarker:<reason> | fail:<reason>
+  local job="$1" pr="$2" sha="$3" headref="$4"
+  if [ "$job" = "review" ]; then
     local m; m="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
     if [ "${m%% *}" != "$sha" ]; then echo "fail-nomarker:no review comment carrying the marker for $sha was found"; return; fi
     if [ "${m##* }" = "0" ]; then echo clean; else echo ok; fi
@@ -282,7 +285,7 @@ verify() { # pr sha headref -> ok | clean | fail-nomarker:<reason> | fail:<reaso
   fi
   local newsha; newsha="$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)"
   if [ -z "$newsha" ]; then echo "fail:could not read the PR head after the run"; return; fi
-  git -C "$MAIN" fetch origin --quiet "$headref" 2>/dev/null
+  git -C "$MAIN" fetch origin --quiet "refs/heads/$headref" 2>/dev/null
   local rm; rm="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
   if [ -z "$rm" ]; then echo "fail-nomarker:the resolver left no disposition marker, so what it did to each finding is unknown"; return; fi
   local r_head r_reviewed r_fixed r_deferred r_noted
@@ -311,138 +314,235 @@ verify() { # pr sha headref -> ok | clean | fail-nomarker:<reason> | fail:<reaso
   echo ok
 }
 
-# ---------------------------------------------------------------- leases and fenced writes
-JOB_PR=""; JOB_FENCE=""; JOB_WT=""; JOB_LOST=0; JOB_LOSTFILE=""; JOB_PIDFILE=""; HB_PID=""
-lease() { python3 "$SCRIPTS/lease.py" "$@"; }
-jlog() { log "$REPO#$JOB_PR fence=$JOB_FENCE $*"; }
+# derive_job pr sha -> DJ (review|resolve), DBASE (the head verify measures from), DRHEAD, DNFIND.
+derive_job() {
+  local pr="$1" sha="$2" m mhead mcount r r_head r_reviewed
+  DJ=review; DBASE="$sha"; DRHEAD=""; DNFIND=""
+  m="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
+  mhead="${m%% *}"; mcount="${m##* }"
+  if [ -n "$m" ] && [ "$mhead" = "$sha" ]; then
+    # Findings for this head need a resolve; a clean review settles on the pre-verify.
+    [ "${mcount:-0}" -gt 0 ] && { DJ=resolve; DRHEAD="$sha"; DNFIND="$mcount"; }
+    return
+  fi
+  r="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
+  read -r r_head r_reviewed _ <<<"$r"
+  if [ -n "$r" ] && [ -n "$m" ] && [ "$r_head" = "$sha" ] && [ "$r_reviewed" = "$mhead" ] \
+     && [ "$(verify resolve "$pr" "$mhead" "$3")" = ok ]; then
+    DJ=resolve; DBASE="$mhead"; DRHEAD="$mhead"; DNFIND="$mcount"
+  fi
+}
 
-# Every Gitea write: checked against the current fence under the job lock, then performed.
-gwrite() { # adapter-args...
-  local err rc
-  err="$(lease guard --repo "$REPO" --pr "$JOB_PR" --worker "$WORKER_ID" --fence "$JOB_FENCE" \
-    -- python3 "$ADAPTER" "$@" 2>&1 >/dev/null)"
+# ---------------------------------------------------------------- claims and guarded writes
+JOB_PR=""; ATTEMPT=""; JOB_KIND=""; JOB_WT=""; JOB_LOST=0; JOB_LOSTFILE=""
+REVIEW_HEAD=""; FINDINGS=""; WORKER_PG=""; WATCH_PID=""; TICK_ID="$(date +%s)-$$"
+claim() { local action="$1"; shift; python3 "$SCRIPTS/claim-record.py" "$action" --repo "$REPO" --pr "$JOB_PR" "$@"; }
+jlog() { log "$REPO#$JOB_PR${ATTEMPT:+ attempt=${ATTEMPT:0:8}} $*"; }
+wt_for() { printf '%s' "$WT_ROOT/pool-$JOB_PR-$TICK_ID-$1"; }
+
+# Run one write under the claim guard. Exit 4 means this attempt was superseded.
+guarded() { # what cmd...
+  local what="$1" err rc; shift
+  err="$(claim guard --attempt "$ATTEMPT" -- "$@" 2>&1 >/dev/null)"
   rc=$?
   if [ "$rc" -eq 4 ]; then
-    JOB_LOST=1; jlog "lost the lease; write aborted ($1): ${err//$'\n'/ }"
+    JOB_LOST=1; jlog "claim superseded; $what refused: ${err//$'\n'/ }"
   elif [ "$rc" -ne 0 ]; then
-    jlog "warning: gitea $1 failed: ${err//$'\n'/ }"
+    jlog "warning: $what failed: ${err//$'\n'/ }"
   fi
   return "$rc"
 }
-relabel() { # remove add
-  if [ "$DRY_RUN" = "1" ]; then jlog "DRY: $1 -> $2"; return 0; fi
-  gwrite label --repo "$REPO" --pr "$JOB_PR" --remove "$1" --add "$2"
+comment_file() { # body-file
+  guarded "comment" python3 "$ADAPTER" comment --repo "$REPO" --pr "$JOB_PR" --body-file "$1"
 }
-comment() { # body
-  local bf rc; bf="$(mktemp)"; printf '%s\n' "$1" > "$bf"
-  gwrite comment --repo "$REPO" --pr "$JOB_PR" --body-file "$bf"; rc=$?
-  rm -f "$bf"; return "$rc"
+release_to() { # label
+  local err rc
+  err="$(claim release --attempt "$ATTEMPT" -- python3 "$ADAPTER" label --repo "$REPO" --pr "$JOB_PR" \
+    --remove "$CLAIMED" --add "$1" 2>&1 >/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 4 ]; then JOB_LOST=1; jlog "claim superseded; release refused: ${err//$'\n'/ }"
+  elif [ "$rc" -ne 0 ]; then jlog "warning: release to $1 failed; the record stays for reconciliation: ${err//$'\n'/ }"; fi
+  return "$rc"
 }
 
-heartbeat_start() {
-  local parent=$$
-  JOB_LOSTFILE="$RUNS/lost-$JOB_PR-$JOB_FENCE"; JOB_PIDFILE="$RUNS/pid-$JOB_PR-$JOB_FENCE"
-  rm -f "$JOB_LOSTFILE" "$JOB_PIDFILE"
+# ---------------------------------------------------------------- worker process group and watcher
+spawn_worker() { # out err
+  # setsid makes the worker a session and process-group leader, so $! is also its group id and
+  # one kill reaches everything it started. The pushurl override makes any worker push fail
+  # whatever its CLI permits.
+  ( cd "$JOB_WT" && exec setsid timeout -k 30 "$WORKER_TIMEOUT" env "${CMD_ENV[@]}" GIT_CONFIG_COUNT=1 \
+      GIT_CONFIG_KEY_0=remote.origin.pushurl GIT_CONFIG_VALUE_0="$NOPUSH_URL" "${CMD[@]}" \
+      <"$CMD_STDIN" >"$1" 2>"$2" ) &
+  WORKER_PG=$!
+}
+kill_worker_group() {
+  [ -n "$WORKER_PG" ] || return 0
+  kill -TERM -- "-$WORKER_PG" 2>/dev/null && { sleep 1; kill -KILL -- "-$WORKER_PG" 2>/dev/null; }
+  WORKER_PG=""
+}
+
+# A read-only watcher, not a renewer: it re-reads the claim and kills the worker's whole group
+# the moment this attempt is no longer current.
+watch_start() {
+  local parent=$$ pg="$WORKER_PG" attempt="$ATTEMPT" pr="$JOB_PR"
+  JOB_LOSTFILE="$RUNS/lost-$pr-$attempt"; rm -f "$JOB_LOSTFILE"
   (
-    while sleep "$HEARTBEAT"; do
-      # A heartbeat that outlives its tick would keep a dead run's lease alive forever.
+    trap - EXIT INT
+    sp=""
+    trap '[ -n "$sp" ] && kill "$sp" 2>/dev/null; exit 0' TERM
+    while :; do
+      sleep "$WATCH_SECS" & sp=$!
+      wait "$sp"
       kill -0 "$parent" 2>/dev/null || exit 0
-      if ! lease renew --repo "$REPO" --pr "$JOB_PR" --worker "$WORKER_ID" --fence "$JOB_FENCE" 2>>"$LOG"; then
+      kill -0 "$pg" 2>/dev/null || exit 0
+      if ! python3 "$SCRIPTS/claim-record.py" check --repo "$REPO" --pr "$pr" --attempt "$attempt" 2>>"$LOG"; then
         : > "$JOB_LOSTFILE"
-        pid="$(cat "$JOB_PIDFILE" 2>/dev/null)"; [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
+        kill -TERM -- "-$pg" 2>/dev/null; sleep 2; kill -KILL -- "-$pg" 2>/dev/null
         exit 0
       fi
     done
   ) &
-  HB_PID=$!
+  WATCH_PID=$!
 }
-heartbeat_stop() {
-  [ -n "$HB_PID" ] && { pkill -P "$HB_PID" 2>/dev/null; kill "$HB_PID" 2>/dev/null; wait "$HB_PID" 2>/dev/null; }
-  HB_PID=""
+watch_stop() {
+  [ -n "$WATCH_PID" ] && { kill "$WATCH_PID" 2>/dev/null; wait "$WATCH_PID" 2>/dev/null; }
+  WATCH_PID=""
 }
 still_held() {
-  [ ! -f "$JOB_LOSTFILE" ] && lease check --repo "$REPO" --pr "$JOB_PR" --worker "$WORKER_ID" --fence "$JOB_FENCE" 2>/dev/null
+  [ ! -f "$JOB_LOSTFILE" ] && claim check --attempt "$ATTEMPT" 2>/dev/null
 }
 
-remove_worktree() { # wt [--force]
+remove_worktree() { # wt
   [ -n "$1" ] && [ -d "$1" ] || return 0
-  git -C "$MAIN" worktree remove ${2:-} "$1" >/dev/null 2>&1 || jlog "worktree $1 kept (uncommitted changes or busy); inspect and remove by hand"
+  git -C "$MAIN" worktree remove --force "$1" >/dev/null 2>&1 || jlog "worktree $1 kept (busy); inspect and remove by hand"
 }
 
-end_job() { # outcome; drops the lease and local state, whether or not the writes went through
-  heartbeat_stop
-  if [ "$JOB_LOST" -eq 0 ]; then
-    lease release --repo "$REPO" --pr "$JOB_PR" --worker "$WORKER_ID" --fence "$JOB_FENCE" --outcome "$1" 2>>"$LOG" \
-      || jlog "release refused; the lease had already moved on"
-  fi
+end_job() {
+  kill_worker_group; watch_stop
   remove_worktree "$JOB_WT"
-  rm -f "$JOB_LOSTFILE" "$JOB_PIDFILE"
-  JOB_PR=""; JOB_FENCE=""; JOB_WT=""; JOB_LOST=0
+  rm -f "$JOB_LOSTFILE"
+  JOB_PR=""; ATTEMPT=""; JOB_KIND=""; JOB_WT=""; JOB_LOST=0; JOB_LOSTFILE=""
 }
 
-finish_job() { # outcome(ok|clean|fail|trigger) reason
-  local outcome="$1" reason="$2"
-  case "$outcome" in
-    ok)      relabel "$CLAIM" "$OK" ;;
-    clean)   relabel "$CLAIM" "$CLEAN" ;;
-    trigger) relabel "$CLAIM" "$TRIGGER" ;;
-    fail)    relabel "$CLAIM" "$FAIL" && [ "$JOB_LOST" -eq 0 ] && \
-               comment "Automated $MODE pool stopped on this PR: $reason. A human needs to look; the pool log on the review host has the detail." ;;
-  esac
-  jlog "$outcome ($reason)"
-  end_job "$outcome"
+finish_job() { # done|ready|fail reason
+  local outcome="$1" reason="$2" target bf
+  case "$outcome" in done) target="$DONE" ;; ready) target="$READY" ;; fail) target="$HUMAN" ;; esac
+  if [ "$outcome" = fail ] && [ "$JOB_LOST" -eq 0 ]; then
+    bf="$(mktemp)"
+    printf 'Automated %s pool stopped on this PR: %s. A human needs to look; the pool log on the review host has the detail.\n' \
+      "$JOB_KIND" "$reason" > "$bf"
+    comment_file "$bf"; rm -f "$bf"
+  fi
+  [ "$JOB_LOST" -eq 0 ] && release_to "$target"
+  if [ "$JOB_LOST" -eq 0 ]; then jlog "$outcome -> $target ($reason)"; else jlog "superseded; touched nothing more ($reason)"; fi
+  end_job
 }
 
 on_exit() {
   local rc=$?
-  if [ -n "$JOB_FENCE" ]; then
-    local pid; pid="$(cat "$JOB_PIDFILE" 2>/dev/null)"; [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
-    [ "$JOB_LOST" -eq 0 ] && finish_job trigger "the pool tick exited unexpectedly (exit $rc) while holding the job"
+  if [ -n "$ATTEMPT" ]; then
+    kill_worker_group
+    [ "$JOB_LOST" -eq 0 ] && finish_job ready "the pool tick exited unexpectedly (exit $rc) while holding the job"
   fi
-  heartbeat_stop
+  watch_stop
 }
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# ---------------------------------------------------------------- controller-side publication
+# publish provider sha headref report result -> PUB: published | nomarker:<why> | requeue:<why> |
+# fail:<why> | lost. The only path by which a worker's work reaches Gitea.
+publish() {
+  local p="$1" sha="$2" headref="$3" report="$4" result="$5" chk alt head fixed newhead remote rc
+  local args=(--marker-module "$MARKER")
+  if [ "$JOB_KIND" = review ]; then args+=(--sha "$sha")
+  else args+=(--review-head "$REVIEW_HEAD" --findings "${FINDINGS:-0}"); fi
+  chk="$(python3 "$SCRIPTS/report.py" "$JOB_KIND" "${args[@]}" --file "$report")"
+  if [ "${chk%%$'\t'*}" != ok ] && [ -s "$result" ]; then
+    alt="$(python3 "$SCRIPTS/report.py" "$JOB_KIND" "${args[@]}" --file "$result")"
+    [ "${alt%%$'\t'*}" = ok ] && { report="$result"; chk="$alt"; }
+  fi
+  case "${chk%%$'\t'*}" in
+    ok) ;;
+    invalid) PUB="fail:${chk#*$'\t'}"; return ;;
+    *) PUB="nomarker:${chk#*$'\t'}"; return ;;
+  esac
+  IFS=$'\t' read -r _ head fixed <<<"$chk"
+  if [ "$JOB_KIND" = resolve ]; then
+    newhead="$(git -C "$JOB_WT" rev-parse HEAD 2>/dev/null)"
+    if [ "$head" != "$newhead" ]; then PUB="fail:the resolve marker names head $head but the worker's worktree is at $newhead"; return; fi
+    if [ "$newhead" != "$sha" ] && [ "${fixed:-0}" -eq 0 ]; then
+      PUB="fail:the worker committed on top of $sha but its marker claims no fixes"; return
+    fi
+    if [ "$newhead" != "$sha" ]; then
+      headref_safe "$headref" || { PUB="fail:refusing to push to '$headref'"; return; }
+      git -C "$JOB_WT" merge-base --is-ancestor "$sha" "$newhead" 2>/dev/null \
+        || { PUB="fail:the worker's commits at $newhead are not a fast-forward of $sha"; return; }
+      remote="$(git -C "$JOB_WT" ls-remote origin "refs/heads/$headref" 2>/dev/null | cut -f1)"
+      [ "$remote" = "$sha" ] || { PUB="requeue:origin/$headref is at ${remote:-nothing}, not $sha; the branch moved during the run"; return; }
+      # No hooks and no force: the worker could have written hook files, and the server refuses
+      # anything that is not a fast-forward.
+      guarded "push" git -C "$JOB_WT" -c core.hooksPath=/dev/null push --quiet --no-verify origin "HEAD:refs/heads/$headref"
+      rc=$?
+      case "$rc" in 0) ;; 4) PUB=lost; return ;; *) PUB="requeue:the push of $newhead to $headref failed"; return ;; esac
+      jlog "pushed $sha..$newhead to $headref for $p"
+    fi
+  fi
+  comment_file "$report"; rc=$?
+  case "$rc" in 0) PUB=published ;; 4) PUB=lost ;; *) PUB="requeue:posting the $JOB_KIND report failed" ;; esac
+}
+
 # ---------------------------------------------------------------- one provider attempt
-prepare_worktree() { # sha headref -> sets JOB_WT
-  JOB_WT="$WT_ROOT/pool-$MODE-$JOB_PR-f$JOB_FENCE"
-  git -C "$MAIN" fetch origin --quiet "$2" 2>/dev/null || { jlog "fetch $2 failed"; return 1; }
+prepare_worktree() { # sha headref -> JOB_WT
+  JOB_WT="$(wt_for "$CURRENT_PROVIDER")"
+  git -C "$MAIN" fetch origin --quiet "refs/heads/$2" 2>/dev/null || { jlog "fetch $2 failed"; return 1; }
   [ -d "$JOB_WT" ] && git -C "$MAIN" worktree remove --force "$JOB_WT" >/dev/null 2>&1
   git -C "$MAIN" worktree add --detach "$JOB_WT" "$1" >/dev/null 2>&1 || { jlog "worktree add failed"; return 1; }
   exclude_tool_config "$JOB_WT"
 }
 
 render_prompt() { # provider sha headref base report -> prompt file path
-  local out="$RUNS/prompt-$JOB_PR-f$JOB_FENCE-$1.txt"
-  python3 "$SCRIPTS/render-prompt.py" "$(prompt_for "$1")" "$out" "PR=$JOB_PR" "HEADREF=$3" "SHA=$2" \
-    "BASE=$4" "REPO=$REPO" "ADAPTER=$ADAPTER" "COMMON=$COMMON" "REPORT=$5" "SENTINEL=POOL_RUN_DONE"
+  local out="$RUNS/prompt-$JOB_PR-${ATTEMPT:0:8}-$1.txt"
+  python3 "$SCRIPTS/render-prompt.py" "$(prompt_for "$1" "$JOB_KIND")" "$out" "PR=$JOB_PR" "HEADREF=$3" \
+    "SHA=$2" "BASE=$4" "REPO=$REPO" "ADAPTER=$ADAPTER" "COMMON=$COMMON" "REPORT=$5" \
+    "SENTINEL=POOL_RUN_DONE" "REVIEW_HEAD=$REVIEW_HEAD" "FINDINGS=$FINDINGS"
   printf '%s' "$out"
 }
 
-# attempt provider sha headref base -> sets VERDICT (ok clean fail setup limit requeue lost) and DETAIL.
+# attempt provider sha headref base -> VERDICT (done findings fail setup limit requeue lost), DETAIL.
 # Runs in the calling shell: it sets JOB_WT and may record setup faults.
 attempt() {
-  local p="$1" sha="$2" headref="$3" base="$4" prompt report out err rc t0 elapsed cls v session
-  VERDICT=""; DETAIL=""
+  local p="$1" sha="$2" headref="$3" base="$4" tag prompt report result out err rc t0 elapsed cls session v
+  VERDICT=""; DETAIL=""; CURRENT_PROVIDER="$p"
   prepare_worktree "$sha" "$headref" || { VERDICT=setup; DETAIL="could not prepare a worktree at $sha"; return; }
-  [ "$p" = cursor ] && write_cursor_permissions "$JOB_WT"
-  report="$RUNS/report-$JOB_PR-f$JOB_FENCE-$p.md"; rm -f "$report"
+  tag="$JOB_PR-${ATTEMPT:0:8}-$p"
+  report="$RUNS/report-$tag.md"; result="$RUNS/result-$tag.txt"; rm -f "$report" "$result"
+  out="$RUNS/out-$tag.json"; err="$RUNS/err-$tag.txt"
   prompt="$(render_prompt "$p" "$sha" "$headref" "$base" "$report")"
-  out="$RUNS/out-$JOB_PR-f$JOB_FENCE-$p.json"; err="$RUNS/err-$JOB_PR-f$JOB_FENCE-$p.txt"
-  build_cmd "$p" "$JOB_WT" "$prompt"
-  jlog "spawning $p (model $(model_for "$p" | sed 's/^$/provider default/')) in $JOB_WT at $sha"
+  if [ "$p" = cursor ]; then
+    mkdir -p "$JOB_WT/.cursor"
+    policy cursor-json cursor "$JOB_KIND" "$JOB_WT" "$report" > "$JOB_WT/.cursor/cli.json"
+  fi
+  build_cmd "$p" "$JOB_KIND" "$JOB_WT" "$prompt" "$report"
+  jlog "spawning $p for $JOB_KIND (model $(model_for "$p" | sed 's/^$/provider default/')) in $JOB_WT at $sha"
   t0="$(date +%s)"
-  ( cd "$JOB_WT" && exec timeout -k 30 "$WORKER_TIMEOUT" "${CMD[@]}" <"$CMD_STDIN" >"$out" 2>"$err" ) &
-  echo $! > "$JOB_PIDFILE"
-  wait $!; rc=$?
-  rm -f "$JOB_PIDFILE"
+  spawn_worker "$out" "$err"
+  watch_start
+  wait "$WORKER_PG"; rc=$?
   elapsed=$(( $(date +%s) - t0 ))
-  if ! still_held; then VERDICT=lost; DETAIL="$p ran ${elapsed}s but the lease moved on"; return; fi
-  cls="$(python3 "$SCRIPTS/classify.py" --provider "$p" --exit "$rc" --stdout "$out" --stderr "$err")"
-  v="$(verify "$JOB_PR" "$sha" "$headref")"
+  watch_stop; kill_worker_group
+  if ! still_held; then VERDICT=lost; DETAIL="$p ran ${elapsed}s but its attempt was superseded"; return; fi
+  cls="$(python3 "$SCRIPTS/classify.py" --provider "$p" --exit "$rc" --stdout "$out" --stderr "$err" --result-out "$result")"
   session="${cls##*$'\t'}"; cls="${cls%$'\t'*}"
+  publish "$p" "$sha" "$headref" "$report" "$result"
+  case "$PUB" in
+    lost)       VERDICT=lost; DETAIL="$p's attempt was superseded before its work was published"; return ;;
+    requeue:*)  VERDICT=requeue; DETAIL="${PUB#*:}"; return ;;
+    published)  v="$(verify "$JOB_KIND" "$JOB_PR" "$sha" "$headref")" ;;
+    nomarker:*) v="fail-nomarker:${PUB#*:}" ;;
+    *)          v="$PUB" ;;
+  esac
   jlog "$p exited $rc after ${elapsed}s; provider says ${cls%%$'\t'*}; verification says ${v%%:*}${session:+; session $session}"
   case "$v" in
     ok|clean)
@@ -452,61 +552,72 @@ attempt() {
         limit*) python3 "$SCRIPTS/cooldown.py" record --provider "$p" --reason "${cls#*$'\t'}" >/dev/null ;;
         *)      python3 "$SCRIPTS/cooldown.py" clear --provider "$p" ;;
       esac
-      VERDICT="$v"; DETAIL="$p verified"; return ;;
+      if [ "$JOB_KIND" = review ] && [ "$v" = ok ]; then VERDICT=findings; else VERDICT=done; fi
+      DETAIL="$p verified"; return ;;
   esac
   case "$cls" in
-    setup*) VERDICT=setup; DETAIL="${cls#*$'\t'}"; return ;;
-    limit*) VERDICT=limit; DETAIL="${cls#*$'\t'}"; return ;;
+    setup*)   VERDICT=setup; DETAIL="${cls#*$'\t'}"; return ;;
+    limit*)   VERDICT=limit; DETAIL="${cls#*$'\t'}"; return ;;
     timeout*) VERDICT=requeue; DETAIL="${cls#*$'\t'} after ${elapsed}s with no verified result"; return ;;
   esac
   if [ "${v%%:*}" = "fail-nomarker" ] && [ "$elapsed" -lt "$FAST_FAIL_SECS" ]; then
-    VERDICT=limit; DETAIL="$p ended after ${elapsed}s (under ${FAST_FAIL_SECS}s) with no marker comment: ${cls#*$'\t'}"
+    VERDICT=limit; DETAIL="$p ended after ${elapsed}s (under ${FAST_FAIL_SECS}s) with no marker: ${cls#*$'\t'}"
     return
   fi
   VERDICT=fail; DETAIL="${v#*:} ($p, ${elapsed}s)"
 }
 
 # ---------------------------------------------------------------- one job
-run_job() { # pr headref sha base reclaim(0|1) providers...
-  local pr="$1" headref="$2" sha="$3" base="$4" reclaim="$5"; shift 5
-  local fence remove p tried=()
-  fence="$(lease claim --repo "$REPO" --pr "$pr" --mode "$MODE" --worker "$WORKER_ID" --provider "${1:-}" 2>>"$LOG")" \
-    || { log "$REPO#$pr: lease is held elsewhere; skipping"; return 0; }
-  JOB_PR="$pr"; JOB_FENCE="$fence"; JOB_LOST=0; JOB_WT=""
-  remove="$TRIGGER"
-  [ "$reclaim" = 1 ] && remove="$TRIGGER${EXTRA_HOLD:+,$EXTRA_HOLD}"
-  if ! relabel "$remove" "$CLAIM"; then
-    jlog "claim relabel failed; leaving the PR for a later tick"
-    end_job claim-failed; return 0
-  fi
-  if [ "$reclaim" = 1 ]; then jlog "claimed by $WORKER_ID (reclaimed a dead hold)"; else jlog "claimed by $WORKER_ID"; fi
-  heartbeat_start
+run_job() { # pr headref sha base job verify-base review-head findings remove-labels providers...
+  local pr="$1" headref="$2" sha="$3" base="$4" job="$5" vbase="$6" rhead="$7" nfind="$8" remove="$9"
+  shift 9
+  local p id rc before tried=() first=1
+  JOB_PR="$pr"; JOB_KIND="$job"; REVIEW_HEAD="$rhead"; FINDINGS="$nfind"; JOB_LOST=0; JOB_WT=""
+  id="$(claim claim --worker "$WORKER_ID" --provider "$1" --job "$job" --branch "$headref" --worktree "$(wt_for "$1")" \
+    -- python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$remove" --add "$CLAIMED" 2>>"$LOG")"
+  rc=$?
+  case "$rc" in
+    0) ATTEMPT="$id" ;;
+    3) log "$REPO#$pr: already claimed elsewhere; skipping"; JOB_PR=""; return 0 ;;
+    *) log "$REPO#$pr: claim failed (exit $rc); leaving the PR for a later tick"; JOB_PR=""; return 0 ;;
+  esac
+  jlog "claimed by $WORKER_ID for $job with $1"
 
-  if [ "$reclaim" = 1 ]; then
-    local before; before="$(verify "$pr" "$sha" "$headref")"
-    case "$before" in ok|clean) finish_job "$before" "the previous run's work was already verified at $sha"; return 0 ;; esac
-  fi
+  before="$(verify "$job" "$pr" "$vbase" "$headref")"
+  case "$before" in
+    clean) finish_job done "the review of $sha is already posted and clean"; return 0 ;;
+    ok) if [ "$job" = resolve ]; then finish_job done "the resolve of $vbase is already verified at $sha"
+        else finish_job ready "the review of $sha is already posted; queued for resolve"; fi
+        return 0 ;;
+  esac
 
   for p in "$@"; do
+    if [ "$first" = 0 ]; then
+      id="$(claim reattempt --attempt "$ATTEMPT" --provider "$p" --worktree "$(wt_for "$p")" 2>>"$LOG")" \
+        || { JOB_LOST=1; jlog "superseded before falling back to $p; touching nothing"; end_job; return 0; }
+      ATTEMPT="$id"; jlog "falling back to $p"
+    fi
+    first=0
     attempt "$p" "$sha" "$headref" "$base"
     tried+=("$p=$VERDICT")
     case "$VERDICT" in
-      ok|clean) finish_job "$VERDICT" "$DETAIL"; return 0 ;;
-      lost)     JOB_LOST=1; jlog "$DETAIL; touching nothing on Gitea"; end_job lost; return 0 ;;
+      done)     finish_job done "$DETAIL"; return 0 ;;
+      findings) finish_job ready "$DETAIL; findings queued for resolve"; return 0 ;;
+      lost)     JOB_LOST=1; jlog "$DETAIL; touching nothing on Gitea"; end_job; return 0 ;;
       fail)     finish_job fail "$DETAIL"; return 0 ;;
+      requeue)  finish_job ready "$DETAIL; back in the queue, not a needs-human"; return 0 ;;
       setup)    setup_fault "$p" "$DETAIL" ;;
-      requeue)  finish_job trigger "$DETAIL; back in the queue, not a needs-human"; return 0 ;;
       limit)
         local cd; cd="$(python3 "$SCRIPTS/cooldown.py" record --provider "$p" --reason "$DETAIL")"
         jlog "LIMIT [$p]: $DETAIL; cooling down $(( ${cd#*$'\t'} / 60 ))m"
-        if [ "$MODE" = resolve ] && [ "$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)" != "$sha" ]; then
-          finish_job trigger "the head moved during a limited run; not handing a half-done resolve to another provider"
+        if [ "$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)" != "$sha" ]; then
+          finish_job ready "the head moved during a limited run; not handing a stale job to another provider"
           return 0
         fi ;;
     esac
-    remove_worktree "$JOB_WT" --force; JOB_WT=""
+    remove_worktree "$JOB_WT"; JOB_WT=""
   done
-  finish_job trigger "no provider completed the job (${tried[*]:-none eligible}); back in the queue"
+  finish_job ready "no provider completed the job (${tried[*]:-none eligible}); back in the queue"
 }
 
 # ---------------------------------------------------------------- the tick
@@ -514,12 +625,13 @@ run_job() { # pr headref sha base reclaim(0|1) providers...
 [ -f "$ADAPTER" ] || die "missing Gitea adapter: $ADAPTER"
 [ -f "$MARKER" ] || die "missing marker reader: $MARKER"
 [ -n "$MAIN" ] && [ -e "$MAIN/.git" ] || die "no checkout for $REPO: set AGENT_POOL_MAIN to its clone (got '$MAIN')"
-[ "$HEARTBEAT" -lt "$LEASE_TTL" ] || die "AGENT_POOL_HEARTBEAT ($HEARTBEAT) must be shorter than AGENT_POOL_LEASE_TTL ($LEASE_TTL)"
+[ "$WORKER_TIMEOUT" -lt "$DEADLINE_SECS" ] \
+  || die "WORKER_TIMEOUT ($WORKER_TIMEOUT) must be shorter than AGENT_POOL_DEADLINE_SECS ($DEADLINE_SECS)"
 WT_ROOT="${AGENT_POOL_WORKTREES:-$(dirname "$MAIN")/.pool-worktrees}"
 mkdir -p "$WT_ROOT"
 
-exec 9>"$STATE/pool-$MODE-$(printf '%s' "$REPO" | tr -c 'A-Za-z0-9.-' '_').lock"
-if ! flock -n 9; then log "previous $MODE tick for $REPO still running; exiting"; exit 0; fi
+exec 9>"$STATE/pool-$(slug "$WORKER_ID")-$(slug "$REPO").lock"
+if ! flock -n 9; then log "previous tick of $WORKER_ID for $REPO still running; exiting"; exit 0; fi
 
 select_providers
 if [ "${#PROVIDERS[@]}" -eq 0 ]; then
@@ -530,15 +642,17 @@ fi
 
 git -C "$MAIN" fetch origin --quiet --prune 2>/dev/null || log "warning: fetch failed; continuing with what is local"
 
-# Candidates carry the trigger label (fresh work) or the claim label (a hold that may have died).
-if ! LISTING="$(python3 "$ADAPTER" list --repo "$REPO" --state open | TRIGGER="$TRIGGER" CLAIM="$CLAIM" python3 -c '
+# Candidates carry agent:ready or agent:claimed, or have a claim record here to reconcile.
+CLAIM_PRS="$(cd "$STATE/claims" 2>/dev/null && for f in "$(slug "$REPO")"__*.json; do [ -e "$f" ] && { f="${f##*__}"; printf '%s ' "${f%.json}"; }; done)"
+if ! LISTING="$(python3 "$ADAPTER" list --repo "$REPO" --state open | READY="$READY" CLAIMED="$CLAIMED" CLAIM_PRS="$CLAIM_PRS" python3 -c '
 import json, os, re, sys
-trigger, claim = os.environ["TRIGGER"], os.environ["CLAIM"]
+ready, claimed = os.environ["READY"], os.environ["CLAIMED"]
+recorded = set(os.environ.get("CLAIM_PRS", "").split())
 raw = os.environ.get("PR_LOOP_SKIP_PATTERN", r"docblock-backfill|^chore\(#152\)")
 rx = re.compile(raw) if raw else None
 for pr in json.load(sys.stdin):
     labels = pr["labels"]
-    if trigger not in labels and claim not in labels: continue
+    if ready not in labels and claimed not in labels and str(pr["number"]) not in recorded: continue
     if pr["draft"] or pr["is_bot"]: continue
     if rx and (rx.search(pr["title"]) or rx.search(pr["head_ref"])): continue
     print("\t".join([str(pr["number"]), pr["head_ref"], pr["head_sha"], pr["base_ref"],
@@ -547,55 +661,72 @@ for pr in json.load(sys.stdin):
   die "gitea pr list failed; not treating that as an empty queue"
 fi
 mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
-[ "${#CANDIDATES[@]}" -eq 0 ] && { log "no open PR in $REPO carries $TRIGGER or $CLAIM"; exit 0; }
+[ "${#CANDIDATES[@]}" -eq 0 ] && { log "no open PR in $REPO carries $READY or $CLAIMED"; exit 0; }
 
-# Resolve-mode findings for an older head go back to review, under a lease like any other write.
-send_back_for_review() { # pr reason
-  local fence
-  fence="$(lease claim --repo "$REPO" --pr "$1" --mode "$MODE" --worker "$WORKER_ID" 2>>"$LOG")" || return 0
-  JOB_PR="$1"; JOB_FENCE="$fence"; JOB_LOST=0; JOB_WT=""
-  relabel "$TRIGGER" "review:requested"
-  jlog "$2; sent back to review:requested"
-  end_job stale-findings
+# reconcile_pr pr -> 0 to go on considering the PR (labels may have become ready), 1 to skip it.
+reconcile_pr() {
+  local out st aid prov info f
+  out="$(python3 "$SCRIPTS/claim-record.py" reconcile --repo "$REPO" --pr "$1" --adapter "$ADAPTER" \
+    --claimed "$CLAIMED" --needs-human "$HUMAN" 2>>"$LOG")"
+  # Fields may be empty, and read would collapse adjacent tabs.
+  mapfile -t f < <(printf '%s\n' "$out" | tr '\t' '\n')
+  st="${f[0]:-}"; aid="${f[1]:-}"; prov="${f[2]:-}"; info="${f[3]:-}"
+  case "$st" in
+    live) log "$REPO#$1: claimed by a live attempt ($prov, deadline $info); skipping"; return 1 ;;
+    stale)
+      if python3 "$SCRIPTS/claim-record.py" requeue --repo "$REPO" --pr "$1" --attempt "$aid" --adapter "$ADAPTER" \
+           --claimed "$CLAIMED" --ready "$READY" >/dev/null 2>>"$LOG"; then
+        log "$REPO#$1: attempt ${aid:0:8} ($prov) passed its deadline $info; requeued to $READY"
+        [ -n "$prov" ] && python3 "$SCRIPTS/cooldown.py" record --provider "$prov" \
+          --reason "a claim passed its deadline with no result" >/dev/null
+        RECONCILED_READY=1; return 0
+      fi
+      log "$REPO#$1: could not requeue the stale attempt ${aid:0:8}; skipping"; return 1 ;;
+    needs-human) log "$REPO#$1: $CLAIMED with no claim record; relabelled $HUMAN"; return 1 ;;
+    orphan-dropped) log "$REPO#$1: dropped the claim record of a job already released"; return 0 ;;
+    free) return 0 ;;
+    *) log "$REPO#$1: could not reconcile the claim ($out); skipping"; return 1 ;;
+  esac
 }
 
 QUEUE=()
 for row in "${CANDIDATES[@]}"; do
   IFS=$'\t' read -r pr headref sha base labels assignees <<<"$row"
-  hold="$(lease hold --repo "$REPO" --pr "$pr" --labels "$labels" --assignees "$assignees" \
-    --hold-labels "$HOLD_LABELS" --bot "$BOT" 2>>"$LOG")"
-  state="${hold%%$'\t'*}"; why="${hold#*$'\t'}"
-  reclaim=0
-  case "$state" in
-    free)    ;;
-    expired|orphan-expired) reclaim=1; log "$REPO#$pr: dead hold ($why); reclaiming" ;;
-    live)    log "$REPO#$pr: held by a live bot lease ($why); skipping"; continue ;;
-    human)   log "$REPO#$pr: held by a human ($why); skipping"; continue ;;
-    orphan-pending) log "$REPO#$pr: hold with no live lease ($why); not a human hold, waiting out the grace"; continue ;;
-    *)       log "$REPO#$pr: could not read the hold state; skipping"; continue ;;
-  esac
-  if [ "$reclaim" = 0 ]; then
-    marker="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
-    mhead="${marker%% *}"
-    if [ "$MODE" = review ] && [ "$mhead" = "$sha" ]; then log "$REPO#$pr head $sha already reviewed (marker); skipping"; continue; fi
-    if [ "$MODE" = resolve ] && [ "$mhead" != "$sha" ]; then
-      if [ "$DRY_RUN" = 1 ]; then log "DRY: $REPO#$pr findings are stale; would send back to review:requested"
-      else send_back_for_review "$pr" "findings are for $mhead but head is $sha"; fi
-      continue
-    fi
+  RECONCILED_READY=0
+  if [[ "$labels" == *"\"$CLAIMED\""* ]] || [[ " $CLAIM_PRS" == *" $pr "* ]]; then
+    if [ "$DRY_RUN" = 1 ]; then log "DRY: would reconcile the claim on $REPO#$pr"; continue; fi
+    reconcile_pr "$pr" || continue
+    [ "$RECONCILED_READY" = 1 ] && labels="${labels//\"$CLAIMED\"/\"$READY\"}"
   fi
-  QUEUE+=("$pr"$'\t'"$headref"$'\t'"$sha"$'\t'"$base"$'\t'"$reclaim")
+  [[ "$labels" == *"\"$READY\""* ]] || continue
+  hold="$(JOB_PR="$pr" claim hold --labels "$labels" --assignees "$assignees" --hold-labels "$EXTRA_HOLD" --bot "$BOT" 2>>"$LOG")"
+  state="${hold%%$'\t'*}"; why="${hold#*$'\t'}"
+  remove="$READY"
+  case "$state" in
+    free)         ;;
+    hold-expired) remove="$READY${EXTRA_HOLD:+,$EXTRA_HOLD}"; log "$REPO#$pr: dead hold ($why); reclaiming" ;;
+    live)         log "$REPO#$pr: held by a live claim ($why); skipping"; continue ;;
+    human)        log "$REPO#$pr: held by a human ($why); skipping"; continue ;;
+    hold-pending) log "$REPO#$pr: hold with no live claim ($why); not a human hold, waiting out the grace"; continue ;;
+    *)            log "$REPO#$pr: could not read the hold state; skipping"; continue ;;
+  esac
+  headref_safe "$headref" || { log "$REPO#$pr: head branch '$headref' is not one the pool will push to; skipping"; continue; }
+  derive_job "$pr" "$sha" "$headref"
+  QUEUE+=("$pr"$'\t'"$headref"$'\t'"$sha"$'\t'"$base"$'\t'"$DJ"$'\t'"$DBASE"$'\t'"${DRHEAD:--}"$'\t'"${DNFIND:--}"$'\t'"$remove")
 done
 [ "${#QUEUE[@]}" -eq 0 ] && { log "nothing to do after skips"; [ "$SETUP_FAULTS" -gt 0 ] && exit 2; exit 0; }
 
 jobs_run=0
 for row in "${QUEUE[@]}"; do
   [ "$jobs_run" -ge "$MAX_JOBS" ] && break
-  IFS=$'\t' read -r pr headref sha base reclaim <<<"$row"
+  IFS=$'\t' read -r pr headref sha base job vbase rhead nfind remove <<<"$row"
+  [ "$rhead" = - ] && rhead=""; [ "$nfind" = - ] && nfind=""
+  job_providers "$job"
+  if [ "${#JOB_PROVIDERS[@]}" -eq 0 ]; then log "$REPO#$pr: no eligible provider takes $job jobs; skipping"; continue; fi
   if [ "$DRY_RUN" = 1 ]; then
-    log "DRY: would claim $REPO#$pr at $sha (reclaim=$reclaim) with providers ${PROVIDERS[*]}"
+    log "DRY: would claim $REPO#$pr at $sha for $job with providers ${JOB_PROVIDERS[*]}"
   else
-    run_job "$pr" "$headref" "$sha" "$base" "$reclaim" "${PROVIDERS[@]}"
+    run_job "$pr" "$headref" "$sha" "$base" "$job" "$vbase" "$rhead" "$nfind" "$remove" "${JOB_PROVIDERS[@]}"
     drop_cooling_providers
     [ "${#PROVIDERS[@]}" -eq 0 ] && { log "every provider is cooling down; stopping the tick"; break; }
   fi
