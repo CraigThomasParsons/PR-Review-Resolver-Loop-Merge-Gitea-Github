@@ -236,7 +236,17 @@ expect "S4: an invalid API key is a setup fault" "$(classify claude 0 '{"subtype
 expect "S4: 'Select login method' is setup, not a limit" "$(classify claude 1 '' 'Select login method:')" "setup"
 expect "S4: 'log in to continue' is setup, not a limit" "$(classify grok 1 '' 'Please log in to continue')" "setup"
 expect "S4: setup wins over limit wording in the same output" "$(classify agy 1 '{"status":"ERROR","error":"invalid model; quota exceeded"}')" "setup"
-expect "S4: a short successful result asking for login is setup" "$(classify cursor 0 '{"type":"result","subtype":"success","is_error":false,"result":"Not logged in. Run cursor-agent login."}')" "setup"
+expect "S4: a short successful result that is the login prompt is setup" "$(classify cursor 0 '{"type":"result","subtype":"success","is_error":false,"result":"Select login method:"}')" "setup"
+expect "r4#3: a short successful summary mentioning 'not logged in' is ok" \
+  "$(classify claude 0 '{"subtype":"success","is_error":false,"result":"Fixed the redirect shown when the user is not logged in."}')" "ok"
+expect "r4#3: a short successful summary mentioning authentication_error is ok" \
+  "$(classify cursor 0 '{"type":"result","subtype":"success","is_error":false,"result":"The handler now maps authentication_error to a 401."}')" "ok"
+expect "r4#3: a failed run saying 'not logged in' is still setup" "$(classify grok 1 '' 'Error: not logged in')" "setup"
+expect "r4#4: a denied run that then hangs is a setup fault, not a timeout" \
+  "$(classify cursor 124 "$CURSOR_DENIED")" "setup"
+expect "r4#4: an agy denial before the timeout is a setup fault" \
+  "$(classify agy 137 '{"status":"ERROR","denied_actions":[{"tool":"run_command"}]}')" "setup"
+expect "r4#4: a plain timeout is still a timeout" "$(classify claude 124 '{"subtype":"error","is_error":true,"result":"x"}')" "timeout"
 expect "G3: exit 126 is a setup fault" "$(classify agy 126 '' 'agy: Argument list too long')" "setup"
 expect_not "G3: exit 126 is not reported as a missing binary" "$(classify agy 126 '' 'agy: Argument list too long')" "missing"
 expect "G3: exit 126 names E2BIG" "$(classify agy 126 '' 'agy: Argument list too long')" "argument list too long"

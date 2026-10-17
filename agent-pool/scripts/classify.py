@@ -24,8 +24,10 @@ Setup faults are found by JSON key, never by prose: cursor tool events carrying 
 or `permissionDenied`, agy's `denied_actions`, claude's `permission_denials`. A run can exit
 0 and report SUCCESS and still be a setup fault.
 
-Order: exit 124/137 is a timeout before anything else is read. Setup signatures (SETUP) are
-checked before limit signatures, so a login prompt or a bad model never reads as a limit.
+Order: denials first (a denied run that then hangs is still a setup fault), then exit 124/137
+is a timeout before any wording is read. Setup signatures (SETUP) are checked before limit
+signatures, so a login prompt or a bad model never reads as a limit. On a run that reports
+success, only the product's own login prompt (LOGIN_PROMPT) counts as setup.
 
 Setup and limit signatures are read from the provider's own messages only when it reports
 failure: stderr plus the final result (for cursor, result/error events and non-JSON lines,
@@ -51,6 +53,9 @@ SETUP = re.compile(
     r"(?:unknown|invalid|unsupported) model|model[ _-]not[ _-]found|not_found_error"
     r"|invalid[ _-]?(?:x-)?api[ _-]?key|authentication_error|login required|not logged in"
     r"|Select login method|log in to continue|please (?:log|sign) in", re.I)
+# On a run that reports success only the product's own login prompt counts: a summary may well
+# mention "not logged in" or authentication_error when that is what the code under review handles.
+LOGIN_PROMPT = re.compile(r"Select login method|log in to continue|Please run /login", re.I)
 # On a run that reports success only wording a review would not use in passing counts: a bare
 # "429" or "rate limit" in a final summary is usually about the code under review.
 RESULT_LIMIT = re.compile(
@@ -138,8 +143,6 @@ def classify(provider, rc, out, err):
     if rc == 126:
         why = "argument list too long" if "argument list too long" in err.lower() else "permission or exec format"
         return "setup", f"{provider} could not be executed (exit 126: {why})", "", ""
-    if rc in (124, 137):
-        return "timeout", f"{provider} hit the worker timeout (exit {rc})", "", ""
 
     docs, failed, result_text, why, own = [], rc != 0, "", f"exit {rc}", out
     if provider == "cursor":
@@ -179,6 +182,8 @@ def classify(provider, rc, out, err):
     found = [d for doc in docs for d in denials(doc)]
     if found:
         return "setup", f"{provider} denied a tool call the worker needed: {describe(found)}", session, result_text
+    if rc in (124, 137):
+        return "timeout", f"{provider} hit the worker timeout (exit {rc})", session, result_text
 
     if failed:
         text = err + "\n" + own
@@ -191,9 +196,9 @@ def classify(provider, rc, out, err):
         return "incomplete", f"{provider} ended without a usable result ({why})", session, result_text
 
     if len(result_text.strip()) < SHORT_RESULT:
-        m = SETUP.search(result_text)
+        m = LOGIN_PROMPT.search(result_text)
         if m:
-            return "setup", f"{provider} setup signature '{m.group(0)}' in its short result", session, result_text
+            return "setup", f"{provider} login prompt '{m.group(0)}' in its short result", session, result_text
         m = RESULT_LIMIT.search(result_text) or PRODUCT_LIMIT.search(result_text)
         if m:
             return "limit", f"{provider} limit signature '{m.group(0)}' in its short result", session, result_text
