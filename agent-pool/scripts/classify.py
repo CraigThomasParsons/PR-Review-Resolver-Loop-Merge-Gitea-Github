@@ -5,8 +5,10 @@ Usage: classify.py --provider P --exit RC --stdout FILE [--stderr FILE] [--resul
 
 Prints one line of tab-separated fields: verdict, reason, session id (may be empty).
   ok          the provider says it finished; verification decides whether it did the job
-  setup       the pool's own setup got in the way: a tool call was denied or rejected, or
-              the binary is missing. No cooldown; a person has to fix the configuration
+  setup       the pool's own setup got in the way: a tool call was denied or rejected, the
+              binary is missing (127) or could not be executed (126, e.g. E2BIG), the model is
+              unknown, the API key is invalid or the CLI wants a login. No cooldown; a person
+              has to fix the configuration
   limit       a usage, credit or rate limit. The provider cools down and the job goes back
               to agent:ready (or to the next provider)
   timeout     the run hit WORKER_TIMEOUT (exit 124/137). Without a marker the job is requeued,
@@ -22,11 +24,16 @@ Setup faults are found by JSON key, never by prose: cursor tool events carrying 
 or `permissionDenied`, agy's `denied_actions`, claude's `permission_denials`. A run can exit
 0 and report SUCCESS and still be a setup fault.
 
-Limit signatures are read from the whole output only when the provider reports failure. On a
-run that reports success, only a short final result (under 400 characters, i.e. nothing but
-the product's own message) is checked, for every provider, and only for wording a review
-would not use in passing (RESULT_LIMIT, PRODUCT_LIMIT). A review that discusses rate
-limiting must not read as a rate limit.
+Order: exit 124/137 is a timeout before anything else is read. Setup signatures (SETUP) are
+checked before limit signatures, so a login prompt or a bad model never reads as a limit.
+
+Setup and limit signatures are read from the provider's own messages only when it reports
+failure: stderr plus the final result (for cursor, result/error events and non-JSON lines,
+never tool_call events, whose output is whatever the worker read). On a run that reports
+success, only a short final result (under 400 characters, i.e. nothing but the product's own
+message) is checked, for every provider, and only for wording a review would not use in
+passing (RESULT_LIMIT, PRODUCT_LIMIT). A review that discusses rate limiting must not read as
+a rate limit.
 """
 import argparse
 import json
@@ -39,8 +46,11 @@ ANY_LIMIT = re.compile(
 # classify-pane.sh's PARKED product dialogs, plus the credit wall that started all this.
 PRODUCT_LIMIT = re.compile(
     r"You've reached your .* limit|/usage-credits|Set up auto mode for your environment"
-    r"|Select login method|log in to continue|purchase more credits|upgrade your plan to continue"
-    r"|Credit balance is too low", re.I)
+    r"|purchase more credits|upgrade your plan to continue|Credit balance is too low", re.I)
+SETUP = re.compile(
+    r"(?:unknown|invalid|unsupported) model|model[ _-]not[ _-]found|not_found_error"
+    r"|invalid[ _-]?(?:x-)?api[ _-]?key|authentication_error|login required|not logged in"
+    r"|Select login method|log in to continue|please (?:log|sign) in", re.I)
 # On a run that reports success only wording a review would not use in passing counts: a bare
 # "429" or "rate limit" in a final summary is usually about the code under review.
 RESULT_LIMIT = re.compile(
@@ -123,12 +133,19 @@ def limit_in(text):
 
 def classify(provider, rc, out, err):
     """Return (verdict, reason, session, result_text)."""
-    if rc in (126, 127):
-        return "setup", f"{provider} binary missing or not executable (exit {rc})", "", ""
+    if rc == 127:
+        return "setup", f"{provider} binary missing (exit 127)", "", ""
+    if rc == 126:
+        why = "argument list too long" if "argument list too long" in err.lower() else "permission or exec format"
+        return "setup", f"{provider} could not be executed (exit 126: {why})", "", ""
+    if rc in (124, 137):
+        return "timeout", f"{provider} hit the worker timeout (exit {rc})", "", ""
 
-    docs, failed, result_text, why = [], rc != 0, "", f"exit {rc}"
+    docs, failed, result_text, why, own = [], rc != 0, "", f"exit {rc}", out
     if provider == "cursor":
         docs = parse_events(out)
+        own = "\n".join([json.dumps(e) for e in docs if e.get("type") in ("result", "error")]
+                        + [line for line in out.splitlines() if not line.strip().startswith("{")])
         results = [e for e in docs if e.get("type") == "result"]
         if not results:
             failed, why = True, "no result event in the stream"
@@ -164,14 +181,19 @@ def classify(provider, rc, out, err):
         return "setup", f"{provider} denied a tool call the worker needed: {describe(found)}", session, result_text
 
     if failed:
-        m = limit_in(err + "\n" + out)
+        text = err + "\n" + own
+        m = SETUP.search(text)
+        if m:
+            return "setup", f"{provider} setup signature '{m.group(0)}' ({why})", session, result_text
+        m = limit_in(text)
         if m:
             return "limit", f"{provider} limit signature '{m.group(0)}' ({why})", session, result_text
-        if rc in (124, 137):
-            return "timeout", f"{provider} hit the worker timeout (exit {rc})", session, result_text
         return "incomplete", f"{provider} ended without a usable result ({why})", session, result_text
 
     if len(result_text.strip()) < SHORT_RESULT:
+        m = SETUP.search(result_text)
+        if m:
+            return "setup", f"{provider} setup signature '{m.group(0)}' in its short result", session, result_text
         m = RESULT_LIMIT.search(result_text) or PRODUCT_LIMIT.search(result_text)
         if m:
             return "limit", f"{provider} limit signature '{m.group(0)}' in its short result", session, result_text

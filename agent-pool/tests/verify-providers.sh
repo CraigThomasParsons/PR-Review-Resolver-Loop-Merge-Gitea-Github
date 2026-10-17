@@ -176,6 +176,8 @@ case "$behave" in
       agy) echo '{"status":"ERROR","error":"RESOURCE_EXHAUSTED"}'; exit 1 ;;
       codex) echo 'insufficient credits' >&2; exit 1 ;;
     esac ;;
+  login)
+    echo '{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key · Please run /login"}'; exit 1 ;;
   denied)
     case "$name" in
       cursor-agent)
@@ -428,6 +430,12 @@ expect "the fault is recorded" "$(cat "$TMP/state/faults/cursor.json" 2>/dev/nul
 expect "the log says SETUP FAULT" "$(cat "$TMP/out.txt")" "SETUP FAULT [cursor]"
 expect "the PR goes back to agent:ready, not needs-human" "$(labels)" "agent:ready"
 expect "the tick exits 2 for a setup fault" "$TICK_RC" "2"
+reset '["agent:ready"]'
+behave claude login
+tick
+expect "S4: a fast login failure is a setup fault, not the fast-fail limit" "$(cat "$TMP/out.txt")" "SETUP FAULT [claude]"
+expect "S4: and claude gets no cooldown" "$(cooldown_doc claude)" "none"
+expect "S4: the PR goes back to agent:ready" "$(labels)" "agent:ready"
 reset '["agent:ready"]'
 WORKER_TIMEOUT=2700 tick
 expect "WORKER_TIMEOUT not shorter than the claim deadline is refused" "$(cat "$TMP/out.txt")" "must be shorter than AGENT_POOL_DEADLINE_SECS"
