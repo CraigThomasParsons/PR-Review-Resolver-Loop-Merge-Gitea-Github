@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# install_skills_and_actions.sh — deploy this repo's skills by symlinking each
-# skills/<name> entry into a consumer's skills directory. Editing a skill in
-# this repo then takes effect immediately everywhere it is installed, instead
-# of needing a redeploy step.
+# install_skills_and_actions.sh — DEVELOPMENT installer: symlink each
+# skills/<name> entry into a consumer's skills directory, so editing a skill in
+# this repo takes effect immediately wherever it is linked.
+#
+# This is not how production is deployed. ~/.claude/skills on the review host
+# is a copy of a committed revision, deployed by ./install.sh (which also
+# installs pr-trigger, pr-drain and the systemd units). Linking production to
+# this checkout would make whatever is checked out here live for the hourly
+# timer, the merge tick and every PR event. Running this against
+# ~/.claude/skills therefore requires --force over the deployed copies, and
+# ./install.sh will in turn refuse to replace the symlinks without --force.
 #
 # Usage:
 #   install_skills_and_actions.sh [--target DIR]... [--force] [--list]
 #
 #   --target DIR   Skills directory to install into. Repeatable.
-#                  Default: ~/.claude/skills (the one place this engine is
-#                  actually deployed and running today).
+#                  Default: ~/.claude/skills (production; see above).
 #   --force        Replace whatever already exists at the destination, even a
 #                  plain directory. Without it, an existing entry that is not
 #                  already the correct symlink is left untouched and reported.
