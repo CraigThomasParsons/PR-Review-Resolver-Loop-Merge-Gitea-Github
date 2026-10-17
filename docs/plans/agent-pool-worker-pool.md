@@ -84,6 +84,68 @@ supersedes the earlier reset-on-read mutable prompt design.
   already-confirmed, edit-capable, non-interactive CLI shapes (`claude -p`, `codex exec`).
   `prod-common.sh` is written provider-parameterized from day one so Agy/Grok/Cursor are pure
   additive follow-ups once their individual gaps (listed below) close — not a redesign.
+  **Superseded by owner decision (PR #2 review):** the Cursor, Agy and Grok adapters that were
+  built alongside Claude and Codex stay in. They are not trimmed back to Claude and Codex.
+  `PROVIDER_ORDER` still defaults to Claude alone, and Codex is never in the default order, so
+  nothing beyond Claude runs unless an operator lists it.
+
+## Owner decisions from the PR #2 review (binding for the build)
+
+- **Labels and job kind.** The pool uses the `agent:ready` / `agent:claimed` / `agent:done` /
+  `agent:needs-human` labels above, never `review:*`. There is no review/resolve mode argument:
+  the job kind is derived per PR from its markers. A review marker for the current head with
+  findings > 0 means resolve. A clean review marker, or a resolve marker that already answered
+  the latest review at the current head, is settled to `agent:done` without running a provider.
+  Anything else is a review. A review with findings goes back to `agent:ready`, queued for the
+  resolve.
+- **Write-once claims.** Heartbeat-renewed leases are gone. `scripts/claim-record.py`
+  implements the v2 claim record, attempt fencing and reconciliation table below. A provider
+  fallback inside one job is a new attempt (`reattempt`): a fresh `attempt_id` and deadline
+  naming the provider actually running, written atomically over the old record. This keeps
+  records write-once and fences off the previous provider's stragglers.
+- **Workers never publish.** Workers only read, edit, commit locally (resolve) and write a
+  report file. If they cannot write files, the report is their final response. The controller,
+  `bin/prod-common.sh`, confirms the claim is still held. It then validates the report's marker
+  and its finding counts, and checks that the worker's commits fast-forward the reviewed head.
+  It also checks that `origin/<headref>` has not moved, then pushes `HEAD:refs/heads/<headref>`
+  and posts the report, every write through `claim-record.py guard`. It never pushes a
+  protected branch (develop, main, master, release, `release/*`) or a `+` refspec, and never
+  force-pushes.
+- **Worker containment.** Each worker runs under `setsid` in its own process group, with
+  `remote.origin.pushurl` overridden to a dead path in its environment. A read-only watcher
+  (not a renewer) re-reads the claim every `AGENT_POOL_WATCH_SECS`. If the attempt is
+  superseded, the watcher kills the whole group. Stragglers are killed when the worker exits.
+- **Permissions are an allowlist** (`scripts/policy.py`, one policy translated per CLI). It
+  allows specific read commands, the adapter's `head|comments|threads` reads by absolute path,
+  named-path staging and `git commit -m|-F` (resolve only), and named gate commands. It never
+  allows `python3 *`, `node *`, `npx *`, broad `git`, or any push or Gitea write. Explicit
+  denies for `git push --force`, `git reset --hard` and `git merge` stay in every adapter's
+  policy, and deny rules never depend on an absolute path alone. Cursor runs without `--force`,
+  using a per-worktree `.cursor/cli.json`. Agy has no rule list. It reviews in `--mode plan`,
+  and the controller posts its `response`. It takes resolve jobs only with `AGY_AUTO_APPROVE=1`.
+- **Timing.** `expected_deadline_at` is seeded at `AGENT_POOL_DEADLINE_SECS` (2700s) until the
+  effort baseline exists. `WORKER_TIMEOUT` (default 2400s) must be shorter than the deadline, or
+  the tick refuses to start. A provider timeout with no marker requeues to `agent:ready`, never
+  `agent:needs-human`. agy has no inner timeout and `--print-timeout 0`.
+
+### Built so far (on `feature/agent-pool-core`)
+
+`bin/prod-common.sh` (the controller tick: reconcile, claim, run, publish, verify, release),
+`scripts/claim-record.py`, `scripts/policy.py`, `scripts/cooldown.py`, `scripts/classify.py`,
+`scripts/report.py`, `scripts/render-prompt.py`, `scripts/poolstate.py`, and the offline tests
+`tests/verify-lease.sh` (unit) and `tests/verify-providers.sh` (end-to-end, stub CLIs).
+
+**Not built yet:** the thin `prod-<provider>.sh` entrypoints, `doctor.sh`, `mailbox.py`,
+`effort-baseline.py` (the deadline is the seed only), the cooldown recovery probe, and the
+systemd units and installer. Until the doctor exists, each tick does the reconciliation itself:
+a stale claim found under the job lock is requeued and its provider cooled down.
+
+**Open questions:** Agy has no deny list, so an auto-approved Agy resolve relies on the
+pushurl override and controller publication alone. Codex's `workspace-write` sandbox has no
+network, so its adapter reads fail and it cannot write a report outside the worktree. It falls
+back to a final-response report. Gate commands (`npm run`, `just`, `composer`) run repository
+code that a resolve worker can edit. Push and publication are still controller-only, but the
+gate is not a sandbox.
 
 ## What already exists and gets reused, not rebuilt
 
@@ -122,16 +184,20 @@ supersedes the earlier reset-on-read mutable prompt design.
 ```
 agent-pool/
   bin/
-    prod-common.sh       # shared claim -> invoke -> verify -> release; provider-parameterized
-    prod-claude.sh       # thin entrypoint, sources prod-common.sh
-    prod-codex.sh
-    doctor.sh            # zero-LLM driver; uses deterministic helpers, systemctl and git/Gitea; optional retalk
+    prod-common.sh       # shared reconcile -> claim -> invoke -> publish -> verify -> release; provider-parameterized
+    prod-claude.sh       # thin entrypoint, sources prod-common.sh (not built yet)
+    prod-codex.sh        # (not built yet)
+    doctor.sh            # zero-LLM driver; uses deterministic helpers, systemctl and git/Gitea; optional retalk (not built yet)
   scripts/
     claim-record.py      # atomic per-job claim file; attempt_id fencing; reconciliation (see below)
-    mailbox.py           # atomic enqueue/pending/ack; stable worker IDs and message IDs
-    effort-baseline.py   # parses pool.log -> rolling avg per provider; seeds at 2700s
-    eligible.py           # cooldown-gated next-eligible selection (adapted from lease.py)
-    record-cooldown.py    # single place cooldowns get written; called by both the EXIT trap and doctor.sh
+    policy.py            # the one worker permission allowlist, translated per provider CLI
+    cooldown.py          # cooldown-gated eligible selection and the single place cooldowns and setup faults are written
+    classify.py          # provider run -> ok | setup | limit | timeout | incomplete
+    report.py            # validates a worker's report marker before the controller publishes it
+    render-prompt.py     # literal placeholder substitution for prompt templates
+    poolstate.py         # atomic writes, flock, state dir, injectable clock
+    mailbox.py           # atomic enqueue/pending/ack; stable worker IDs and message IDs (not built yet)
+    effort-baseline.py   # parses pool.log -> rolling avg per provider; seeds at 2700s (not built yet)
   prompts/
     claim-job.txt         # default "go claim a job" template
     reassigned.txt         # "your task was reassigned, go pick a new one" template
@@ -142,10 +208,15 @@ agent-pool/
   install_systemd_units.sh   # same idempotent/--force/--list shape as install_skills_and_actions.sh
   docs/HANDOFF-agent-pool.md # state machine + decision log, mirrors HANDOFF-pr-automerge.md
   tests/
-    verify-claim-record.sh   # offline unit tests for claim-record.py's fencing/reconciliation logic,
-                              # mirroring pr-loops-common/tests/verify-merge.sh's style
-    inject-staleness.sh      # offline synthetic end-to-end scenarios, see Verification
+    verify-lease.sh          # offline unit tests: claim-record.py fencing/reconciliation/deadline
+                              # boundary, holds, cooldowns, classification, prompt rendering, policy
+    verify-providers.sh      # offline end-to-end ticks against stub CLIs, a stub Gitea adapter and
+                              # a local bare remote: publication, fencing, reconciliation, adapters
+    inject-staleness.sh      # doctor scenarios, see Verification (not built yet)
 ```
+
+The shared prompts live in `skills/pr-loops-common/prompts/review.generic.txt` and
+`resolve.generic.txt`, not under `agent-pool/prompts/`.
 
 Runtime state (not checked in), `~/.local/state/agent-pool/`:
 `pool.log` (same `date -Is [MODE] msg` format as `pr-loop.log`, keyed by `repo#issue` **and**
@@ -380,7 +451,10 @@ mechanism by which it can't itself be rate-limited.
 Two test files, both fully offline and deterministic — no waiting hours for a real rate limit,
 and no dependency on scenario order.
 
-### `agent-pool/tests/verify-claim-record.sh` — unit-level, pure logic
+### `agent-pool/tests/verify-lease.sh` — unit-level, pure logic
+
+(Planned as `verify-claim-record.sh`; built as `verify-lease.sh`, which also covers cooldowns,
+classification, prompt rendering and the permission policy.)
 
 Mirrors `pr-loops-common/tests/verify-merge.sh`'s style: direct calls into `claim-record.py`
 with a fixed/injected clock, no systemd, no real Gitea calls (a stub adapter). Covers the

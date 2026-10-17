@@ -8,21 +8,23 @@ no `SKILL.md` on purpose.
 - `pr-merge.sh` one mechanical, opt-in merge tick (no model worker)
 - `prompts/review.txt`, `prompts/resolve.txt` the prompts pasted into each worker
 - `prompts/review.generic.txt`, `prompts/resolve.generic.txt` provider-neutral prompts for the
-  headless agent pool (`../../agent-pool/bin/prod-common.sh`); no Claude-only skills, and staging is
-  by named path only
+  headless agent pool (`../../agent-pool/bin/prod-common.sh`); no Claude-only skills, staging is
+  by named path only, and workers never push or comment (the pool controller publishes)
 - `marker.py` reads the hidden `pulse-review:v1` and `pulse-resolve:v1` markers off a PR. A
   resolve marker counts each finding as `fixed`, `noted` (non-blocking, left for the author) or
   `deferred` (blocking); only `deferred` sends a PR to `review:needs-human`
-- `gitea-pr.py` the Gitea adapter (list, head, label, comment, comments, threads, diff, merge)
+- `gitea-pr.py` the Gitea adapter (list, head, labels, label, comment, comments,
+  threads, diff, merge)
 - `classify-pane.sh` classifies a worker pane (WORKING, BLOCKED, PARKED, DONE, IDLE, STALLED)
   from the pane text and an idle-streak state file. The loop depends on the four-argument form
   and the PARKED and STALLED states, which the tmux-pipeline skill's classifier does not provide.
 - `tests/verify-resolve.sh` offline cases for the resolve verification gate; run it after any
   edit to `verify()` in `pr-loop.sh`
 - `tests/verify-merge.sh` offline cases for merge candidate and safety gates
-- `../../agent-pool/tests/verify-lease.sh` offline cases for the agent pool's leases, fence tokens, hold state,
-  cooldowns and limit classification
-- `../../agent-pool/tests/verify-providers.sh` offline end-to-end ticks of the agent pool against stub provider
-  CLIs, a stub Gitea adapter and a local git remote
+- `../../agent-pool/tests/verify-lease.sh` offline cases for the agent pool's write-once claim
+  records and attempt fencing, hold state, cooldowns, limit classification, prompt rendering and
+  worker permission policy
+- `../../agent-pool/tests/verify-providers.sh` offline end-to-end ticks of the agent pool against
+  stub provider CLIs, a stub Gitea adapter and a local git remote
 
 Operator setup: [`docs/agents/pr-loops-setup.md`](../../../docs/agents/pr-loops-setup.md).
