@@ -76,8 +76,8 @@ case "$MODE" in review|resolve) ;; *) echo "usage: prod-common.sh review|resolve
 
 # ---------------------------------------------------------------- configuration
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
-SCRIPTS="$AGENT_POOL_HOME/scripts"
-COMMON="${AGENT_POOL_COMMON:-$(cd -- "$AGENT_POOL_HOME/../skills/pr-loops-common" 2>/dev/null && pwd)}"
+SCRIPTS="$(cd -- "$AGENT_POOL_HOME/../scripts" && pwd)"
+COMMON="${AGENT_POOL_COMMON:-$(cd -- "$AGENT_POOL_HOME/../../skills/pr-loops-common" 2>/dev/null && pwd)}"
 ADAPTER="${AGENT_POOL_ADAPTER:-$COMMON/gitea-pr.py}"
 MARKER="${AGENT_POOL_MARKER:-$COMMON/marker.py}"
 PROMPTS="${AGENT_POOL_PROMPTS:-$COMMON/prompts}"

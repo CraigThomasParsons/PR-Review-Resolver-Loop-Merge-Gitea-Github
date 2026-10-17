@@ -4,7 +4,7 @@
 # touches the network, and all state lives in a temp directory.
 set -uo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$ROOT/agent-pool/scripts"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export AGENT_POOL_STATE="$TMP/state"

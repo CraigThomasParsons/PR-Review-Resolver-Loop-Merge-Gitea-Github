@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline end-to-end cases for the agent pool tick (agent-pool/prod-common.sh).
+# Offline end-to-end cases for the agent pool tick (agent-pool/bin/prod-common.sh).
 #
 # Everything is stubbed: HOME is a temp directory whose .local/bin holds stub claude,
 # cursor-agent, grok, agy and codex CLIs (also first on PATH), the Gitea adapter is a stub that
@@ -7,8 +7,8 @@
 # provider CLI, no network, no real state directory.
 set -uo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
-POOL="$ROOT/agent-pool/prod-common.sh"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+POOL="$ROOT/agent-pool/bin/prod-common.sh"
 REAL_COMMON="$ROOT/skills/pr-loops-common"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"
