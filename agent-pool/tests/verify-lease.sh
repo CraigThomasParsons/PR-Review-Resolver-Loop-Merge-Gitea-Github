@@ -158,5 +158,14 @@ python3 "$SCRIPTS/classify.py" --provider agy --exit 0 --stdout "$TMP/o" --stder
 expect "agy response is written to --result-out" "$(cat "$TMP/r")" "pulse-review:v1 head=abc findings=0"
 expect "claude session_id is reported" "$(classify claude 0 '{"subtype":"success","is_error":false,"result":"done","session_id":"s-1"}' | cut -f3)" "s-1"
 
+echo
+echo "prompt rendering"
+printf 'branch __HEADREF__ pr __PR__ report __REPORT__ again __HEADREF__\n' > "$TMP/tpl"
+python3 "$SCRIPTS/render-prompt.py" "$TMP/tpl" "$TMP/rendered" 'HEADREF=feat/a|b&c\1' 'PR=7' 'REPORT=/tmp/r&|.md'
+expect "| & and backslashes in a branch name survive rendering" "$(cat "$TMP/rendered")" 'branch feat/a|b&c\1 pr 7 report /tmp/r&|.md again feat/a|b&c\1'
+expect "no placeholder is left" "$(grep -c '__[A-Z]*__' "$TMP/rendered")" "0"
+python3 "$SCRIPTS/render-prompt.py" "$TMP/tpl" "$TMP/rendered" 'NOEQUALS' 2>/dev/null
+expect_rc "a malformed KEY=VALUE is refused" "$?" "1"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

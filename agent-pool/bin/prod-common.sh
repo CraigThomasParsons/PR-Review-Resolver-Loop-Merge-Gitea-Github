@@ -416,9 +416,8 @@ prepare_worktree() { # sha headref -> sets JOB_WT
 
 render_prompt() { # provider sha headref base report -> prompt file path
   local out="$RUNS/prompt-$JOB_PR-f$JOB_FENCE-$1.txt"
-  sed -e "s|__PR__|$JOB_PR|g" -e "s|__HEADREF__|$3|g" -e "s|__SHA__|$2|g" -e "s|__BASE__|$4|g" \
-      -e "s|__REPO__|$REPO|g" -e "s|__ADAPTER__|$ADAPTER|g" -e "s|__COMMON__|$COMMON|g" \
-      -e "s|__REPORT__|$5|g" -e "s|__SENTINEL__|POOL_RUN_DONE|g" "$(prompt_for "$1")" > "$out"
+  python3 "$SCRIPTS/render-prompt.py" "$(prompt_for "$1")" "$out" "PR=$JOB_PR" "HEADREF=$3" "SHA=$2" \
+    "BASE=$4" "REPO=$REPO" "ADAPTER=$ADAPTER" "COMMON=$COMMON" "REPORT=$5" "SENTINEL=POOL_RUN_DONE"
   printf '%s' "$out"
 }
 
