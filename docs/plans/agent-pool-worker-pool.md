@@ -145,7 +145,8 @@ pushurl override and controller publication alone. Codex's `workspace-write` san
 network, so its adapter reads fail and it cannot write a report outside the worktree. It falls
 back to a final-response report. Gate commands (`npm run`, `just`, `composer`) run repository
 code that a resolve worker can edit. Push and publication are still controller-only, but the
-gate is not a sandbox.
+gate is not a sandbox. The PR #2 round 3 review items D1 (the trust model for gate commands) and
+D2 (one host per repo) are pending Craig's decision.
 
 ## What already exists and gets reused, not rebuilt
 
