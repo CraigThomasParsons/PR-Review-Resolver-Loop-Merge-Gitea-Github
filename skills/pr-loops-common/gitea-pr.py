@@ -19,7 +19,7 @@ workers deny that command; the deterministic merge tick is its sole caller.
 
 Subcommands:
   list   --repo O/R [--state open]   PRs as JSON with number, draft, labels,
-                                     head_sha, author, is_bot
+                                     head_sha, author, is_bot, assignees
   head   --repo O/R --pr N           print the current head SHA (the gate)
   label  --repo O/R --pr N [--add L] [--remove L]
   comment --repo O/R --pr N --body-file F
@@ -113,6 +113,8 @@ def cmd_list(a):
             # Gitea has no is_bot flag; treat the known automation identities as bots.
             "is_bot": login.lower() in {"gitea-actions", "actions-user"} or login.endswith("[bot]"),
             "labels": [l.get("name") for l in (p.get("labels") or [])],
+            # The agent pool reads a non-bot assignee as a human hold.
+            "assignees": [u.get("login") for u in (p.get("assignees") or []) if u.get("login")],
             "url": p.get("html_url", ""),
         })
     print(json.dumps(out, indent=2))
