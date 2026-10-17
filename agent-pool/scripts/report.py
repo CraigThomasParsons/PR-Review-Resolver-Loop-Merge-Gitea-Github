@@ -9,11 +9,47 @@ Prints "ok<TAB><head><TAB><fixed>" when the report carries a marker the loop can
 (review: a pulse-review marker naming S; resolve: a pulse-resolve marker whose reviewed= is H,
 with <head> the head it claims). Prints "nomarker<TAB><reason>" when there is no such marker
 and "invalid<TAB><reason>" when a resolve marker does not account for exactly N findings, so
-the controller refuses it before pushing anything. The marker grammar comes from
-skills/pr-loops-common/marker.py so there is one parser.
+the controller refuses it before pushing anything. A report that contains the adapter's token or
+anything token-shaped is "invalid" too: it would be posted as a PR comment. The marker grammar
+comes from skills/pr-loops-common/marker.py so there is one parser.
 """
 import argparse
 import importlib.util
+import os
+import re
+from pathlib import Path
+
+# Bare 40-hex is deliberately absent: commit SHAs have the same shape. The live token is matched
+# exactly instead.
+TOKEN_SHAPES = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|\bgh[pousr]_[A-Za-z0-9]{30,}"
+    r"|\bgithub_pat_[A-Za-z0-9_]{30,}"
+    r"|\bsk-ant-[A-Za-z0-9_-]{20,}"
+    r"|\bsk-[A-Za-z0-9]{32,}"
+    r"|\bAKIA[0-9A-Z]{16}\b"
+    r"|\bglpat-[A-Za-z0-9_-]{20,}"
+    r"|\bxox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|\b(?:token|bearer)\s+[0-9a-f]{40}\b",
+    re.IGNORECASE)
+
+
+def live_tokens():
+    found = []
+    env = os.environ.get("GITEA_TOKEN", "").strip()
+    if env:
+        found.append(env)
+    try:
+        f = (Path.home() / ".config/pulse/gitea_token").read_text().strip()
+        if f:
+            found.append(f)
+    except OSError:
+        pass
+    return [t for t in found if len(t) >= 8]
+
+
+def leaks_secret(body):
+    return bool(TOKEN_SHAPES.search(body)) or any(t in body for t in live_tokens())
 
 
 def load_marker(path):
@@ -39,6 +75,9 @@ def main():
         body = ""
     if not body.strip():
         print("nomarker\tthe worker left no report")
+        return
+    if leaks_secret(body):
+        print("invalid\tthe report contains a credential or token-shaped string; refusing to post it")
         return
     if a.job == "review":
         found = marker.MARKER.findall(body)

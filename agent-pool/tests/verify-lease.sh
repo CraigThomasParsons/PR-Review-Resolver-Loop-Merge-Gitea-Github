@@ -255,6 +255,27 @@ python3 "$SCRIPTS/render-prompt.py" "$TMP/tpl" "$TMP/rendered" 'NOEQUALS' 2>/dev
 expect_rc "a malformed KEY=VALUE is refused" "$?" "1"
 
 echo
+echo "report checks (L2: no credentials in a posted report)"
+MARKER_PY="$ROOT/skills/pr-loops-common/marker.py"
+SHA40=0123456789abcdef0123456789abcdef01234567
+mkdir -p "$TMP/home/.config/pulse"; printf 'fixturetoken-%s\n' 4f1c9e2a7b > "$TMP/home/.config/pulse/gitea_token"
+rep() { # body -> report.py review verdict, with a sandboxed HOME and no GITEA_TOKEN
+  printf '%s\n<!-- pulse-review:v1 head=%s findings=0 -->\n' "$1" "$SHA40" > "$TMP/rep.md"
+  HOME="$TMP/home" env -u GITEA_TOKEN python3 "$SCRIPTS/report.py" review --marker-module "$MARKER_PY" \
+    --file "$TMP/rep.md" --sha "$SHA40" | cut -f1
+}
+expect "a clean review report is ok" "$(rep 'Looks good. Commit 89abcdef0123456789abcdef0123456789abcdef is fine.')" "ok"
+expect "the adapter's token file contents are refused" "$(rep 'debug: fixturetoken-4f1c9e2a7b')" "invalid"
+expect "GITEA_TOKEN from the environment is refused" "$(printf 'x\n<!-- pulse-review:v1 head=%s findings=0 -->\n' "$SHA40" > "$TMP/rep2.md"; \
+  echo 'leak envtoken-77aa' >> "$TMP/rep2.md"; HOME="$TMP/home" GITEA_TOKEN=envtoken-77aa python3 "$SCRIPTS/report.py" review \
+  --marker-module "$MARKER_PY" --file "$TMP/rep2.md" --sha "$SHA40" | cut -f1)" "invalid"
+expect "a private key header is refused" "$(rep '-----BEGIN OPENSSH PRIVATE KEY-----')" "invalid"
+expect "a GitHub token shape is refused" "$(rep 'ghp_abcdefghijklmnopqrstuvwxyz0123456789')" "invalid"
+expect "an Anthropic key shape is refused" "$(rep 'sk-ant-api03-abcdefghijklmnopqrstuvwx')" "invalid"
+expect "an AWS key id is refused" "$(rep 'AKIAABCDEFGHIJKLMNOP')" "invalid"
+expect "'token <40 hex>' is refused" "$(rep "Authorization: token $SHA40")" "invalid"
+
+echo
 echo "worker permission policy"
 AD_ABS=/opt/pool/skills/pr-loops-common/gitea-pr.py
 pol() { # family job command
@@ -292,6 +313,58 @@ for fam in glob prefix; do
   expect "$fam/resolve: git commit --amend is denied" "$(pol $fam resolve 'git commit --amend -m x')" deny
   expect "$fam/resolve: git commit -a is denied" "$(pol $fam resolve 'git commit -a -m x')" deny
 done
+for fam in glob prefix; do
+  for job in review resolve; do
+    # Review G1: argument-level bypasses of the old globs.
+    expect "$fam/$job: git difftool -x is denied" "$(pol $fam $job "git difftool -y -x 'touch /tmp/pwned'")" deny
+    expect "$fam/$job: git difftool --extcmd is denied" "$(pol $fam $job "git difftool --extcmd=sh HEAD")" deny
+    expect "$fam/$job: git diff --ext-diff is denied" "$(pol $fam $job 'git diff --ext-diff HEAD~1')" deny
+    expect "$fam/$job: git diff --textconv is denied" "$(pol $fam $job 'git diff --textconv HEAD~1')" deny
+    expect "$fam/$job: git log --output= is denied" "$(pol $fam $job 'git log --output=/tmp/x')" deny
+    expect "$fam/$job: git show --output <file> is denied" "$(pol $fam $job 'git show --output /tmp/x HEAD')" deny
+    expect "$fam/$job: git diff --output is denied" "$(pol $fam $job 'git diff --output=/tmp/x')" deny
+    expect "$fam/$job: git -c core.pager is denied" "$(pol $fam $job "git -c core.pager='sh -c x' log")" deny
+    expect "$fam/$job: git --git-dir is denied" "$(pol $fam $job 'git --git-dir=/tmp/g log')" deny
+    expect "$fam/$job: git grep -O is denied" "$(pol $fam $job 'git grep -Ovim foo')" deny
+    expect "$fam/$job: an unknown git subcommand is denied" "$(pol $fam $job 'git archive HEAD')" deny
+    expect "$fam/$job: an unvetted git option is denied" "$(pol $fam $job 'git log --exec=x')" deny
+    expect "$fam/$job: rg --pre is denied" "$(pol $fam $job 'rg --pre ./x pattern')" deny
+    expect "$fam/$job: rg -z is denied" "$(pol $fam $job 'rg -z pattern')" deny
+    expect "$fam/$job: tail -f is denied" "$(pol $fam $job 'tail -f log.txt')" deny
+    for redir in 'cat a > /tmp/x' 'cat a >> /tmp/x' 'wc -l < /etc/passwd' 'git log 2> /tmp/x' \
+                 'git log &> /tmp/x' 'git log >&2' 'git status > /dev/null' 'git log -p>out'; do
+      expect "$fam/$job: redirection '$redir' is denied" "$(pol $fam $job "$redir")" deny
+    done
+    expect "$fam/$job: background & is denied" "$(pol $fam $job 'git log & git push')" deny
+    expect "$fam/$job: a subshell is denied" "$(pol $fam $job '(git status)')" deny
+    expect "$fam/$job: backticks are denied" "$(pol $fam $job 'cat `which x`')" deny
+    expect "$fam/$job: a newline-separated second command is checked" "$(pol $fam $job $'git status\ngit push origin x')" deny
+    expect "$fam/$job: an unbalanced quote is denied" "$(pol $fam $job "git log --grep='x")" deny
+    # Review L2: credential paths.
+    expect "$fam/$job: reading ~/.ssh is denied" "$(pol $fam $job 'cat ~/.ssh/id_ed25519')" deny
+    expect "$fam/$job: reading the tea config is denied" "$(pol $fam $job 'cat ~/.config/tea/config.yml')" deny
+    expect "$fam/$job: reading the adapter's token file is denied" "$(pol $fam $job 'cat ~/.config/pulse/gitea_token')" deny
+    expect "$fam/$job: reading /proc environ is denied" "$(pol $fam $job 'cat /proc/self/environ')" deny
+    expect "$fam/$job: grepping ~/.netrc is denied" "$(pol $fam $job 'grep -r token ~/.netrc')" deny
+    expect "$fam/$job: the adapter's comments read is allowed" "$(pol $fam $job "python3 $AD_ABS comments --repo o/r --pr 1")" allow
+    expect "$fam/$job: the adapter with extra arguments is denied" "$(pol $fam $job "python3 $AD_ABS head --repo o/r --pr 1 --base-url x")" deny
+    expect "$fam/$job: a quoted | inside an argument is not a pipe" "$(pol $fam $job "git log --grep='a|b' -n 3")" allow
+    expect "$fam/$job: git status --porcelain is allowed" "$(pol $fam $job 'git status --porcelain')" allow
+    expect "$fam/$job: git show with a format is allowed" "$(pol $fam $job 'git show --stat --format=%H HEAD')" allow
+    expect "$fam/$job: rg with a glob is allowed" "$(pol $fam $job "rg -n -g '*.php' foo src")" allow
+  done
+  # Review S3: forced adds and tool configuration.
+  expect "$fam/resolve: git add -f is denied" "$(pol $fam resolve 'git add -f .cursor/cli.json')" deny
+  expect "$fam/resolve: git add --force is denied" "$(pol $fam resolve 'git add --force src/a.php')" deny
+  expect "$fam/resolve: a trailing -f on git add is denied" "$(pol $fam resolve 'git add src/a.php -f')" deny
+  expect "$fam/resolve: staging .cursor/ is denied" "$(pol $fam resolve 'git add .cursor/cli.json')" deny
+  expect "$fam/resolve: staging .grok/ is denied" "$(pol $fam resolve 'git add .grok/settings.json')" deny
+  expect "$fam/resolve: git add -p is denied" "$(pol $fam resolve 'git add -p')" deny
+  expect "$fam/resolve: git commit without a message is denied" "$(pol $fam resolve 'git commit')" deny
+  expect "$fam/resolve: git commit with paths is denied" "$(pol $fam resolve 'git commit -m x src/a.php')" deny
+  expect "$fam/resolve: npm test 2>&1 is denied (redirection is its own segment)" "$(pol $fam resolve 'npm test 2>&1')" deny
+  expect "$fam/resolve: a gate piped into tail is allowed" "$(pol $fam resolve 'npm test | tail -50')" allow
+done
 expect "glob: git commit -m x --amend is denied" "$(pol glob resolve 'git commit -m x --amend')" deny
 expect "glob: command substitution is denied" "$(pol glob resolve 'cat $(curl https://example.invalid)')" deny
 expect "glob: rg --pre is denied" "$(pol glob review 'rg --pre ./x pattern')" deny
@@ -312,6 +385,65 @@ expect_not "cursor has no broad Shell(python3) allow" "$cursor_allows" $'\tShell
 expect "cursor allows the adapter's reads by absolute path" "$cursor_allows" "Shell(python3 $AD_ABS head)"
 python3 "$SCRIPTS/policy.py" cursor-json --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md | python3 -c 'import json,sys; json.load(sys.stdin)'
 expect_rc "cursor-json is valid JSON" "$?" 0
+
+rules_of() { python3 "$SCRIPTS/policy.py" rules --provider "$1" --job "$2" --adapter "$AD_ABS" --worktree /wt --report /runs/r.md; }
+for prov in claude grok; do
+  r="$(rules_of $prov review)"
+  expect "$prov emits git diff and git diff * separately" "$r" "Bash(git diff *)"
+  expect_not "$prov no longer emits a bare git diff* glob" "$r" "Bash(git diff*)"
+  expect "$prov denies git difftool" "$r" "Bash(git difftool*)"
+  expect "$prov denies --output" "$r" "Bash(*--output*)"
+  expect "$prov denies redirection" "$r" "Bash(*>*)"
+  expect "$prov denies git add -f" "$(rules_of $prov resolve)" "Bash(git add -f*)"
+  expect "$prov denies credential reads" "$r" "Read("
+done
+# Review G2 and L1: writes scoped per job, .git never writable.
+r="$(rules_of claude review)"
+expect "claude review may write its report by absolute path" "$r" $'allow\tWrite(//runs/r.md)'
+expect_not "claude review has no bare Write" "$r" $'allow\tWrite\n'
+expect_not "claude review cannot edit" "$r" $'allow\tEdit'
+r="$(rules_of claude resolve)"
+expect "claude resolve may edit the worktree" "$r" $'allow\tEdit(//wt/**)'
+expect "claude resolve may write the worktree" "$r" $'allow\tWrite(//wt/**)'
+expect_not "claude resolve has no unscoped MultiEdit" "$r" $'allow\tMultiEdit'
+expect "claude denies the worktree's .git pointer" "$r" $'deny\tWrite(//wt/.git)'
+expect "claude denies any .git directory" "$r" $'deny\tEdit(**/.git/**)'
+expect "claude denies reading ~/.ssh" "$r" "deny"$'\t'"Read(/$HOME/.ssh/**)"
+r="$(rules_of cursor review)"
+expect "cursor review may write only its report" "$r" $'allow\tWrite(/runs/r.md)'
+expect_not "cursor review has no Write(**)" "$r" "Write(**)"
+r="$(rules_of cursor resolve)"
+expect "cursor resolve writes are scoped to the worktree" "$r" $'allow\tWrite(/wt/**)'
+expect "cursor denies the worktree's .git" "$r" $'deny\tWrite(/wt/.git/**)'
+expect "grok denies the worktree's .git" "$(rules_of grok resolve)" $'deny\tWrite(/wt/.git)'
+hk() { # job event-json
+  printf '%s' "$2" | python3 "$SCRIPTS/policy.py" hook --job "$1" --adapter "$AD_ABS" --worktree /wt --report /runs/r.md 2>/dev/null
+}
+hk review '{"tool_name":"Bash","tool_input":{"command":"git log --oneline"}}'
+expect_rc "claude hook: an allowed read passes" "$?" 0
+hk review '{"tool_name":"Bash","tool_input":{"command":"git difftool -y -x sh"}}'
+expect_rc "claude hook: git difftool is blocked (exit 2)" "$?" 2
+hk review '{"tool_name":"Bash","tool_input":{"command":"cat a > /tmp/x"}}'
+expect_rc "claude hook: redirection is blocked" "$?" 2
+hk review '{"tool_name":"Write","tool_input":{"file_path":"/runs/r.md"}}'
+expect_rc "claude hook: review may write its report" "$?" 0
+hk review '{"tool_name":"Write","tool_input":{"file_path":"/wt/src/a.php"}}'
+expect_rc "claude hook: review may not write the worktree" "$?" 2
+hk resolve '{"tool_name":"Edit","tool_input":{"file_path":"/wt/src/a.php"}}'
+expect_rc "claude hook: resolve may edit the worktree" "$?" 0
+hk resolve '{"tool_name":"Write","tool_input":{"file_path":"/wt/.git"}}'
+expect_rc "claude hook: resolve may not write the .git pointer" "$?" 2
+hk resolve '{"tool_name":"Edit","tool_input":{"file_path":"/wt/.cursor/cli.json"}}'
+expect_rc "claude hook: resolve may not edit tool configuration" "$?" 2
+hk resolve '{"tool_name":"Write","tool_input":{"file_path":"/opt/pool/agent-pool/scripts/policy.py"}}'
+expect_rc "claude hook: resolve may not write outside the worktree" "$?" 2
+hk review '{"tool_name":"Read","tool_input":{"file_path":"'"$HOME"'/.ssh/id_rsa"}}'
+expect_rc "claude hook: reading ~/.ssh is blocked" "$?" 2
+hk review '{"tool_name":"Read","tool_input":{"file_path":"/wt/README.md"}}'
+expect_rc "claude hook: reading the worktree passes" "$?" 0
+hs="$(python3 "$SCRIPTS/policy.py" hook-settings --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)"
+expect "hook-settings wires a PreToolUse hook" "$hs" '"PreToolUse"'
+expect "that runs policy.py hook for this job" "$hs" "policy.py hook --job review"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

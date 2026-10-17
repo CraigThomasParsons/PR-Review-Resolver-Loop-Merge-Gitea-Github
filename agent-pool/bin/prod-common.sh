@@ -242,9 +242,12 @@ build_cmd() {
       load_policy claude "$job" "$wt" "$report"
       # The stale ANTHROPIC_API_KEY incident: never let an inherited API key pick the billing account.
       CMD_ENV=(-u ANTHROPIC_API_KEY)
+      # --add-dir lets it write the report in $RUNS (Write is scoped to that one file); the
+      # PreToolUse hook runs policy.py's argument check on every tool call.
       CMD=("$CLAUDE_BIN" -p --output-format json --model "$model"
-        --permission-mode "${CLAUDE_PERMISSION_MODE:-default}" --allowedTools "${ALLOW[@]}"
-        --disallowedTools "${DENY[@]}")
+        --permission-mode "${CLAUDE_PERMISSION_MODE:-default}" --add-dir "$RUNS"
+        --settings "$(policy hook-settings claude "$job" "$wt" "$report")"
+        --allowedTools "${ALLOW[@]}" --disallowedTools "${DENY[@]}")
       CMD_STDIN="$prompt" ;;
     cursor)
       # No --force: the per-worktree cli.json allowlist decides. Always --model: cursor-agent

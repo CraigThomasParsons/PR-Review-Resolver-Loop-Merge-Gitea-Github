@@ -247,6 +247,10 @@ expect "claude adapter shape" "$(calls claude | tr '\n' ' ')" "ARG -p ARG --outp
 expect "claude may read through the adapter's absolute path" "$(calls claude)" "ARG Bash(python3 $TMP/common/gitea-pr.py head *)"
 expect_not "claude gets no python3 * allow" "$(calls claude)" "ARG Bash(python3 *)"
 expect "claude is denied every push" "$(calls claude)" "ARG Bash(git push*)"
+expect "claude may write its report in the runs dir" "$(calls claude | tr '\n' ' ')" "ARG --add-dir ARG $TMP/state/runs"
+expect "claude runs the policy's PreToolUse hook" "$(calls claude)" '"PreToolUse"'
+expect "claude review writes are scoped to the report" "$(calls claude)" "ARG Write(/$TMP/state/runs/report-7-"
+expect_not "claude review gets no bare Write" "$(calls claude)" $'ARG Write\n'
 expect "PROVIDER_ORDER unset means claude only; codex is never in the default" "$(ncalls cursor-agent)$(ncalls grok)$(ncalls agy)$(ncalls codex)" "0000"
 expect "the tick itself is a normal exit" "$TICK_RC" "0"
 worker_sid="$(calls claude | sed -n 's/^SID=//p' | head -1)"
