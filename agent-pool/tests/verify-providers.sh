@@ -34,6 +34,10 @@ git -C "$TMP/main" push -q origin feature/x
 git -C "$TMP/main" push -q origin "HEAD:refs/heads/$ODD_REF"
 SHA="$(git -C "$TMP/main" rev-parse HEAD)"
 git -C "$TMP/main" checkout -q --detach
+git -C "$TMP/main" commit -q --allow-empty -m "fix: an earlier resolve"
+RESOLVED="$(git -C "$TMP/main" rev-parse HEAD)"
+git -C "$TMP/main" push -q origin HEAD:refs/heads/resolved-fixture
+git -C "$TMP/main" checkout -q --detach "$SHA"
 
 # ---------------------------------------------------------------- stub Gitea adapter
 cat > "$TMP/common/gitea-pr.py" <<'PY'
@@ -441,6 +445,14 @@ expect "a claim past its deadline is requeued" "$(cat "$TMP/out.txt")" "passed i
 expect "its provider is cooled down" "$(cooldown_doc grok)" '"strikes": 1'
 expect "and the job is picked up again in the same tick" "$(comments)" "pulse-review:v1 head=$SHA"
 reset '["agent:claimed"]'
+aid="$(AGENT_POOL_NOW=$(( $(date +%s) - 10000 )) python3 "$CLAIMREC" claim --repo $R --pr 7 --worker w --provider grok --deadline-secs 100)"
+mkdir -p "$TMP/state/published"; : > "$TMP/state/published/owner_repo__7.$aid"
+behave claude ok
+tick
+expect "L4: a stale claim whose work was published (only its release failed) is requeued" "$(cat "$TMP/out.txt")" "only the release failed"
+expect "L4: and its provider is not cooled down" "$(cooldown_doc grok)" "none"
+expect "L4: the published marks are cleared once consumed or released" "$(ls -A "$TMP/state/published" | wc -l)" "0"
+reset '["agent:claimed"]'
 python3 "$CLAIMREC" claim --repo $R --pr 7 --worker live-worker --provider claude >/dev/null
 tick
 expect "a live claim is respected" "$(cat "$TMP/out.txt")" "claimed by a live attempt"
@@ -491,6 +503,16 @@ reset '["agent:ready"]' '[]' "$CLEAN_MARKER"
 tick
 expect "a PR whose head already has a clean review is agent:done" "$(labels)" "agent:done"
 expect "without spawning a provider" "$(ncalls claude)" "0"
+RESOLVE_DONE="$(python3 -c 'import json,sys; s,r=sys.argv[1:]; print(json.dumps([
+  {"id":1,"user":"bot","created_at":"","body":f"## Automated review\n1. x\n<!-- pulse-review:v1 head={s} findings=1 -->"},
+  {"id":2,"user":"bot","created_at":"","body":f"## Automated resolve\n<!-- pulse-resolve:v1 head={r} reviewed={s} fixed=1 noted=0 deferred=0 -->"}]))' "$SHA" "$RESOLVED")"
+reset '["agent:ready"]' '[]' "$RESOLVE_DONE"
+git --git-dir "$ORIGIN" update-ref refs/heads/feature/x "$RESOLVED"
+PROVIDER_ORDER=agy tick
+expect "G6: an already-verified resolve is settled even when no provider takes resolve jobs" "$(labels)" "agent:done"
+expect "G6: the log says why" "$(cat "$TMP/out.txt")" "already verified at $RESOLVED"
+expect_not "G6: it is not skipped for want of a resolve provider" "$(cat "$TMP/out.txt")" "no eligible provider takes resolve"
+expect "G6: and no provider ran" "$(ncalls agy)" "0"
 
 echo
 echo "setup faults: no cooldown, reported clearly"
@@ -565,7 +587,21 @@ expect "the timeout is logged as a timeout" "$(cat "$TMP/out.txt")" "hit the wor
 expect "the PR goes back to agent:ready" "$(labels)" "agent:ready"
 expect_not "not needs-human" "$(labels)" "agent:needs-human"
 expect "and no needs-human comment" "$(comments)" "[]"
-expect "and no cooldown" "$(cooldown_doc claude)" "none"
+expect "G4: the timed-out provider pauses briefly" "$(cooldown_doc claude)" '"seconds": 900'
+expect "G4: with no strike" "$(cooldown_doc claude)" '"strikes": 0'
+expect "G4: and the log says so" "$(cat "$TMP/out.txt")" "TIMEOUT [claude]"
+reset '["agent:ready"]'
+behave claude hang; behave cursor-agent ok
+WORKER_TIMEOUT=2 AGENT_POOL_FAST_FAIL_SECS=0 PROVIDER_ORDER=claude,cursor tick
+expect "G4: a timeout falls through to the next provider in the same tick" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
+expect "G4: which ran under its own attempt" "$(calls cursor-agent)" "CLAIM_PROVIDER=cursor"
+reset '["agent:ready"]'
+mkdir -p "$TMP/state/cooldowns"
+python3 "$ROOT/agent-pool/scripts/cooldown.py" record --provider claude --reason limit >/dev/null
+python3 "$ROOT/agent-pool/scripts/cooldown.py" record --provider claude --reason timeout --seconds 900 >/dev/null
+expect "G4: a timeout pause never shortens a longer limit cooldown" "$(cooldown_doc claude)" '"strikes": 1'
+left="$(python3 "$ROOT/agent-pool/scripts/cooldown.py" active --provider claude)"
+expect "G4: (the limit's hour still stands)" "$([ "${left:-0}" -gt 3000 ] && echo hour || echo "only ${left}s")" "hour"
 reset '["agent:ready"]'
 behave agy hang
 WORKER_TIMEOUT=2 AGENT_POOL_FAST_FAIL_SECS=0 PROVIDER_ORDER=agy tick

@@ -57,6 +57,8 @@
 #   AGENT_POOL_WATCH_SECS=30       how often the watcher re-reads the claim during a run
 #   AGENT_POOL_ORPHAN_GRACE=3600   AGENT_POOL_FAST_FAIL_SECS=90   AGENT_POOL_MAX_JOBS=2   DRY_RUN=1
 #   AGENT_POOL_HEAD_SETTLE="1 2 3 4"   backoff (s) while Gitea's PR head catches up with a push
+#   AGENT_POOL_TIMEOUT_COOLDOWN=900    a timed-out provider pauses this long (no strike); the job
+#                                      falls through to the next provider
 #   AGENT_POOL_HOLD_LABELS="status: in-progress"   extra labels that read as a hold
 #   AGENT_POOL_PROTECTED_BRANCHES=develop,main,master,release   never pushed to (nor release/*)
 #   AGENT_POOL_BOT                 the pool's Gitea login; any other assignee is a human hold
@@ -110,6 +112,7 @@ FAST_FAIL_SECS="${AGENT_POOL_FAST_FAIL_SECS:-90}"
 MAX_JOBS="${AGENT_POOL_MAX_JOBS:-2}"
 WORKER_TIMEOUT="${WORKER_TIMEOUT:-2400}"
 HEAD_SETTLE="${AGENT_POOL_HEAD_SETTLE:-1 2 3 4}"
+TIMEOUT_COOLDOWN="${AGENT_POOL_TIMEOUT_COOLDOWN:-900}"
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_HOLD="${AGENT_POOL_HOLD_LABELS-status: in-progress}"
 BOT="${AGENT_POOL_BOT:-}"
@@ -127,7 +130,8 @@ GROK_BIN="${GROK_BIN:-$HOME/.local/bin/grok}"
 AGY_BIN="${AGY_BIN:-$HOME/.local/bin/agy}"
 CODEX_BIN="${CODEX_BIN:-$HOME/.local/bin/codex}"
 
-mkdir -p "$STATE" "$RUNS"
+PUBLISHED="$STATE/published"
+mkdir -p "$STATE" "$RUNS" "$PUBLISHED"
 log() { printf '%s [pool] %s\n' "$(date -Is)" "$*" | tee -a "$LOG" >&2; }
 die() { log "FATAL: $*"; exit 2; }
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9.-' '_'; }
@@ -334,22 +338,25 @@ verify() { # job pr base-sha headref [pushed-sha] -> ok | clean | fail-nomarker:
   echo ok
 }
 
-# derive_job pr sha -> DJ (review|resolve), DBASE (the head verify measures from), DRHEAD, DNFIND.
+# derive_job pr sha headref -> DJ (review|resolve|settled), DBASE (the head verify measures from),
+# DRHEAD, DNFIND, DWHY. settled means the work is already verified: a clean review of this head,
+# or a resolve that answered the latest review and verifies at this head. It needs no provider.
 derive_job() {
   local pr="$1" sha="$2" m mhead mcount r r_head r_reviewed
-  DJ=review; DBASE="$sha"; DRHEAD=""; DNFIND=""
+  DJ=review; DBASE="$sha"; DRHEAD=""; DNFIND=""; DWHY=""
   m="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
   mhead="${m%% *}"; mcount="${m##* }"
   if [ -n "$m" ] && [ "$mhead" = "$sha" ]; then
-    # Findings for this head need a resolve; a clean review settles on the pre-verify.
-    [ "${mcount:-0}" -gt 0 ] && { DJ=resolve; DRHEAD="$sha"; DNFIND="$mcount"; }
+    if [ "${mcount:-0}" -gt 0 ]; then DJ=resolve; DRHEAD="$sha"; DNFIND="$mcount"
+    else DJ=settled; DWHY="the review of $sha is already posted and clean"; fi
     return
   fi
   r="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
   read -r r_head r_reviewed _ <<<"$r"
   if [ -n "$r" ] && [ -n "$m" ] && [ "$r_head" = "$sha" ] && [ "$r_reviewed" = "$mhead" ] \
      && [ "$(verify resolve "$pr" "$mhead" "$3")" = ok ]; then
-    DJ=resolve; DBASE="$mhead"; DRHEAD="$mhead"; DNFIND="$mcount"
+    DJ=settled; DBASE="$mhead"; DRHEAD="$mhead"; DNFIND="$mcount"
+    DWHY="the resolve of $mhead is already verified at $sha"
   fi
 }
 
@@ -382,8 +389,10 @@ release_to() { # label
   rc=$?
   if [ "$rc" -eq 4 ]; then JOB_LOST=1; jlog "claim superseded; release refused: ${err//$'\n'/ }"
   elif [ "$rc" -ne 0 ]; then jlog "warning: release to $1 failed; the record stays for reconciliation: ${err//$'\n'/ }"; fi
+  [ "$rc" -eq 0 ] && rm -f "$(published_mark "$ATTEMPT")"
   return "$rc"
 }
+published_mark() { printf '%s/%s__%s.%s' "$PUBLISHED" "$(slug "$REPO")" "$JOB_PR" "$1"; }
 
 # ---------------------------------------------------------------- worker process group and watcher
 spawn_worker() { # out err
@@ -529,6 +538,8 @@ publish() {
   fi
   comment_file "$report"; rc=$?
   case "$rc" in 0) PUB=published ;; 4) PUB=lost ;; *) PUB="requeue:posting the $JOB_KIND report failed" ;; esac
+  # If the release after this fails, the claim goes stale although the provider did its job.
+  [ "$PUB" = published ] && : > "$(published_mark "$ATTEMPT")"
 }
 
 # ---------------------------------------------------------------- one provider attempt
@@ -564,7 +575,7 @@ render_prompt() { # provider sha headref base report -> prompt file path
   printf '%s' "$out"
 }
 
-# attempt provider sha headref base -> VERDICT (done findings fail setup limit requeue lost), DETAIL.
+# attempt provider sha headref base -> VERDICT (done findings fail setup limit timeout requeue lost), DETAIL.
 # Runs in the calling shell: it sets JOB_WT and may record setup faults.
 attempt() {
   local p="$1" sha="$2" headref="$3" base="$4" tag prompt report result out err rc t0 elapsed cls session v
@@ -613,7 +624,7 @@ attempt() {
   case "$cls" in
     setup*)   VERDICT=setup; DETAIL="${cls#*$'\t'}"; return ;;
     limit*)   VERDICT=limit; DETAIL="${cls#*$'\t'}"; return ;;
-    timeout*) VERDICT=requeue; DETAIL="${cls#*$'\t'} after ${elapsed}s with no verified result"; return ;;
+    timeout*) VERDICT=timeout; DETAIL="${cls#*$'\t'} after ${elapsed}s with no verified result"; return ;;
   esac
   if [ "${v%%:*}" = "fail-nomarker" ] && [ "$elapsed" -lt "$FAST_FAIL_SECS" ]; then
     VERDICT=limit; DETAIL="$p ended after ${elapsed}s (under ${FAST_FAIL_SECS}s) with no marker: ${cls#*$'\t'}"
@@ -641,6 +652,8 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
     *) log "$REPO#$pr: claim failed (exit $rc); leaving the PR for a later tick"; JOB_PR=""; return 0 ;;
   esac
   jlog "claimed by $WORKER_ID for $job with $1"
+  # derive_job already verified it; the claim re-checked the head, so it is not verified again.
+  if [ "$job" = settled ]; then finish_job done "$SETTLED_WHY"; return 0; fi
 
   before="$(verify "$job" "$pr" "$vbase" "$headref")"
   case "$before" in
@@ -666,11 +679,18 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
       fail)     finish_job fail "$DETAIL"; return 0 ;;
       requeue)  finish_job ready "$DETAIL; back in the queue, not a needs-human"; return 0 ;;
       setup)    setup_fault "$p" "$DETAIL" ;;
-      limit)
-        local cd; cd="$(python3 "$SCRIPTS/cooldown.py" record --provider "$p" --reason "$DETAIL")"
-        jlog "LIMIT [$p]: $DETAIL; cooling down $(( ${cd#*$'\t'} / 60 ))m"
+      limit|timeout)
+        local cd
+        if [ "$VERDICT" = limit ]; then
+          cd="$(python3 "$SCRIPTS/cooldown.py" record --provider "$p" --reason "$DETAIL")"
+          jlog "LIMIT [$p]: $DETAIL; cooling down $(( ${cd#*$'\t'} / 60 ))m"
+        else
+          # A hung provider would otherwise be picked first again and cost a full WORKER_TIMEOUT.
+          cd="$(python3 "$SCRIPTS/cooldown.py" record --provider "$p" --reason "$DETAIL" --seconds "$TIMEOUT_COOLDOWN")"
+          jlog "TIMEOUT [$p]: $DETAIL; pausing it $(( ${cd#*$'\t'} / 60 ))m, no strike"
+        fi
         if [ "$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)" != "$sha" ]; then
-          finish_job ready "the head moved during a limited run; not handing a stale job to another provider"
+          finish_job ready "the head moved during the run; not handing a stale job to another provider"
           return 0
         fi ;;
     esac
@@ -724,7 +744,7 @@ mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 
 # reconcile_pr pr -> 0 to go on considering the PR (labels may have become ready), 1 to skip it.
 reconcile_pr() {
-  local out st aid prov info f
+  local out st aid prov info f mark
   out="$(python3 "$SCRIPTS/claim-record.py" reconcile --repo "$REPO" --pr "$1" --adapter "$ADAPTER" \
     --claimed "$CLAIMED" --needs-human "$HUMAN" 2>>"$LOG")"
   # Fields may be empty, and read would collapse adjacent tabs.
@@ -735,9 +755,15 @@ reconcile_pr() {
     stale)
       if python3 "$SCRIPTS/claim-record.py" requeue --repo "$REPO" --pr "$1" --attempt "$aid" --adapter "$ADAPTER" \
            --claimed "$CLAIMED" --ready "$READY" >/dev/null 2>>"$LOG"; then
-        log "$REPO#$1: attempt ${aid:0:8} ($prov) passed its deadline $info; requeued to $READY"
-        [ -n "$prov" ] && python3 "$SCRIPTS/cooldown.py" record --provider "$prov" \
-          --reason "a claim passed its deadline with no result" >/dev/null
+        mark="$(JOB_PR="$1" published_mark "$aid")"
+        if [ -e "$mark" ]; then
+          rm -f "$mark"
+          log "$REPO#$1: attempt ${aid:0:8} ($prov) passed its deadline $info after its work was published (only the release failed); requeued to $READY, no cooldown"
+        else
+          log "$REPO#$1: attempt ${aid:0:8} ($prov) passed its deadline $info; requeued to $READY"
+          [ -n "$prov" ] && python3 "$SCRIPTS/cooldown.py" record --provider "$prov" \
+            --reason "a claim passed its deadline with no result" >/dev/null
+        fi
         RECONCILED_READY=1; return 0
       fi
       log "$REPO#$1: could not requeue the stale attempt ${aid:0:8}; skipping"; return 1 ;;
@@ -771,15 +797,21 @@ for row in "${CANDIDATES[@]}"; do
   esac
   headref_safe "$headref" || { log "$REPO#$pr: head branch '$headref' is not one the pool will push to; skipping"; continue; }
   derive_job "$pr" "$sha" "$headref"
-  QUEUE+=("$pr"$'\t'"$headref"$'\t'"$sha"$'\t'"$base"$'\t'"$DJ"$'\t'"$DBASE"$'\t'"${DRHEAD:--}"$'\t'"${DNFIND:--}"$'\t'"$remove")
+  QUEUE+=("$pr"$'\t'"$headref"$'\t'"$sha"$'\t'"$base"$'\t'"$DJ"$'\t'"$DBASE"$'\t'"${DRHEAD:--}"$'\t'"${DNFIND:--}"$'\t'"$remove"$'\t'"${DWHY:--}")
 done
 [ "${#QUEUE[@]}" -eq 0 ] && { log "nothing to do after skips"; [ "$SETUP_FAULTS" -gt 0 ] && exit 2; exit 0; }
 
 jobs_run=0
 for row in "${QUEUE[@]}"; do
   [ "$jobs_run" -ge "$MAX_JOBS" ] && break
-  IFS=$'\t' read -r pr headref sha base job vbase rhead nfind remove <<<"$row"
+  IFS=$'\t' read -r pr headref sha base job vbase rhead nfind remove SETTLED_WHY <<<"$row"
   [ "$rhead" = - ] && rhead=""; [ "$nfind" = - ] && nfind=""
+  if [ "$job" = settled ]; then
+    # Settling needs no provider, so it never waits on one.
+    if [ "$DRY_RUN" = 1 ]; then log "DRY: would settle $REPO#$pr ($SETTLED_WHY)"
+    else run_job "$pr" "$headref" "$sha" "$base" "$job" "$vbase" "$rhead" "$nfind" "$remove" controller; fi
+    continue
+  fi
   job_providers "$job"
   if [ "${#JOB_PROVIDERS[@]}" -eq 0 ]; then log "$REPO#$pr: no eligible provider takes $job jobs; skipping"; continue; fi
   if [ "$DRY_RUN" = 1 ]; then

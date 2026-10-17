@@ -12,7 +12,8 @@ setup, and a cooldown would only hide that. They go to faults/<provider>.json in
 which nothing reads to gate selection.
 
 Subcommands:
-  record   --provider P --reason R   add a strike; print "<until>\t<seconds>"
+  record   --provider P --reason R [--seconds S]   add a strike; print "<until>\t<seconds>".
+           With --seconds: pause S seconds with no strike (a timeout, not a limit)
   clear    --provider P              reset strikes after a verified success
   active   --provider P              exit 0 and print seconds left if cooling, else exit 1
   eligible --order a,b,c             print providers not cooling, in order; exit 1 if none
@@ -57,9 +58,14 @@ def cmd_record(a):
         strikes = int(doc.get("strikes", 0))
         if strikes and now - float(doc.get("until", 0)) > cap():
             strikes = 0
-        strikes += 1
-        seconds = min(base() * 2 ** (strikes - 1), cap())
-        until = now + seconds
+        if a.seconds is not None:
+            # A fixed pause (a timeout): no strike, and never shortens a longer cooldown.
+            seconds = a.seconds
+            until = max(now + seconds, float(doc.get("until", 0)))
+        else:
+            strikes += 1
+            seconds = min(base() * 2 ** (strikes - 1), cap())
+            until = now + seconds
         poolstate.save(path, {"provider": a.provider, "strikes": strikes, "since": now,
                               "until": until, "seconds": seconds, "reason": a.reason})
     print(f"{until:.0f}\t{seconds:.0f}")
@@ -111,6 +117,7 @@ def main():
     p.add_argument("--provider")
     p.add_argument("--reason", default="")
     p.add_argument("--order", default="")
+    p.add_argument("--seconds", type=float)
     a = p.parse_args()
     if a.action != "eligible" and not a.provider:
         p.error("--provider is required")
