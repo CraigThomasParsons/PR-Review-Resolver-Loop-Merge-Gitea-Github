@@ -35,8 +35,14 @@ the previous provider is fenced off.
 "status: in-progress" style label with no live claim behind it is not a human hold; it
 expires one grace period after the pool first saw it.
 
+With --adapter, claim first re-reads the PR live under the lock and refuses (exit 6) unless
+--require-label is still on it, no human or --hold-labels hold appeared, no assignee other
+than --bot was added, and the head is still --expect-head. The listing that queued the job
+may be minutes old by the time the job is claimed.
+
 Subcommands (all take --repo O/R --pr N):
-  claim     --worker W --provider P [--job J] [--branch B] [--worktree D] [--deadline-secs S] [-- CMD...]
+  claim     --worker W --provider P [--job J] [--branch B] [--worktree D] [--deadline-secs S]
+            [--adapter F --require-label L --expect-head SHA --hold-labels CSV --bot B] [-- CMD...]
   reattempt --attempt A --provider P [--worktree D] [--deadline-secs S]   print the new attempt_id
   check     --attempt A                     exit 0 if A is the current attempt, else 4
   guard     --attempt A -- CMD...           run CMD under the lock iff A is current
@@ -47,7 +53,8 @@ Subcommands (all take --repo O/R --pr N):
   hold      --labels JSON [--assignees JSON] --hold-labels CSV [--bot B] [--grace S]
 
 Exit codes: 0 ok; 2 usage or unreadable record; 3 a claim already exists; 4 the attempt is
-not current (or, for requeue, not stale); 5 the claim's label flip failed and was rolled back.
+not current (or, for requeue, not stale); 5 the claim's label flip failed and was rolled back;
+6 the live PR state no longer allows the claim.
 """
 import argparse
 import datetime
@@ -137,12 +144,38 @@ def current(path, attempt):
     return doc
 
 
+def live_refusal(a):
+    """Why the PR's live state no longer allows this claim, or None. Read under the job lock."""
+    out = subprocess.run([sys.executable, a.adapter, "state", "--repo", a.repo, "--pr", str(a.pr)],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return f"could not read the live PR state: {out.stderr.strip()[:200]}"
+    st = json.loads(out.stdout or "{}")
+    labels = set(st.get("labels") or [])
+    if a.require_label and a.require_label not in labels:
+        return f"{a.require_label} is no longer on the PR"
+    held = (labels & HUMAN_LABELS) | (labels & {x.strip() for x in a.hold_labels.split(",") if x.strip()})
+    if held:
+        return "now held by " + ",".join(sorted(held))
+    humans = [x for x in (st.get("assignees") or []) if x and x != a.bot]
+    if humans:
+        return "now assigned to " + ",".join(humans)
+    if a.expect_head and st.get("head_sha") != a.expect_head:
+        return f"the head moved from {a.expect_head} to {st.get('head_sha') or 'nothing'}"
+    return None
+
+
 def cmd_claim(a, path):
     doc = poolstate.load(path)
     if doc:
         state = "unreadable" if doc.get("_unreadable") else f"attempt {doc.get('attempt_id')} by {doc.get('worker_id')}"
         print(f"claim: {a.repo}#{a.pr} already claimed ({state})", file=sys.stderr)
         return 3
+    if a.adapter:
+        why = live_refusal(a)
+        if why:
+            print(f"claim: {a.repo}#{a.pr} not claimed: {why}", file=sys.stderr)
+            return 6
     rec = new_record(a, poolstate.now())
     poolstate.save(path, rec)
     if run(a.command, quiet=True) != 0:
@@ -306,6 +339,8 @@ def main():
     p.add_argument("--hold-labels", default="")
     p.add_argument("--bot", default="")
     p.add_argument("--grace", type=float)
+    p.add_argument("--require-label", default="")
+    p.add_argument("--expect-head", default="")
     a = p.parse_args(argv)
     a.command = command
     if a.action == "claim" and not a.worker:
@@ -314,6 +349,8 @@ def main():
         p.error("--attempt is required")
     if a.action in ("requeue", "reconcile") and not a.adapter:
         p.error("--adapter is required")
+    if (a.require_label or a.expect_head) and not a.adapter:
+        p.error("--require-label and --expect-head need --adapter")
     path = claim_path(a.repo, a.pr)
     handler = globals()["cmd_" + a.action]
     if a.action in ("show", "hold"):

@@ -574,14 +574,18 @@ attempt() {
 run_job() { # pr headref sha base job verify-base review-head findings remove-labels providers...
   local pr="$1" headref="$2" sha="$3" base="$4" job="$5" vbase="$6" rhead="$7" nfind="$8" remove="$9"
   shift 9
-  local p id rc before tried=() first=1
+  local p id rc before tried=() first=1 holds="$EXTRA_HOLD"
   JOB_PR="$pr"; JOB_KIND="$job"; REVIEW_HEAD="$rhead"; FINDINGS="$nfind"; JOB_LOST=0; JOB_WT=""
+  # Reclaiming a dead hold removes the hold label in the same flip, so it cannot also refuse it.
+  [ "$remove" != "$READY" ] && holds=""
   id="$(claim claim --worker "$WORKER_ID" --provider "$1" --job "$job" --branch "$headref" --worktree "$(wt_for "$1")" \
+    --adapter "$ADAPTER" --require-label "$READY" --expect-head "$sha" --hold-labels "$holds" --bot "$BOT" \
     -- python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$remove" --add "$CLAIMED" 2>>"$LOG")"
   rc=$?
   case "$rc" in
     0) ATTEMPT="$id" ;;
     3) log "$REPO#$pr: already claimed elsewhere; skipping"; JOB_PR=""; return 0 ;;
+    6) log "$REPO#$pr: the PR changed since it was listed; not claimed (see $LOG)"; JOB_PR=""; return 0 ;;
     *) log "$REPO#$pr: claim failed (exit $rc); leaving the PR for a later tick"; JOB_PR=""; return 0 ;;
   esac
   jlog "claimed by $WORKER_ID for $job with $1"

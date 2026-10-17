@@ -74,6 +74,17 @@ elif cmd == "comments":
     print(json.dumps(st["prs"][arg("--pr")]["comments"]))
 elif cmd == "head":
     print(head(st["prs"][arg("--pr")]))
+elif cmd == "state":
+    p = st["prs"][arg("--pr")]
+    if os.path.exists(path + ".race"):
+        # A person acted between the tick's listing and its claim.
+        race = json.load(open(path + ".race")); os.remove(path + ".race")
+        p.update({k: v for k, v in race.items() if k in ("labels", "assignees")})
+        if "head" in race:
+            subprocess.run(["git", "--git-dir", os.environ["STUB_ORIGIN"], "update-ref",
+                            "refs/heads/" + p["head_ref"], race["head"]], check=True)
+        save()
+    print(json.dumps({"head_sha": head(p), "labels": p["labels"], "assignees": p.get("assignees", [])}))
 else:
     sys.exit(f"stub adapter: unexpected {cmd}")
 PY
@@ -200,7 +211,7 @@ export ANTHROPIC_API_KEY=stale-key-for-test PR_LOOP_SKIP_PATTERN=""
 unset PROVIDER_ORDER AGY_AUTO_APPROVE
 
 reset() { # labels-json [assignees-json] [comments-json] [head-ref]
-  rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes"
+  rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes" "$STUB_GITEA.race"
   git --git-dir "$ORIGIN" update-ref refs/heads/feature/x "$SHA"
   git --git-dir "$ORIGIN" update-ref "refs/heads/$ODD_REF" "$SHA"
   python3 - "$STUB_GITEA" "$1" "${2:-[]}" "${3:-[]}" "${4:-feature/x}" "$SHA" <<'PY'
@@ -412,6 +423,24 @@ expect "nothing ran during the grace" "$(ncalls claude)" "0"
 AGENT_POOL_ORPHAN_GRACE=0 tick
 expect "after the grace the orphan hold is reclaimed" "$(comments)" "pulse-review:v1"
 expect_not "and the dead status: in-progress label is cleared" "$(labels)" "status: in-progress"
+
+echo
+echo "S1: the claim re-reads the PR live under the lock"
+for race in '{"labels":["agent:ready","agent:needs-human"]}' '{"labels":[]}' '{"assignees":["craig"]}' \
+            '{"labels":["agent:ready","status: in-progress"]}' "{\"head\":\"$(git --git-dir "$ORIGIN" rev-parse master)\"}"; do
+  reset '["agent:ready"]'
+  echo "$race" > "$STUB_GITEA.race"
+  behave claude ok
+  tick
+  expect "a change after listing ($race) refuses the claim" "$(cat "$TMP/out.txt")" "changed since it was listed"
+  expect "and no provider ran ($race)" "$(ncalls claude)" "0"
+  expect "and nothing was written to Gitea ($race)" "$(w="$(writes)"; echo "${w:-none}")" "none"
+  expect "and no claim record is left ($race)" "$(record)" "{}"
+done
+reset '["agent:ready"]' '["pool-bot"]'
+behave claude ok
+AGENT_POOL_BOT=pool-bot tick
+expect "the pool's own assignee does not refuse the claim" "$(comments)" "pulse-review:v1 head=$SHA"
 
 echo
 echo "pre-verify: already-done work is settled without a provider"
