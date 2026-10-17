@@ -56,6 +56,7 @@
 #   WORKER_TIMEOUT=2400            per provider run; must be shorter than the deadline
 #   AGENT_POOL_WATCH_SECS=30       how often the watcher re-reads the claim during a run
 #   AGENT_POOL_ORPHAN_GRACE=3600   AGENT_POOL_FAST_FAIL_SECS=90   AGENT_POOL_MAX_JOBS=2   DRY_RUN=1
+#   AGENT_POOL_HEAD_SETTLE="1 2 3 4"   backoff (s) while Gitea's PR head catches up with a push
 #   AGENT_POOL_HOLD_LABELS="status: in-progress"   extra labels that read as a hold
 #   AGENT_POOL_PROTECTED_BRANCHES=develop,main,master,release   never pushed to (nor release/*)
 #   AGENT_POOL_BOT                 the pool's Gitea login; any other assignee is a human hold
@@ -108,6 +109,7 @@ WATCH_SECS="${AGENT_POOL_WATCH_SECS:-30}"
 FAST_FAIL_SECS="${AGENT_POOL_FAST_FAIL_SECS:-90}"
 MAX_JOBS="${AGENT_POOL_MAX_JOBS:-2}"
 WORKER_TIMEOUT="${WORKER_TIMEOUT:-2400}"
+HEAD_SETTLE="${AGENT_POOL_HEAD_SETTLE:-1 2 3 4}"
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_HOLD="${AGENT_POOL_HOLD_LABELS-status: in-progress}"
 BOT="${AGENT_POOL_BOT:-}"
@@ -278,15 +280,27 @@ build_cmd() {
 # The same gates as pr-loop.sh's verify(), read from Gitea after the controller has published,
 # with one distinction the pool needs: a missing marker is reported as fail-nomarker, because a
 # fast run that left no marker is a limit, not a defect.
-verify() { # job pr base-sha headref -> ok | clean | fail-nomarker:<reason> | fail:<reason>
-  local job="$1" pr="$2" sha="$3" headref="$4"
+verify() { # job pr base-sha headref [pushed-sha] -> ok | clean | fail-nomarker:<reason> | fail:<reason>
+  local job="$1" pr="$2" sha="$3" headref="$4" pushed="${5:-}"
   if [ "$job" = "review" ]; then
     local m; m="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
     if [ "${m%% *}" != "$sha" ]; then echo "fail-nomarker:no review comment carrying the marker for $sha was found"; return; fi
     if [ "${m##* }" = "0" ]; then echo clean; else echo ok; fi
     return
   fi
-  local newsha; newsha="$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)"
+  local newsha delay; newsha="$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)"
+  if [ -n "$pushed" ] && [ "$newsha" != "$pushed" ]; then
+    # Gitea updates a PR's head asynchronously after a push.
+    for delay in $HEAD_SETTLE; do
+      sleep "$delay"
+      newsha="$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)"
+      [ "$newsha" = "$pushed" ] && break
+    done
+    if [ "$newsha" != "$pushed" ] \
+       && [ "$(git -C "$MAIN" ls-remote origin "refs/heads/$headref" 2>/dev/null | cut -f1)" = "$pushed" ]; then
+      newsha="$pushed"
+    fi
+  fi
   if [ -z "$newsha" ]; then echo "fail:could not read the PR head after the run"; return; fi
   git -C "$MAIN" fetch origin --quiet "refs/heads/$headref" 2>/dev/null
   local rm; rm="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
@@ -415,6 +429,21 @@ still_held() {
   [ ! -f "$JOB_LOSTFILE" ] && claim check --attempt "$ATTEMPT" 2>/dev/null
 }
 
+# worker_head wt -> the worker's HEAD commit, read through the main clone. The controller never
+# runs git inside a worker's worktree after the worker started: its .git pointer, config and
+# hooks are the worker's to rewrite.
+worker_head() {
+  local common want d
+  common="$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  want="$(realpath -m "$1")/.git"
+  for d in "$common"/worktrees/*/; do
+    [ "$(realpath -m "$(cat "$d/gitdir" 2>/dev/null)")" = "$want" ] || continue
+    git -C "$MAIN" rev-parse --verify -q "worktrees/$(basename "$d")/HEAD^{commit}"
+    return
+  done
+  return 1
+}
+
 remove_worktree() { # wt
   [ -n "$1" ] && [ -d "$1" ] || return 0
   git -C "$MAIN" worktree remove --force "$1" >/dev/null 2>&1 || jlog "worktree $1 kept (busy); inspect and remove by hand"
@@ -457,8 +486,9 @@ trap 'exit 143' TERM
 # publish provider sha headref report result -> PUB: published | nomarker:<why> | requeue:<why> |
 # fail:<why> | lost. The only path by which a worker's work reaches Gitea.
 publish() {
-  local p="$1" sha="$2" headref="$3" report="$4" result="$5" chk alt head fixed newhead remote rc
+  local p="$1" sha="$2" headref="$3" report="$4" result="$5" chk alt head fixed newhead remote rc tool
   local args=(--marker-module "$MARKER")
+  PUSHED=""
   if [ "$JOB_KIND" = review ]; then args+=(--sha "$sha")
   else args+=(--review-head "$REVIEW_HEAD" --findings "${FINDINGS:-0}"); fi
   chk="$(python3 "$SCRIPTS/report.py" "$JOB_KIND" "${args[@]}" --file "$report")"
@@ -473,22 +503,24 @@ publish() {
   esac
   IFS=$'\t' read -r _ head fixed <<<"$chk"
   if [ "$JOB_KIND" = resolve ]; then
-    newhead="$(git -C "$JOB_WT" rev-parse HEAD 2>/dev/null)"
+    newhead="$(worker_head "$JOB_WT")" || { PUB="fail:could not read the worker's HEAD through the main clone"; return; }
     if [ "$head" != "$newhead" ]; then PUB="fail:the resolve marker names head $head but the worker's worktree is at $newhead"; return; fi
     if [ "$newhead" != "$sha" ] && [ "${fixed:-0}" -eq 0 ]; then
       PUB="fail:the worker committed on top of $sha but its marker claims no fixes"; return
     fi
     if [ "$newhead" != "$sha" ]; then
       headref_safe "$headref" || { PUB="fail:refusing to push to '$headref'"; return; }
-      git -C "$JOB_WT" merge-base --is-ancestor "$sha" "$newhead" 2>/dev/null \
+      git -C "$MAIN" merge-base --is-ancestor "$sha" "$newhead" 2>/dev/null \
         || { PUB="fail:the worker's commits at $newhead are not a fast-forward of $sha"; return; }
-      remote="$(git -C "$JOB_WT" ls-remote origin "refs/heads/$headref" 2>/dev/null | cut -f1)"
+      tool="$(git -C "$MAIN" diff --name-only "$sha" "$newhead" 2>/dev/null | grep -E '(^|/)\.(cursor|grok|claude)/' | head -3 | tr '\n' ' ')"
+      [ -z "$tool" ] || { PUB="fail:the worker's commits touch agent tool configuration (${tool% }); refusing to push"; return; }
+      remote="$(git -C "$MAIN" ls-remote origin "refs/heads/$headref" 2>/dev/null | cut -f1)"
       [ "$remote" = "$sha" ] || { PUB="requeue:origin/$headref is at ${remote:-nothing}, not $sha; the branch moved during the run"; return; }
-      # No hooks and no force: the worker could have written hook files, and the server refuses
-      # anything that is not a fast-forward.
-      guarded "push" git -C "$JOB_WT" -c core.hooksPath=/dev/null push --quiet --no-verify origin "HEAD:refs/heads/$headref"
+      # No hooks and no force: the server refuses anything that is not a fast-forward.
+      guarded "push" git -C "$MAIN" -c core.hooksPath=/dev/null push --quiet --no-verify origin "$newhead:refs/heads/$headref"
       rc=$?
       case "$rc" in 0) ;; 4) PUB=lost; return ;; *) PUB="requeue:the push of $newhead to $headref failed"; return ;; esac
+      PUSHED="$newhead"
       jlog "pushed $sha..$newhead to $headref for $p"
     fi
   fi
@@ -542,7 +574,7 @@ attempt() {
   case "$PUB" in
     lost)       VERDICT=lost; DETAIL="$p's attempt was superseded before its work was published"; return ;;
     requeue:*)  VERDICT=requeue; DETAIL="${PUB#*:}"; return ;;
-    published)  v="$(verify "$JOB_KIND" "$JOB_PR" "$sha" "$headref")" ;;
+    published)  v="$(verify "$JOB_KIND" "$JOB_PR" "$sha" "$headref" "$PUSHED")" ;;
     nomarker:*) v="fail-nomarker:${PUB#*:}" ;;
     *)          v="$PUB" ;;
   esac

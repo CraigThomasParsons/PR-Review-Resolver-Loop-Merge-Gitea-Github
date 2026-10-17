@@ -73,7 +73,14 @@ elif cmd == "comment":
 elif cmd == "comments":
     print(json.dumps(st["prs"][arg("--pr")]["comments"]))
 elif cmd == "head":
-    print(head(st["prs"][arg("--pr")]))
+    p = st["prs"][arg("--pr")]
+    lag = int(open(path + ".lag").read()) if os.path.exists(path + ".lag") else 0
+    if lag > 0:
+        # Gitea has not caught up with a push yet: the PR still shows its old head.
+        open(path + ".lag", "w").write(str(lag - 1))
+        print(p["head_sha"])
+    else:
+        print(head(p))
 elif cmd == "state":
     p = st["prs"][arg("--pr")]
     if os.path.exists(path + ".race"):
@@ -151,6 +158,21 @@ case "$behave" in
   resolve-noted)    resolve_text 0 1 0 > "$report"; success ;;
   resolve-deferred) resolve_text 0 0 1 > "$report"; success ;;
   resolve-fix)      commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-repoint)
+    # Commit, then point the worktree's .git at a gitdir of the worker's choosing.
+    commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"
+    printf 'gitdir: /nonexistent/worker-owned-gitdir\n' > .git; success ;;
+  resolve-toolconf-cursor)
+    commit_fix; mkdir -p .cursor; echo '{"permissions":{"allow":["Shell(*)"]}}' > .cursor/cli.json
+    git add -f .cursor/cli.json; git commit -q -m "chore: tool config"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-toolconf-claude)
+    commit_fix; mkdir -p .claude; echo '{}' > .claude/settings.json
+    git add .claude/settings.json; git commit -q -m "chore: tool config"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-lag)
+    commit_fix; cat "$STUB_BEHAVE/lag" > "$STUB_GITEA.lag"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-miscount) commit_fix; resolve_text 1 "${findings:-1}" 0 > "$report"; success ;;
   resolve-unclaimed) commit_fix; resolve_text 0 "${findings:-1}" 0 > "$report"; success ;;
   resolve-push)
@@ -211,7 +233,7 @@ export ANTHROPIC_API_KEY=stale-key-for-test PR_LOOP_SKIP_PATTERN=""
 unset PROVIDER_ORDER AGY_AUTO_APPROVE
 
 reset() { # labels-json [assignees-json] [comments-json] [head-ref]
-  rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes" "$STUB_GITEA.race"
+  rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes" "$STUB_GITEA.race" "$STUB_GITEA.lag"
   git --git-dir "$ORIGIN" update-ref refs/heads/feature/x "$SHA"
   git --git-dir "$ORIGIN" update-ref "refs/heads/$ODD_REF" "$SHA"
   python3 - "$STUB_GITEA" "$1" "${2:-[]}" "${3:-[]}" "${4:-feature/x}" "$SHA" <<'PY'
@@ -350,6 +372,26 @@ expect "if the branch moved on the remote during the run, nothing is pushed over
 expect "the job is requeued" "$(labels)" "agent:ready"
 expect "and the reason logged" "$(cat "$TMP/out.txt")" "the branch moved during the run"
 expect_not "no resolve report was posted" "$(comments)" "pulse-resolve"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-repoint
+tick
+expect "S2: a worker that repoints its .git still has its commit read through the main clone" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "S2: and the resolve is done" "$(labels)" "agent:done"
+for tc in cursor claude; do
+  reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+  behave claude "resolve-toolconf-$tc"
+  tick
+  expect "S3: commits touching .$tc/ are never pushed" "$(origin_head)" "$SHA"
+  expect "S3: and go to needs-human (.$tc/)" "$(labels)" "agent:needs-human"
+  expect "S3: with the reason (.$tc/)" "$(comments)" "touch agent tool configuration"
+done
+for lag in 3 99; do
+  reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+  behave claude resolve-lag; echo "$lag" > "$TMP/behave/lag"
+  AGENT_POOL_HEAD_SETTLE="0 0 0 0" tick
+  expect "S6: a resolve is verified against the pushed head while Gitea lags ($lag reads)" "$(labels)" "agent:done"
+  expect_not "S6: not 'head never moved' ($lag reads)" "$(cat "$TMP/out.txt")" "never moved"
+done
 
 echo
 echo "push target safety"
