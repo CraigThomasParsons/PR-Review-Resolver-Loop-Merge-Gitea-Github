@@ -35,7 +35,12 @@ The emitted rules follow the same policy as far as each CLI's syntax allows:
   grok    --allow/--deny Bash(<glob>), Read, Grep, Write(<path>), Edit(<path>)
   cursor  .cursor/cli.json Shell(<command prefix>), Read(<glob>), Write(<glob>). Prefix rules
           cannot constrain arguments, so cursor's arguments are limited only by the prefixes
-          it is allowed and the spelled-out deny prefixes; recorded as a residual risk.
+          it is allowed and the spelled-out deny prefixes; recorded as a residual risk. In
+          particular a prefix cannot deny an option at an arbitrary position (`git log -p -n 3
+          --output=/tmp/x` starts with the allowed `git log`; only the common leading options
+          are spelled out), cannot see redirection (`cat a > /tmp/x`), and cannot see through a
+          symlink or a brace. `check` denies all of these; Cursor's own CLI does not. Cursor is
+          not contained by cli.json alone and must not run unattended on an untrusted repo.
 Writes: review may write only its report; resolve may write the worktree and its report.
 `.git` (the worktree's pointer file and any .git directory) is never writable.
 
@@ -187,8 +192,11 @@ def resolved(arg, a):
 
 
 def sensitive(arg, a):
-    p = resolved(arg, a) + "/"
-    return any(frag in p for frag in SENSITIVE) or any(frag in arg for frag in SENSITIVE)
+    """The argument names a credential: literally, once normalised, or once symlinks are followed
+    (a PR can commit notes.txt -> ~/.ssh/id_ed25519)."""
+    p = resolved(arg, a)
+    forms = (arg, p + "/", os.path.realpath(p) + "/")
+    return any(frag in form for form in forms for frag in SENSITIVE)
 
 
 def roots(a, wildcard=False):
@@ -243,7 +251,7 @@ def options_ok(args, spec, positional_ok, value_ok):
             if not value_ok(tok.split("=", 1)[1]):
                 return False
         elif any(re.fullmatch(rx, tok) for rx in spec["attached"]):
-            if not value_ok(tok):
+            if not value_ok(tok[2:] if not tok.startswith("--") else tok):
                 return False
         else:
             return False
@@ -355,6 +363,12 @@ CURSOR_DENY = ["git push", "git push --force", "git reset --hard", "git merge", 
                "python3 -c", "python3 -", "node", "npx", "bash", "sh", "env", "eval",
                "rg --pre", "rg -z", "rg --search-zip", "git grep -O", "git grep --open-files-in-pager",
                "tail -f", "tail -F", "cat ~/.ssh", "cat ~/.config", "cat ~/.netrc", "cat /proc"]
+# Prefix rules match only a fixed leading position, so --output behind other options is spelled
+# out for the leading options workers actually use; anything else is beyond cli.json (see above).
+CURSOR_DENY += [f"git {sub} {lead}--output" for sub in ("diff", "log", "show")
+                for lead in ("", "-p ", "--patch ", "--stat ", "--oneline ", "--name-only ", "-p --stat ",
+                             "--stat -p ", "--format=%H ", "-1 ", "-n 1 ")]
+CURSOR_DENY = list(dict.fromkeys(CURSOR_DENY))
 CURSOR_REVIEW_DENY = ["git add", "git commit"]
 
 
@@ -434,10 +448,19 @@ def family_allows(segment, a):
         not any(fnmatch.fnmatchcase(segment, p) for p in deny)
 
 
+def writes_output(seg):
+    """--output (or an abbreviation git would accept, --ou...) anywhere in the segment, not
+    only straight after the subcommand: `git log -p --output=/tmp/x` writes a file."""
+    return any(t.split("=", 1)[0].startswith("--ou") for t in seg)
+
+
 def check(a, command):
     if not argument_check(command, a):
         return "deny"
-    for seg in tokenize(command):
+    segments = tokenize(command)
+    if any(writes_output(seg) for seg in segments):
+        return "deny"
+    for seg in segments:
         if not family_allows(" ".join(seg), a):
             return "deny"
     return "allow"
@@ -445,6 +468,8 @@ def check(a, command):
 
 # ---------------------------------------------------------------- claude hook
 def write_allowed(path, a):
+    if sensitive(path, a):
+        return False
     p = os.path.realpath(os.path.join(a.worktree or "/", os.path.expanduser(path)))
     if p == os.path.realpath(a.report):
         return True

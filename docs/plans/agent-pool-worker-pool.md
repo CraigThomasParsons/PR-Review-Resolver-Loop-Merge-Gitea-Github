@@ -145,9 +145,12 @@ pushurl override and controller publication alone. Codex's `workspace-write` san
 network, so its adapter reads fail and it cannot write a report outside the worktree. It falls
 back to a final-response report. Gate commands (`npm run`, `just`, `composer`) run repository
 code that a resolve worker can edit. Push and publication are still controller-only, but the
-gate is not a sandbox. D1 is decided: the controller will run gate commands itself from a pinned
-list after the worker exits (not built yet); D2 (one host per repo) is still pending Craig's
-decision.
+gate is not a sandbox. Cursor's `.cursor/cli.json` prefix rules cannot deny an option at an
+arbitrary position (`git log -p -n 3 --output=/tmp/x` starts with the allowed `git log`),
+redirection, a symlinked path or brace expansion; `policy.py check` denies all of these, but
+Cursor's own CLI enforces only the prefixes, so Cursor is not contained by cli.json alone.
+D1 is decided: the controller will run gate commands itself from a pinned list after the worker
+exits (not built yet); D2 (one host per repo) is still pending Craig's decision.
 
 ## What already exists and gets reused, not rebuilt
 

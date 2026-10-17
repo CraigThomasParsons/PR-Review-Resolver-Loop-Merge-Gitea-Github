@@ -447,6 +447,50 @@ expect "r4#2 a read through a symlink out of the worktree is denied" "$(spol rev
 expect "r4#2 a wildcard that matches a symlink out of the worktree is denied" "$(spol review 'cat etc*/hostname')" deny
 expect "r4#2 a read of a real worktree file is allowed" "$(spol review 'cat src/a.txt')" allow
 expect "r4#2 git add through a symlink out of the worktree is denied" "$(spol resolve 'git add etclink/hostname')" deny
+# Charlie B1: a symlink committed in the PR pointing at a credential (a fake ~/.ssh under a temp HOME).
+FH="$TMP/fakehome"; BWT="$TMP/b1wt"
+mkdir -p "$FH/.ssh" "$BWT/src"; echo 'fake key' > "$FH/.ssh/id_ed25519"; echo x > "$BWT/src/a.txt"
+ln -s "$FH/.ssh/id_ed25519" "$BWT/notes.txt"; ln -s "$FH/.ssh" "$BWT/keydir"
+bpol() { HOME="$FH" python3 "$SCRIPTS/policy.py" check --family "$1" --job "$2" --adapter "$AD_ABS" --worktree "$BWT" --report "$TMP/b1runs/r.md" -- "$3"; }
+bhk() { printf '%s' "$2" | HOME="$FH" python3 "$SCRIPTS/policy.py" hook --job "$1" --adapter "$AD_ABS" --worktree "$BWT" --report "$TMP/b1runs/r.md" 2>/dev/null; }
+for fam in glob prefix; do
+  for job in review resolve; do
+    expect "$fam/$job: B1 cat of a symlink to a credential is denied" "$(bpol $fam $job 'cat notes.txt')" deny
+    expect "$fam/$job: B1 head of a symlink to a credential is denied" "$(bpol $fam $job 'head -n 1 notes.txt')" deny
+    expect "$fam/$job: B1 rg of a symlink to a credential is denied" "$(bpol $fam $job 'rg BEGIN notes.txt')" deny
+    expect "$fam/$job: B1 rg of a symlinked credential directory is denied" "$(bpol $fam $job 'rg -n BEGIN keydir')" deny
+    expect "$fam/$job: B1 a wildcard matching the symlink is denied" "$(bpol $fam $job 'cat note*')" deny
+    expect "$fam/$job: B1 a real worktree file is still readable" "$(bpol $fam $job 'cat src/a.txt')" allow
+    # Charlie B4: consumed option values get the same credential and symlink check.
+    expect "$fam/$job: B4 git log -S <credential path> is denied" "$(bpol $fam $job 'git log -S ~/.ssh/id_ed25519')" deny
+    expect "$fam/$job: B4 git log -G <credential path> is denied" "$(bpol $fam $job 'git log -G ~/.config/tea/config.yml')" deny
+    expect "$fam/$job: B4 an attached -S<credential path> is denied" "$(bpol $fam $job 'git log -S~/.ssh/id_ed25519')" deny
+    expect "$fam/$job: B4 git grep -e <credential path> is denied" "$(bpol $fam $job 'git grep -e ~/.config/pulse/gitea_token')" deny
+    expect "$fam/$job: B4 an option value that is a symlink to a credential is denied" "$(bpol $fam $job 'git log -S notes.txt')" deny
+    expect "$fam/$job: B4 git blame -L <credential path> is denied" "$(bpol $fam $job 'git blame -L 1,2 ~/.ssh/id_ed25519')" deny
+    expect "$fam/$job: B4 an ordinary -S search is allowed" "$(bpol $fam $job 'git log -S parseConfig --oneline')" allow
+    # Charlie B5: --output anywhere in the command.
+    expect "$fam/$job: B5 git log -p --output= is denied" "$(bpol $fam $job 'git log -p --output=/tmp/x')" deny
+    expect "$fam/$job: B5 --output late in the command is denied" "$(bpol $fam $job 'git log -p -n 3 --stat --output /tmp/x')" deny
+    expect "$fam/$job: B5 an abbreviated --outp= is denied" "$(bpol $fam $job 'git log -p --outp=/tmp/x')" deny
+    expect "$fam/$job: B5 git diff with a late --output is denied" "$(bpol $fam $job 'git diff HEAD~1 --output=/tmp/x')" deny
+  done
+  # Charlie B2: git commit -F is gone in both families.
+  expect "$fam/resolve: B2 git commit -m x -F <file> is denied" "$(bpol $fam resolve 'git commit -m x -F /etc/hostname')" deny
+  expect "$fam/resolve: B2 git commit -F <credential> is denied" "$(bpol $fam resolve "git commit -F $FH/.ssh/id_ed25519")" deny
+done
+bhk review '{"tool_name":"Read","tool_input":{"file_path":"'"$BWT"'/notes.txt"}}'
+expect_rc "claude hook B1: Read of a symlink to a credential is blocked" "$?" 2
+bhk review '{"tool_name":"Read","tool_input":{"file_path":"notes.txt"}}'
+expect_rc "claude hook B1: a relative Read of the symlink is blocked" "$?" 2
+bhk review '{"tool_name":"Grep","tool_input":{"pattern":"BEGIN","path":"'"$BWT"'/keydir"}}'
+expect_rc "claude hook B1: Grep through a symlinked credential directory is blocked" "$?" 2
+bhk review '{"tool_name":"Read","tool_input":{"file_path":"'"$BWT"'/src/a.txt"}}'
+expect_rc "claude hook B1: Read of a real worktree file passes" "$?" 0
+bhk resolve '{"tool_name":"Edit","tool_input":{"file_path":"'"$BWT"'/notes.txt"}}'
+expect_rc "claude hook B1: an Edit through a symlink to a credential is blocked" "$?" 2
+bhk resolve '{"tool_name":"Edit","tool_input":{"file_path":"'"$BWT"'/src/a.txt"}}'
+expect_rc "claude hook B1: an Edit of a real worktree file passes" "$?" 0
 expect "glob: git commit -m x --amend is denied" "$(pol glob resolve 'git commit -m x --amend')" deny
 expect "glob: command substitution is denied" "$(pol glob resolve 'cat $(curl https://example.invalid)')" deny
 expect "glob: rg --pre is denied" "$(pol glob review 'rg --pre ./x pattern')" deny
@@ -552,6 +596,10 @@ expect "claude r4#1: brace expansion is denied in the emitted globs" "$r" 'Bash(
 expect "claude r4#2: git commit -F is denied in the emitted globs" "$(rules_of claude resolve)" 'Bash(git commit -F*)'
 expect_not "claude r4#2: git commit -F is no longer allowed" "$(rules_of claude resolve | grep '^allow')" 'git commit -F'
 expect "cursor r4#2: git commit -F is a deny prefix" "$(rules_of cursor resolve)" 'Shell(git commit -F)'
+cr="$(rules_of cursor review)"
+expect "cursor B5: --output behind -p is a deny prefix" "$cr" 'Shell(git log -p --output)'
+expect "cursor B5: --output behind --stat on git diff is a deny prefix" "$cr" 'Shell(git diff --stat --output)'
+expect "claude B5: --output anywhere is a deny glob" "$(rules_of claude review)" 'Bash(*--output*)'
 hs="$(python3 "$SCRIPTS/policy.py" hook-settings --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)"
 expect "hook-settings wires a PreToolUse hook" "$hs" '"PreToolUse"'
 expect "that runs policy.py hook for this job" "$hs" "policy.py hook --job review"
