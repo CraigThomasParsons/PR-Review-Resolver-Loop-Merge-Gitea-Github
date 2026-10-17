@@ -185,6 +185,16 @@ case "$behave" in
     commit_fix; mkdir -p .claude; echo '{}' > .claude/settings.json
     git add .claude/settings.json; git commit -q -m "chore: tool config"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-context)
+    commit_fix; git add -f .agent-pool-context.md; git commit -q -m "chore: context"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-secret-msg)
+    echo "fix $RANDOM" >> f.txt; git add f.txt
+    git commit -q -m "fix: something" -m "token: 3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-secret-diff)
+    echo "GITEA_TOKEN=3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901" >> f.txt; git add f.txt; git commit -q -m "fix: config"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-lag)
     commit_fix; cat "$STUB_BEHAVE/lag" > "$STUB_GITEA.lag"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
@@ -399,6 +409,20 @@ for tc in cursor claude; do
   expect "S3: commits touching .$tc/ are never pushed" "$(origin_head)" "$SHA"
   expect "S3: and go to needs-human (.$tc/)" "$(labels)" "agent:needs-human"
   expect "S3: with the reason (.$tc/)" "$(comments)" "touch agent tool configuration"
+done
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-context
+tick
+expect "r4#5: a commit adding the context file is never pushed" "$(origin_head)" "$SHA"
+expect "r4#5: and the reason is given" "$(comments)" "touch agent tool configuration"
+for leak in msg diff; do
+  reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+  behave claude "resolve-secret-$leak"
+  tick
+  expect "r4#2: a credential in the commit $leak is never pushed" "$(origin_head)" "$SHA"
+  expect "r4#2: and goes to needs-human ($leak)" "$(labels)" "agent:needs-human"
+  expect "r4#2: with the reason ($leak)" "$(comments)" "contain a credential or token-shaped string"
+  expect_not "r4#2: and the secret itself is not repeated in the comment ($leak)" "$(comments)" "3f9a0c1d2e4b"
 done
 for lag in 3 99; do
   reset '["agent:ready"]' '[]' "$REVIEW_MARKER"

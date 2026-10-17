@@ -292,6 +292,17 @@ expect "a GitHub token shape is refused" "$(rep 'ghp_abcdefghijklmnopqrstuvwxyz0
 expect "an Anthropic key shape is refused" "$(rep 'sk-ant-api03-abcdefghijklmnopqrstuvwx')" "invalid"
 expect "an AWS key id is refused" "$(rep 'AKIAABCDEFGHIJKLMNOP')" "invalid"
 expect "'token <40 hex>' is refused" "$(rep "Authorization: token $SHA40")" "invalid"
+expect "r4#2: a YAML 'token: <hex>' line is refused" "$(rep "    token: $SHA40")" "invalid"
+expect "r4#2: a key=value token is refused" "$(rep "GITEA_TOKEN=3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6")" "invalid"
+expect "r4#2: a JSON password is refused" "$(rep '{"password": "Zx81kd9w0qPl3mNb7"}')" "invalid"
+expect "r4#2: a code identifier after token: is not a secret" "$(rep 'The token: getTokenFromEnvironment is read once.')" "ok"
+expect "r4#2: a SHA in prose is not a secret" "$(rep "Fixed in $SHA40.")" "ok"
+printf 'fix: x\n\napi_key = "AbC123dEf456GhI789jK"\n' > "$TMP/scan.txt"
+python3 "$SCRIPTS/report.py" scan --file "$TMP/scan.txt" >/dev/null
+expect_rc "r4#2: report.py scan flags a credential in commit text" "$?" 1
+printf 'fix: x\n+def token_for(user):\n' > "$TMP/scan.txt"
+python3 "$SCRIPTS/report.py" scan --file "$TMP/scan.txt" >/dev/null
+expect_rc "r4#2: report.py scan passes clean commit text" "$?" 0
 
 echo
 echo "worker permission policy"

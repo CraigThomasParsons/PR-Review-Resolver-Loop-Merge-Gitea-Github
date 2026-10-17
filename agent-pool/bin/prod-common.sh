@@ -498,7 +498,7 @@ trap 'exit 143' TERM
 # publish provider sha headref report result -> PUB: published | nomarker:<why> | requeue:<why> |
 # fail:<why> | lost. The only path by which a worker's work reaches Gitea.
 publish() {
-  local p="$1" sha="$2" headref="$3" report="$4" result="$5" chk alt head fixed newhead remote rc tool
+  local p="$1" sha="$2" headref="$3" report="$4" result="$5" chk alt head fixed newhead remote rc tool scan
   local args=(--marker-module "$MARKER")
   PUSHED=""
   if [ "$JOB_KIND" = review ]; then args+=(--sha "$sha")
@@ -524,8 +524,18 @@ publish() {
       headref_safe "$headref" || { PUB="fail:refusing to push to '$headref'"; return; }
       git -C "$MAIN" merge-base --is-ancestor "$sha" "$newhead" 2>/dev/null \
         || { PUB="fail:the worker's commits at $newhead are not a fast-forward of $sha"; return; }
-      tool="$(git -C "$MAIN" diff --name-only "$sha" "$newhead" 2>/dev/null | grep -E '(^|/)\.(cursor|grok|claude)/' | head -3 | tr '\n' ' ')"
+      tool="$(git -C "$MAIN" diff --name-only "$sha" "$newhead" 2>/dev/null \
+        | grep -E "(^|/)\.(cursor|grok|claude)/|(^|/)${CONTEXT_FILE//./\\.}\$" | head -3 | tr '\n' ' ')"
       [ -z "$tool" ] || { PUB="fail:the worker's commits touch agent tool configuration (${tool% }); refusing to push"; return; }
+      # Commit messages and added lines go public with the push; nothing secret may ride along.
+      scan="$RUNS/push-scan-$JOB_PR-${ATTEMPT:0:8}.txt"
+      { git -C "$MAIN" log --format=%B "$sha..$newhead"; git -C "$MAIN" diff "$sha" "$newhead" | grep '^+' | grep -v '^+++ '; } \
+        > "$scan" 2>/dev/null
+      if ! python3 "$SCRIPTS/report.py" scan --file "$scan" >/dev/null; then
+        rm -f "$scan"
+        PUB="fail:the worker's commits contain a credential or token-shaped string; refusing to push"; return
+      fi
+      rm -f "$scan"
       remote="$(git -C "$MAIN" ls-remote origin "refs/heads/$headref" 2>/dev/null | cut -f1)"
       [ "$remote" = "$sha" ] || { PUB="requeue:origin/$headref is at ${remote:-nothing}, not $sha; the branch moved during the run"; return; }
       # No hooks and no force: the server refuses anything that is not a fast-forward.
