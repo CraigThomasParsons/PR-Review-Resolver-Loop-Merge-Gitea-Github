@@ -152,6 +152,9 @@ Cursor's own CLI enforces only the prefixes, so Cursor is not contained by cli.j
 D1 is decided: the controller will run gate commands itself from a pinned list after the worker
 exits (not built yet); D2 (one host per repo) is still pending Craig's decision.
 
+Resolve workers must not run unattended until the controller-gates follow-up (branch
+docs/controller-gates-plan, docs/plans/controller-gates.md) lands.
+
 ## What already exists and gets reused, not rebuilt
 
 - **`skills/pr-loops-common/gitea-pr.py`** — the Gitea adapter (list/label/comment). The new

@@ -9,7 +9,9 @@ no `SKILL.md` on purpose.
 - `prompts/review.txt`, `prompts/resolve.txt` the prompts pasted into each worker
 - `prompts/review.generic.txt`, `prompts/resolve.generic.txt` provider-neutral prompts for the
   headless agent pool (`../../agent-pool/bin/prod-common.sh`); no Claude-only skills, staging is
-  by named path only, and workers never push or comment (the pool controller publishes)
+  by named path only, and workers never push or comment (the pool controller publishes).
+  Resolve workers must not run unattended until the controller-gates follow-up (branch
+  docs/controller-gates-plan, docs/plans/controller-gates.md) lands.
 - `marker.py` reads the hidden `pulse-review:v1` and `pulse-resolve:v1` markers off a PR. A
   resolve marker counts each finding as `fixed`, `noted` (non-blocking, left for the author) or
   `deferred` (blocking); only `deferred` sends a PR to `review:needs-human`
