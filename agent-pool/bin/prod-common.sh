@@ -393,6 +393,8 @@ release_to() { # label
   return "$rc"
 }
 published_mark() { printf '%s/%s__%s.%s' "$PUBLISHED" "$(slug "$REPO")" "$JOB_PR" "$1"; }
+# The job's outcome is already on Gitea; a failed release must not cost anyone a cooldown strike.
+mark_published() { : > "$(published_mark "$ATTEMPT")"; }
 
 # ---------------------------------------------------------------- worker process group and watcher
 spawn_worker() { # out err
@@ -549,7 +551,7 @@ publish() {
   comment_file "$report"; rc=$?
   case "$rc" in 0) PUB=published ;; 4) PUB=lost ;; *) PUB="requeue:posting the $JOB_KIND report failed" ;; esac
   # If the release after this fails, the claim goes stale although the provider did its job.
-  [ "$PUB" = published ] && : > "$(published_mark "$ATTEMPT")"
+  [ "$PUB" = published ] && mark_published
 }
 
 # ---------------------------------------------------------------- one provider attempt
@@ -663,9 +665,10 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
   esac
   jlog "claimed by $WORKER_ID for $job with $1"
   # derive_job already verified it; the claim re-checked the head, so it is not verified again.
-  if [ "$job" = settled ]; then finish_job done "$SETTLED_WHY"; return 0; fi
+  if [ "$job" = settled ]; then mark_published; finish_job done "$SETTLED_WHY"; return 0; fi
 
   before="$(verify "$job" "$pr" "$vbase" "$headref")"
+  case "$before" in clean|ok) mark_published ;; esac
   case "$before" in
     clean) finish_job done "the review of $sha is already posted and clean"; return 0 ;;
     ok) if [ "$job" = resolve ]; then finish_job done "the resolve of $vbase is already verified at $sha"
@@ -811,17 +814,18 @@ for row in "${CANDIDATES[@]}"; do
 done
 [ "${#QUEUE[@]}" -eq 0 ] && { log "nothing to do after skips"; [ "$SETUP_FAULTS" -gt 0 ] && exit 2; exit 0; }
 
-jobs_run=0
+jobs_run=0; stopped=""
 for row in "${QUEUE[@]}"; do
-  [ "$jobs_run" -ge "$MAX_JOBS" ] && break
   IFS=$'\t' read -r pr headref sha base job vbase rhead nfind remove SETTLED_WHY <<<"$row"
   [ "$rhead" = - ] && rhead=""; [ "$nfind" = - ] && nfind=""
   if [ "$job" = settled ]; then
-    # Settling needs no provider, so it never waits on one.
+    # Settling needs no provider and is no provider job, so neither limit below holds it back.
     if [ "$DRY_RUN" = 1 ]; then log "DRY: would settle $REPO#$pr ($SETTLED_WHY)"
     else run_job "$pr" "$headref" "$sha" "$base" "$job" "$vbase" "$rhead" "$nfind" "$remove" controller; fi
     continue
   fi
+  [ -n "$stopped" ] && continue
+  [ "$jobs_run" -ge "$MAX_JOBS" ] && continue
   job_providers "$job"
   if [ "${#JOB_PROVIDERS[@]}" -eq 0 ]; then log "$REPO#$pr: no eligible provider takes $job jobs; skipping"; continue; fi
   if [ "$DRY_RUN" = 1 ]; then
@@ -829,7 +833,7 @@ for row in "${QUEUE[@]}"; do
   else
     run_job "$pr" "$headref" "$sha" "$base" "$job" "$vbase" "$rhead" "$nfind" "$remove" "${JOB_PROVIDERS[@]}"
     drop_cooling_providers
-    [ "${#PROVIDERS[@]}" -eq 0 ] && { log "every provider is cooling down; stopping the tick"; break; }
+    [ "${#PROVIDERS[@]}" -eq 0 ] && { log "every provider is cooling down; only settling from here"; stopped=1; }
   fi
   jobs_run=$((jobs_run + 1))
 done

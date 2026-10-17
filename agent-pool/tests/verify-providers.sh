@@ -72,6 +72,8 @@ if cmd == "list":
 elif cmd == "labels":
     print(json.dumps(st["prs"][arg("--pr")]["labels"]))
 elif cmd == "label":
+    if os.path.exists(path + ".faildone") and "agent:done" in (arg("--add") or ""):
+        sys.exit("stub adapter: Gitea hiccup on the release")
     p = st["prs"][arg("--pr")]
     remove = [x for x in (arg("--remove") or "").split(",") if x]
     p["labels"] = [l for l in p["labels"] if l not in remove]
@@ -258,7 +260,8 @@ export ANTHROPIC_API_KEY=stale-key-for-test PR_LOOP_SKIP_PATTERN=""
 unset PROVIDER_ORDER AGY_AUTO_APPROVE
 
 reset() { # labels-json [assignees-json] [comments-json] [head-ref]
-  rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes" "$STUB_GITEA.race" "$STUB_GITEA.lag"
+  rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes" "$STUB_GITEA.race" "$STUB_GITEA.lag" \
+    "$STUB_GITEA.faildone"
   git --git-dir "$ORIGIN" update-ref refs/heads/feature/x "$SHA"
   git --git-dir "$ORIGIN" update-ref "refs/heads/$ODD_REF" "$SHA"
   python3 - "$STUB_GITEA" "$1" "${2:-[]}" "${3:-[]}" "${4:-feature/x}" "$SHA" <<'PY'
@@ -547,6 +550,31 @@ expect "G6: an already-verified resolve is settled even when no provider takes r
 expect "G6: the log says why" "$(cat "$TMP/out.txt")" "already verified at $RESOLVED"
 expect_not "G6: it is not skipped for want of a resolve provider" "$(cat "$TMP/out.txt")" "no eligible provider takes resolve"
 expect "G6: and no provider ran" "$(ncalls agy)" "0"
+reset '["agent:ready"]' '[]' "$CLEAN_MARKER"
+AGENT_POOL_MAX_JOBS=0 tick
+expect "r4#7: a settled PR is settled even with no job slots left" "$(labels)" "agent:done"
+reset '["agent:ready"]'
+python3 - "$STUB_GITEA" "$CLEAN_MARKER" <<'PY'
+import json, sys
+path, comments = sys.argv[1:]
+st = json.load(open(path))
+st["prs"]["8"] = dict(st["prs"]["7"], labels=["agent:ready"], comments=json.loads(comments))
+json.dump(st, open(path, "w"))
+PY
+behave claude limit
+tick
+expect "r4#7: once every provider cools down, later settled PRs are still settled" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prs"]["8"]["labels"])' "$STUB_GITEA")" "agent:done"
+expect "r4#7: the log says the tick only settles from there" "$(cat "$TMP/out.txt")" "only settling from here"
+reset '["agent:ready"]' '[]' "$CLEAN_MARKER"
+: > "$STUB_GITEA.faildone"
+tick
+expect "r4#6: a settled job whose release fails keeps its claim for reconciliation" "$(record)" "attempt_id"
+rm -f "$STUB_GITEA.faildone"
+AGENT_POOL_NOW=$(( $(date +%s) + 100000 )) tick
+expect "r4#6: the stale claim of a settled job is requeued without a strike" "$(cat "$TMP/out.txt")" "only the release failed"
+expect "r4#6: and nobody is cooled down" "$(ls "$TMP/state/cooldowns" 2>/dev/null | wc -l)" "0"
+expect "r4#6: the job then settles" "$(labels)" "agent:done"
 
 echo
 echo "setup faults: no cooldown, reported clearly"
