@@ -133,9 +133,30 @@ expect "grok 429" "$(classify grok 1 '' 'HTTP 429 Too Many Requests')" "limit"
 expect "grok success" "$(classify grok 0 '{"text":"done","stopReason":"EndTurn"}')" "ok"
 expect "agy denied_actions is a setup fault despite SUCCESS" "$(classify agy 0 '{"status":"SUCCESS","denied_actions":[{"tool":"run_command"}]}')" "setup"
 expect "agy quota exceeded" "$(classify agy 1 '{"status":"ERROR","error":"Quota exceeded for model"}')" "limit"
-expect "agy timeout is incomplete" "$(classify agy 124 '')" "incomplete"
+expect "agy hitting WORKER_TIMEOUT is a timeout, not incomplete" "$(classify agy 124 '')" "timeout"
+expect "a killed run (137) is a timeout" "$(classify claude 137 '')" "timeout"
+expect "a timeout with limit wording is still a limit" "$(classify grok 124 '' 'rate limit exceeded')" "limit"
 expect "codex insufficient credits" "$(classify codex 1 '' 'insufficient credits')" "limit"
 expect "a missing binary is a setup fault" "$(classify grok 127 '' 'not found')" "setup"
+expect "RESOURCE_EXHAUSTED is a limit" "$(classify agy 1 '{"status":"ERROR","error":"RESOURCE_EXHAUSTED: try later"}')" "limit"
+expect "usage limit wording is a limit" "$(classify codex 1 '' 'You have reached your usage limit for today')" "limit"
+expect "'hit your ... limit' is a limit" "$(classify grok 1 '' 'You hit your weekly limit')" "limit"
+expect "a short successful agy result with RESOURCE_EXHAUSTED is a limit" \
+  "$(classify agy 0 '{"status":"SUCCESS","response":"RESOURCE_EXHAUSTED"}')" "limit"
+expect "a short successful cursor result with usage-limit wording is a limit" \
+  "$(classify cursor 0 '{"type":"result","subtype":"success","is_error":false,"result":"You hit your usage limit."}')" "limit"
+expect "a short successful grok result with insufficient credits is a limit" \
+  "$(classify grok 0 '{"text":"Insufficient credits"}')" "limit"
+expect "a short successful codex result with too many requests is a limit" "$(classify codex 0 'Too many requests')" "limit"
+expect "a short successful cursor credit wall is a limit" \
+  "$(classify cursor 0 '{"type":"result","subtype":"success","is_error":false,"result":"Credit balance is too low"}')" "limit"
+AGY_OK='{"status":"SUCCESS","conversation_id":"conv-42","response":"## Automated review\nnothing\n<!-- pulse-review:v1 head=abc findings=0 -->"}'
+expect "agy SUCCESS with a response is ok" "$(classify agy 0 "$AGY_OK")" "ok"
+expect "agy conversation_id is reported as the session" "$(classify agy 0 "$AGY_OK" | cut -f3)" "conv-42"
+printf '%s' "$AGY_OK" > "$TMP/o"; : > "$TMP/e"
+python3 "$SCRIPTS/classify.py" --provider agy --exit 0 --stdout "$TMP/o" --stderr "$TMP/e" --result-out "$TMP/r" >/dev/null
+expect "agy response is written to --result-out" "$(cat "$TMP/r")" "pulse-review:v1 head=abc findings=0"
+expect "claude session_id is reported" "$(classify claude 0 '{"subtype":"success","is_error":false,"result":"done","session_id":"s-1"}' | cut -f3)" "s-1"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

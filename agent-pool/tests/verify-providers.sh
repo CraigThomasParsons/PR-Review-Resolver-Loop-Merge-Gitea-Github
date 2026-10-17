@@ -80,6 +80,7 @@ name="$(basename "$0")"
   printf 'ARG %s\n' "$@"
   echo "PWD=$PWD"
   echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-unset}"
+  echo "PARENT=$(ps -o args= -p "$PPID" 2>/dev/null)"
   [ -f "$PWD/.cursor/cli.json" ] && echo "CURSOR_CLI_JSON=present"
 } >> "$STUB_CALLS/$name.log"
 cat > /dev/null
@@ -106,6 +107,7 @@ case "$behave" in
   resolve-noted) resolve 0 1 0; success ;;
   resolve-deferred) resolve 0 0 1; success ;;
   slow) sleep "${STUB_SLEEP:-4}"; review 2; success ;;
+  hang) sleep 60; success ;;
   expire)
     # The lease lapses underneath a running worker; its heartbeat must notice and stop it.
     python3 - "$AGENT_POOL_STATE/leases/owner_repo__$STUB_PR.json" <<'PY'
@@ -226,13 +228,16 @@ expect "agy denied_actions despite SUCCESS gets no cooldown" "$(cooldown_doc agy
 expect "agy denied_actions is reported" "$(cat "$TMP/out.txt")" "SETUP FAULT [agy]"
 expect "agy runs in the worktree" "$(calls agy)" "PWD=$TMP/wt/"
 expect "agy adapter shape" "$(calls agy | tr '\n' ' ')" "ARG -p"
-expect "agy flags" "$(calls agy | tr '\n' ' ')" "ARG --output-format ARG json ARG --print-timeout ARG 100s ARG --model ARG test-model"
+expect "agy flags: print timeout 0 so WORKER_TIMEOUT is the only limit" "$(calls agy | tr '\n' ' ')" "ARG --output-format ARG json ARG --print-timeout ARG 0 ARG --model ARG test-model"
+expect "agy runs directly under the worker timeout" "$(calls agy | grep PARENT=)" "timeout -k 30"
+expect_not "with no inner 120s timeout" "$(calls agy | grep PARENT=)" "timeout 120"
 expect_not "agy auto-approve is opt-in" "$(calls agy)" "dangerously-skip-permissions"
 reset '["review:requested"]'
+behave agy ok
 PROVIDER_ORDER=agy tick
-expect "agy without a model is a setup fault before any claim" "$(cat "$TMP/out.txt")" "no model configured"
-expect "and nothing was claimed" "$(labels)" "review:requested"
-expect "and agy never ran" "$(ncalls agy)" "0"
+expect_not "agy without a model is not a setup fault" "$(cat "$TMP/out.txt")" "SETUP FAULT"
+expect "agy without a model ran" "$(ncalls agy)" "1"
+expect_not "and was given no --model" "$(calls agy)" "ARG --model"
 
 echo
 echo "stale fence token blocks writes"
@@ -291,6 +296,22 @@ expect "and the worker writes nothing after its claim" "$(labels)" "review:in-pr
 reset '["review:requested"]'
 AGENT_POOL_LEASE_TTL=5 AGENT_POOL_HEARTBEAT=5 tick
 expect "a heartbeat no shorter than the TTL is refused" "$(cat "$TMP/out.txt")" "must be shorter than"
+
+echo
+echo "a provider timeout requeues, never needs-human"
+reset '["review:requested"]'
+behave claude hang
+WORKER_TIMEOUT=2 AGENT_POOL_FAST_FAIL_SECS=0 tick
+expect "the timeout is logged as a timeout" "$(cat "$TMP/out.txt")" "hit the worker timeout"
+expect "the PR goes back to its trigger" "$(labels)" "review:requested"
+expect_not "not needs-human" "$(labels)" "review:needs-human"
+expect "and no needs-human comment" "$(python3 "$STUB_ADAPTER" comments --repo $R --pr 7)" "[]"
+expect "and no cooldown" "$(cooldown_doc claude)" "none"
+reset '["review:requested"]'
+behave agy hang
+WORKER_TIMEOUT=2 AGENT_POOL_FAST_FAIL_SECS=0 PROVIDER_ORDER=agy tick
+expect "an agy timeout requeues too" "$(labels)" "review:requested"
+expect_not "an agy timeout is never needs-human" "$(labels)" "review:needs-human"
 
 echo
 echo "real verification failures still go to needs-human"

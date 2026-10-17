@@ -46,12 +46,12 @@
 #   AGENT_POOL_HOLD_LABELS="status: in-progress"   extra labels that read as a hold
 #   AGENT_POOL_BOT                 the pool's Gitea login; any other assignee is a human hold
 #   AGENT_POOL_MODEL_<PROVIDER>    model per provider (claude=opus cursor=auto grok=grok-build;
-#                                  agy and codex have no default and are a setup fault without one)
+#                                  agy runs on its own default without one; codex is a setup fault)
 #   AGENT_POOL_PROMPT_<PROVIDER>   prompt template per provider (default prompts/<mode>.generic.txt)
 #   CLAUDE_BIN CURSOR_AGENT_BIN GROK_BIN AGY_BIN CODEX_BIN  full paths (default ~/.local/bin/<cli>)
 #   CLAUDE_PERMISSION_MODE=auto  GROK_PERMISSION_MODE=bypassPermissions  CODEX_SANDBOX_MODE=workspace-write
 #   AGY_AUTO_APPROVE=1             pass --dangerously-skip-permissions (agy has no deny list)
-#   AGY_TIMEOUT=120  AGY_PRINT_TIMEOUT=100s
+#   AGY_PRINT_TIMEOUT=0            agy's own print timeout; 0 leaves WORKER_TIMEOUT as the only limit
 #
 # Exit codes: 0 for a normal tick (including nothing to do); 2 for a setup fault.
 
@@ -177,7 +177,7 @@ select_providers() {
     bin="$(bin_for "$p")"; model="$(model_for "$p")"
     case "$bin" in /*) ;; *) setup_fault "$p" "binary path '$bin' is not absolute"; continue ;; esac
     [ -x "$bin" ] || { setup_fault "$p" "binary $bin is missing or not executable"; continue; }
-    [ -n "$model" ] || { setup_fault "$p" "no model configured (set AGENT_POOL_MODEL_${p^^})"; continue; }
+    [ -n "$model" ] || [ "$p" = agy ] || { setup_fault "$p" "no model configured (set AGENT_POOL_MODEL_${p^^})"; continue; }
     [ -f "$(prompt_for "$p")" ] || { setup_fault "$p" "missing prompt template $(prompt_for "$p")"; continue; }
     PROVIDERS+=("$p")
   done
@@ -258,8 +258,9 @@ build_cmd() {
       [ "$MODE" = review ] && CMD+=(--deny "Edit($wt/**)")
       CMD+=(-m "$model") ;;
     agy)
-      CMD=(timeout "${AGY_TIMEOUT:-120}" "$AGY_BIN" -p "$(cat "$prompt")" --output-format json
-        --print-timeout "${AGY_PRINT_TIMEOUT:-100s}" --model "$model")
+      # No inner timeout and no print timeout by default: WORKER_TIMEOUT is the only clock.
+      CMD=("$AGY_BIN" -p "$(cat "$prompt")" --output-format json --print-timeout "${AGY_PRINT_TIMEOUT:-0}")
+      [ -n "$model" ] && CMD+=(--model "$model")
       [ "${AGY_AUTO_APPROVE:-0}" = 1 ] && CMD+=(--dangerously-skip-permissions) ;;
     codex)
       CMD=("$CODEX_BIN" exec --ephemeral --sandbox "${CODEX_SANDBOX_MODE:-workspace-write}"
@@ -421,10 +422,10 @@ render_prompt() { # provider sha headref base report -> prompt file path
   printf '%s' "$out"
 }
 
-# attempt provider sha headref base -> sets VERDICT (ok clean fail setup limit lost) and DETAIL.
+# attempt provider sha headref base -> sets VERDICT (ok clean fail setup limit requeue lost) and DETAIL.
 # Runs in the calling shell: it sets JOB_WT and may record setup faults.
 attempt() {
-  local p="$1" sha="$2" headref="$3" base="$4" prompt report out err rc t0 elapsed cls v
+  local p="$1" sha="$2" headref="$3" base="$4" prompt report out err rc t0 elapsed cls v session
   VERDICT=""; DETAIL=""
   prepare_worktree "$sha" "$headref" || { VERDICT=setup; DETAIL="could not prepare a worktree at $sha"; return; }
   [ "$p" = cursor ] && write_cursor_permissions "$JOB_WT"
@@ -432,7 +433,7 @@ attempt() {
   prompt="$(render_prompt "$p" "$sha" "$headref" "$base" "$report")"
   out="$RUNS/out-$JOB_PR-f$JOB_FENCE-$p.json"; err="$RUNS/err-$JOB_PR-f$JOB_FENCE-$p.txt"
   build_cmd "$p" "$JOB_WT" "$prompt"
-  jlog "spawning $p (model $(model_for "$p")) in $JOB_WT at $sha"
+  jlog "spawning $p (model $(model_for "$p" | sed 's/^$/provider default/')) in $JOB_WT at $sha"
   t0="$(date +%s)"
   ( cd "$JOB_WT" && exec timeout -k 30 "$WORKER_TIMEOUT" "${CMD[@]}" <"$CMD_STDIN" >"$out" 2>"$err" ) &
   echo $! > "$JOB_PIDFILE"
@@ -442,7 +443,8 @@ attempt() {
   if ! still_held; then VERDICT=lost; DETAIL="$p ran ${elapsed}s but the lease moved on"; return; fi
   cls="$(python3 "$SCRIPTS/classify.py" --provider "$p" --exit "$rc" --stdout "$out" --stderr "$err")"
   v="$(verify "$JOB_PR" "$sha" "$headref")"
-  jlog "$p exited $rc after ${elapsed}s; provider says ${cls%%$'\t'*}; verification says ${v%%:*}"
+  session="${cls##*$'\t'}"; cls="${cls%$'\t'*}"
+  jlog "$p exited $rc after ${elapsed}s; provider says ${cls%%$'\t'*}; verification says ${v%%:*}${session:+; session $session}"
   case "$v" in
     ok|clean)
       # The verified outcome stands either way; the provider's own complaint is still recorded.
@@ -456,6 +458,7 @@ attempt() {
   case "$cls" in
     setup*) VERDICT=setup; DETAIL="${cls#*$'\t'}"; return ;;
     limit*) VERDICT=limit; DETAIL="${cls#*$'\t'}"; return ;;
+    timeout*) VERDICT=requeue; DETAIL="${cls#*$'\t'} after ${elapsed}s with no verified result"; return ;;
   esac
   if [ "${v%%:*}" = "fail-nomarker" ] && [ "$elapsed" -lt "$FAST_FAIL_SECS" ]; then
     VERDICT=limit; DETAIL="$p ended after ${elapsed}s (under ${FAST_FAIL_SECS}s) with no marker comment: ${cls#*$'\t'}"
@@ -493,6 +496,7 @@ run_job() { # pr headref sha base reclaim(0|1) providers...
       lost)     JOB_LOST=1; jlog "$DETAIL; touching nothing on Gitea"; end_job lost; return 0 ;;
       fail)     finish_job fail "$DETAIL"; return 0 ;;
       setup)    setup_fault "$p" "$DETAIL" ;;
+      requeue)  finish_job trigger "$DETAIL; back in the queue, not a needs-human"; return 0 ;;
       limit)
         local cd; cd="$(python3 "$SCRIPTS/cooldown.py" record --provider "$p" --reason "$DETAIL")"
         jlog "LIMIT [$p]: $DETAIL; cooling down $(( ${cd#*$'\t'} / 60 ))m"
