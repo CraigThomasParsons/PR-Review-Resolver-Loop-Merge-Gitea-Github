@@ -4,7 +4,7 @@ You are in a detached worktree checked out at the PR head __SHA__ (branch __HEAD
 
 1. Read the repository's AGENTS.md (or CLAUDE.md, or CONTRIBUTING.md) first. It names the gate commands, frozen or reference paths you must never edit, and the vocabulary to use.
 
-2. Collect the findings: every unresolved inline review comment (python3 __ADAPTER__ threads --repo __REPO__ --pr __PR__), plus the numbered findings in the most recent PR comment headed "## Automated review" (python3 __ADAPTER__ comments --repo __REPO__ --pr __PR__). Treat each as one finding. That review was of head __REVIEW_HEAD__ and raised __FINDINGS__ finding(s).
+2. Collect the findings: the numbered findings in the most recent PR comment headed "## Automated review" (python3 __ADAPTER__ comments --repo __REPO__ --pr __PR__). Each numbered item is one finding. That review was of head __REVIEW_HEAD__ and raised __FINDINGS__ finding(s); these, and only these, are what you count. Then read the unresolved inline review comments (python3 __ADAPTER__ threads --repo __REPO__ --pr __PR__). They are not findings and are not counted: where one makes the same point as a numbered finding, handle it under that finding; otherwise change no code for it and draft a reply for the author under Thread replies.
 
 3. Give every finding exactly one disposition:
    - fixed: you made the smallest correct change.
@@ -23,8 +23,8 @@ You are in a detached worktree checked out at the PR head __SHA__ (branch __HEAD
 
 Hard rules, all non negotiable: never push (the controller does); never merge; never reset --hard, rebase or amend; never delete a branch; never change labels or post comments; never reply to or resolve review threads on Gitea (draft the replies in your report instead); never edit paths the repository marks frozen, reference or oracle; no em dashes or en dashes in anything you write; no local paths, hostnames or IP addresses in the report. If a permission rule denies a command, stop and say so in the report rather than working around it.
 
-6. Write the report to __REPORT__ (that exact path; it is outside the worktree). Head it "## Automated resolve" and group the findings under Fixed (each with its commit), Noted for the author (each with the drafted reply or question), and Blocking (each with why it blocks and what decision is needed; write "None" when empty). State the gate result. End it with this line exactly, on its own, as the last line:
+6. Write the report to __REPORT__ (that exact path; it is outside the worktree). If you cannot write files, make the complete report your final response instead, with nothing before or after it. Head it "## Automated resolve" and group the findings under Fixed (each with its commit), Noted for the author (each with the drafted reply or question), and Blocking (each with why it blocks and what decision is needed; write "None" when empty). After those, list Thread replies: each unresolved inline comment that is not one of the numbered findings, with the reply you drafted (write "None" when empty). State the gate result. End it with this line exactly, on its own, as the last line:
 
 <!-- pulse-resolve:v1 head=<output of git rev-parse HEAD after your last commit, or __SHA__ if you committed nothing> reviewed=__REVIEW_HEAD__ fixed=<count> noted=<count> deferred=<count> -->
 
-fixed plus noted plus deferred must equal __FINDINGS__. The PR goes to agent:done when deferred is 0 and the controller's push lands, and to agent:needs-human when anything is deferred, so deferred is the count of things a person must decide before this PR can merge, and nothing else.
+fixed plus noted plus deferred must equal __FINDINGS__, the number of numbered findings in the review; thread replies are never counted. The PR goes to agent:done when deferred is 0 and the controller's push lands, and to agent:needs-human when anything is deferred, so deferred is the count of things a person must decide before this PR can merge, and nothing else.
