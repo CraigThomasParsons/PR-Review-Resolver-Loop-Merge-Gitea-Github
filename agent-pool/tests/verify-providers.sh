@@ -11,7 +11,16 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 POOL="$ROOT/agent-pool/bin/prod-common.sh"
 REAL_COMMON="$ROOT/skills/pr-loops-common"
 CLAIMREC="$ROOT/agent-pool/scripts/claim-record.py"
-TMP="$(mktemp -d)"; trap 'pkill -f "sleep 30[01]" 2>/dev/null; rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
+# Kill only the stub sleeps this run recorded, and only while each pid still is one.
+cleanup() {
+  local pid
+  while read -r pid; do
+    [[ "$(ps -o args= -p "$pid" 2>/dev/null)" == "sleep "* ]] && kill "$pid" 2>/dev/null
+  done < <(cat "$TMP/stub-pids" 2>/dev/null)
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 export HOME="$TMP/home"
 BIN="$HOME/.local/bin"
 mkdir -p "$BIN" "$TMP/common" "$TMP/calls" "$TMP/behave"
@@ -102,6 +111,7 @@ PY
 cp "$REAL_COMMON/marker.py" "$TMP/common/marker.py"
 export STUB_GITEA="$TMP/gitea.json" STUB_ADAPTER="$TMP/common/gitea-pr.py" STUB_REPO="$R" STUB_PR=7
 export STUB_CALLS="$TMP/calls" STUB_BEHAVE="$TMP/behave" STUB_CLAIMREC="$CLAIMREC" STUB_ORIGIN="$ORIGIN"
+export STUB_PIDS="$TMP/stub-pids"
 
 # ---------------------------------------------------------------- stub provider CLIs
 cat > "$BIN/stub-provider" <<'SH'
@@ -159,7 +169,7 @@ case "$behave" in
   clean)     review_text 0 > "$report"; success ;;
   final-only) success "$(review_text 2)" ;;
   silent)    success ;;
-  hang)      sleep 60; success ;;
+  hang)      sleep 60 & echo $! >> "$STUB_PIDS"; wait $!; success ;;
   resolve-noted)    resolve_text 0 1 0 > "$report"; success ;;
   resolve-deferred) resolve_text 0 0 1 > "$report"; success ;;
   resolve-fix)      commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
@@ -203,8 +213,8 @@ case "$behave" in
       -- python3 "$STUB_ADAPTER" label --repo "$STUB_REPO" --pr "$STUB_PR" --remove agent:ready --add agent:claimed \
       > "$STUB_CALLS/thief-attempt"
     sleep 301 >/dev/null 2>&1 &
-    echo $! > "$STUB_CALLS/grandchild.pid"
-    [ "$behave" = steal ] && sleep 300
+    echo $! > "$STUB_CALLS/grandchild.pid"; echo $! >> "$STUB_PIDS"
+    if [ "$behave" = steal ]; then sleep 300 & echo $! >> "$STUB_PIDS"; wait $!; fi
     success ;;
   limit)
     case "$name" in
@@ -657,6 +667,11 @@ expect "codex adapter shape" "$(calls codex | tr '\n' ' ')" "ARG exec ARG --ephe
 echo
 echo "prompts"
 expect "the generic resolve prompt names files to stage" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "git add path/to/first/file"
+expect "G5: the resolve prompt has the final-response fallback" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "If you cannot write files, make the complete report your final response instead"
+expect "L3: the resolve count covers only the review's numbered findings" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "thread replies are never counted"
+expect "L3: thread replies are listed separately" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "list Thread replies"
+expect_not "L3: inline threads are no longer counted as findings" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "Treat each as one finding"
+expect_not "no generic or agy prompt uses an em or en dash" "$(cat "$REAL_COMMON/prompts/"*.generic.txt "$REAL_COMMON/prompts/review.agy.txt")" "—"
 expect_not "the generic prompts use no Claude-only skill" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "mattpocock-skills"
 expect_not "no prompt tells a worker to post a comment" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "__ADAPTER__ comment "
 expect_not "no prompt tells a worker to push" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "git push origin"
