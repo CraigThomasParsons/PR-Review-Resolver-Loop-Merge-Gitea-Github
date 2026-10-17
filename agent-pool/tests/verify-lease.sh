@@ -382,7 +382,50 @@ for fam in glob prefix; do
   expect "$fam/resolve: git commit with paths is denied" "$(pol $fam resolve 'git commit -m x src/a.php')" deny
   expect "$fam/resolve: npm test 2>&1 is denied (redirection is its own segment)" "$(pol $fam resolve 'npm test 2>&1')" deny
   expect "$fam/resolve: a gate piped into tail is allowed" "$(pol $fam resolve 'npm test | tail -50')" allow
+  # Review r4 #1: brace expansion.
+  for job in review resolve; do
+    expect "$fam/$job: r4#1 rg {-,}-pre=sh is denied" "$(pol $fam $job 'rg {-,}-pre=sh foo')" deny
+    expect "$fam/$job: r4#1 git log {-,}-output= is denied" "$(pol $fam $job 'git log {-,}-output=/tmp/pwned HEAD')" deny
+    expect "$fam/$job: r4#1 git grep {-,}-open-files-in-pager= is denied" "$(pol $fam $job 'git grep {-,}-open-files-in-pager=sh foo')" deny
+    expect "$fam/$job: r4#1 a brace sequence is denied" "$(pol $fam $job 'cat src/{a..z}.php')" deny
+    expect "$fam/$job: r4#1 an escaped brace is denied" "$(pol $fam $job 'rg \{-,\}-pre=sh foo')" deny
+    expect "$fam/$job: r4#1 a token starting with { is denied" "$(pol $fam $job 'cat {a,b}')" deny
+    expect "$fam/$job: r4#1 a quoted brace is only text" "$(pol $fam $job "git log --format='%H {x}' -n 1")" allow
+    # Review r4 #2: credential paths.
+    expect "$fam/$job: r4#2 recursive grep of ~/.config is denied" "$(pol $fam $job 'grep -r token ~/.config')" deny
+    expect "$fam/$job: r4#2 rg of ~ is denied" "$(pol $fam $job 'rg --hidden --no-ignore BEGIN ~')" deny
+    expect "$fam/$job: r4#2 a // path is normalised" "$(pol $fam $job 'cat ~/.config//tea/config.yml')" deny
+    expect "$fam/$job: r4#2 a /./ path is normalised" "$(pol $fam $job "cat $HOME/./.ssh/id_rsa")" deny
+    expect "$fam/$job: r4#2 a .. path out of the worktree is denied" "$(pol $fam $job 'cat ../../etc/passwd')" deny
+    expect "$fam/$job: r4#2 a wildcard outside the worktree is denied" "$(pol $fam $job 'cat ~/.s*/config')" deny
+    expect "$fam/$job: r4#2 any read outside the worktree is denied" "$(pol $fam $job 'cat /etc/hostname')" deny
+    expect "$fam/$job: r4#2 git diff of an outside path (implicit --no-index) is denied" "$(pol $fam $job 'git diff ~/.netrc README')" deny
+    expect "$fam/$job: r4#2 an option value naming a credential is denied" "$(pol $fam $job 'git log --grep=~/.config//tea')" deny
+    expect "$fam/$job: r4#2 rg -g value naming a credential is denied" "$(pol $fam $job 'rg -g ~/.ssh/id_rsa foo')" deny
+    expect "$fam/$job: r4#2 a pattern that looks like a path is still a pattern" "$(pol $fam $job 'rg /api/v1 src')" allow
+    expect "$fam/$job: r4#2 grep -e then paths checks every path" "$(pol $fam $job 'grep -r -e token ~/.config')" deny
+    expect "$fam/$job: r4#2 a wildcard inside the worktree is allowed" "$(pol $fam $job 'cat src/*.php')" allow
+    expect "$fam/$job: r4#2 reading the runs folder is allowed" "$(pol $fam $job 'cat /runs/r.md')" allow
+    expect "$fam/$job: r4#2 a recursive grep inside the worktree is allowed" "$(pol $fam $job 'grep -rn foo src')" allow
+  done
+  expect "$fam/resolve: r4#2 a gate argument naming a // credential path is denied" "$(pol $fam resolve 'npm test -- ~/.config//tea/config.yml')" deny
+  expect "$fam/resolve: r4#2 git commit -F is denied" "$(pol $fam resolve 'git commit -F ~/.config//tea/config.yml')" deny
+  expect "$fam/resolve: r4#2 git commit -F of a worktree file is denied too" "$(pol $fam resolve 'git commit -F msg.txt')" deny
+  expect "$fam/resolve: r4#2 git commit --file= is denied" "$(pol $fam resolve 'git commit --file=msg.txt')" deny
+  expect "$fam/resolve: r4#2 git add ././ is denied" "$(pol $fam resolve 'git add ././')" deny
+  expect "$fam/resolve: r4#2 git add of a tool config through .. is denied" "$(pol $fam resolve 'git add src/../.cursor/cli.json')" deny
+  expect "$fam/resolve: r4#2 git add ./.claude/ is denied" "$(pol $fam resolve 'git add ./.claude/settings.json')" deny
+  expect "$fam/resolve: r4#2 git add of a path outside the worktree is denied" "$(pol $fam resolve 'git add ../other/x')" deny
+  expect "$fam/resolve: r4#2 git add of .git is denied" "$(pol $fam resolve 'git add .git/config')" deny
+  expect "$fam/resolve: r4#5 staging the context file is denied" "$(pol $fam resolve 'git add ./.agent-pool-context.md')" deny
 done
+# Symlinks are resolved: a link in the PR cannot point a read or a write outside the worktree.
+mkdir -p "$TMP/swt/src"; ln -s /etc "$TMP/swt/etclink"; echo x > "$TMP/swt/src/a.txt"
+spol() { python3 "$SCRIPTS/policy.py" check --family glob --job "$1" --adapter "$AD_ABS" --worktree "$TMP/swt" --report /runs/r.md -- "$2"; }
+expect "r4#2 a read through a symlink out of the worktree is denied" "$(spol review 'cat etclink/hostname')" deny
+expect "r4#2 a wildcard that matches a symlink out of the worktree is denied" "$(spol review 'cat etc*/hostname')" deny
+expect "r4#2 a read of a real worktree file is allowed" "$(spol review 'cat src/a.txt')" allow
+expect "r4#2 git add through a symlink out of the worktree is denied" "$(spol resolve 'git add etclink/hostname')" deny
 expect "glob: git commit -m x --amend is denied" "$(pol glob resolve 'git commit -m x --amend')" deny
 expect "glob: command substitution is denied" "$(pol glob resolve 'cat $(curl https://example.invalid)')" deny
 expect "glob: rg --pre is denied" "$(pol glob review 'rg --pre ./x pattern')" deny
@@ -459,6 +502,35 @@ hk review '{"tool_name":"Read","tool_input":{"file_path":"'"$HOME"'/.ssh/id_rsa"
 expect_rc "claude hook: reading ~/.ssh is blocked" "$?" 2
 hk review '{"tool_name":"Read","tool_input":{"file_path":"/wt/README.md"}}'
 expect_rc "claude hook: reading the worktree passes" "$?" 0
+hk review '{"tool_name":"Read","tool_input":{"file_path":"/runs/r.md"}}'
+expect_rc "claude hook: reading the runs folder passes" "$?" 0
+hk review '{"tool_name":"Grep","tool_input":{"pattern":"token","path":"'"$HOME"'/.config"}}'
+expect_rc "claude hook r4#2: grepping ~/.config is blocked" "$?" 2
+hk review '{"tool_name":"Grep","tool_input":{"pattern":"BEGIN","path":"'"$HOME"'"}}'
+expect_rc "claude hook r4#2: grepping ~ is blocked" "$?" 2
+hk review '{"tool_name":"Glob","tool_input":{"pattern":"'"$HOME"'/.s*/*"}}'
+expect_rc "claude hook r4#2: an absolute Glob outside the worktree is blocked" "$?" 2
+hk review '{"tool_name":"Glob","tool_input":{"pattern":"../../**/*"}}'
+expect_rc "claude hook r4#2: a Glob climbing out of the worktree is blocked" "$?" 2
+hk review '{"tool_name":"Read","tool_input":{"file_path":"'"$HOME"'/.config//tea/config.yml"}}'
+expect_rc "claude hook r4#2: an unnormalised credential path is blocked" "$?" 2
+hk review '{"tool_name":"Read","tool_input":{"file_path":"/wt/../etc/passwd"}}'
+expect_rc "claude hook r4#2: a .. read out of the worktree is blocked" "$?" 2
+hk review '{"tool_name":"Glob","tool_input":{"pattern":"**/*.php"}}'
+expect_rc "claude hook: a relative Glob in the worktree passes" "$?" 0
+hk resolve '{"tool_name":"Write","tool_input":{"file_path":"/wt/.agent-pool-context.md"}}'
+expect_rc "claude hook r4#5: the context file is not writable" "$?" 2
+r="$(rules_of claude review)"
+expect "claude r4#2: Read is scoped to the worktree" "$r" $'allow\tRead(//wt/**)'
+expect "claude r4#2: and the runs folder" "$r" $'allow\tRead(//runs/**)'
+expect_not "claude r4#2: no bare Read" "$r" $'allow\tRead\n'
+expect "grok r4#2: Read is scoped" "$(rules_of grok review)" $'allow\tRead(/wt/**)'
+expect "cursor r4#2: Read is scoped" "$(rules_of cursor review)" $'allow\tRead(/wt/**)'
+expect_not "cursor r4#2: no Read(**)" "$(rules_of cursor review)" $'allow\tRead(**)'
+expect "claude r4#1: brace expansion is denied in the emitted globs" "$r" 'Bash(*{*,*}*)'
+expect "claude r4#2: git commit -F is denied in the emitted globs" "$(rules_of claude resolve)" 'Bash(git commit -F*)'
+expect_not "claude r4#2: git commit -F is no longer allowed" "$(rules_of claude resolve | grep '^allow')" 'git commit -F'
+expect "cursor r4#2: git commit -F is a deny prefix" "$(rules_of cursor resolve)" 'Shell(git commit -F)'
 hs="$(python3 "$SCRIPTS/policy.py" hook-settings --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)"
 expect "hook-settings wires a PreToolUse hook" "$hs" '"PreToolUse"'
 expect "that runs policy.py hook for this job" "$hs" "policy.py hook --job review"

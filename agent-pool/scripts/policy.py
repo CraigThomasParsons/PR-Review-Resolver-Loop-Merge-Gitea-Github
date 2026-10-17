@@ -5,21 +5,26 @@ Workers never publish. They read, edit and commit locally (resolve), or only rea
 and write a report file. The controller does every push and comment through the claim guard,
 so the policy denies all of `git push` and every gitea-pr.py write to every worker.
 
-The policy is deny-by-default at the ARGUMENT level (`check`). A command line is tokenized
-like a shell would (quotes respected); `&&`, `||`, `;`, `|` and newlines separate commands;
-any redirection (`>`, `>>`, `<`, `2>`, `&>`, `>&` ...), background `&`, subshell `(`, `$` or
-backtick is its own denied segment. Every remaining command must be one of:
+The policy is deny-by-default at the ARGUMENT level (`check`). An unquoted `{` or `}` anywhere
+denies the whole command before anything else is read: bash brace expansion would otherwise
+turn `rg {-,}-pre=sh` into `rg --pre=sh`. A command line is then tokenized like a shell would
+(quotes respected); `&&`, `||`, `;`, `|` and newlines separate commands; any redirection (`>`,
+`>>`, `<`, `2>`, `&>`, `>&` ...), background `&`, subshell `(`, `$` or backtick is its own
+denied segment. Every remaining command must be one of:
 
   git diff|log|show|status|rev-parse|ls-files|grep|blame  with vetted options only (no
         difftool, no --output, no --ext-diff/--textconv, no global options such as -C/-c)
   cat ls head tail wc grep rg                              with vetted options only
   python3 <adapter> head|comments|threads --repo R --pr N  the adapter's reads, absolute path
-  git add <named paths> / git commit -m|-F                 resolve only; no -A/-u/-f/., no
-        tool configuration paths, no --amend/-a
+  git add <named paths> / git commit -m                    resolve only; no -A/-u/-f/., no
+        tool configuration paths, no --amend/-a, no -F (a file would become the message)
   the named gate commands                                  resolve only (their arguments are
-        not vetted; see the plan doc's D1)
+        not vetted; the controller will run gates itself from a pinned list, see D1)
 
-and no argument may name a credential path (~/.ssh, ~/.config/tea, ~/.config/pulse, ~/.netrc,
+Paths are normalised (~ expanded, //, /./ and .. collapsed, symlinks resolved) before they are
+checked. Every path a reader or git is given must stay inside the worktree or the runs folder;
+a wildcard is expanded and every match must stay inside the worktree. Option values and gate
+arguments may not name a credential path (~/.ssh, ~/.config/tea, ~/.config/pulse, ~/.netrc,
 ~/.git-credentials, /proc ...).
 
 The emitted rules follow the same policy as far as each CLI's syntax allows:
@@ -44,6 +49,7 @@ Usage:
 """
 import argparse
 import fnmatch
+import glob
 import json
 import os
 import re
@@ -52,7 +58,8 @@ import sys
 
 OPERATOR_CHARS = "();<>|&\n"
 SEPARATORS = {"&&", "||", "|", ";", "\n"}
-TOOL_CONFIG = (".cursor/", ".grok/", ".claude/")
+TOOL_CONFIG = (".cursor/", ".grok/", ".claude/", ".agent-pool-context.md")
+WILDCARDS = re.compile(r"[*?\[]")
 SENSITIVE = ("/.ssh", ".ssh/", ".config/tea", ".config/pulse", ".netrc", ".git-credentials",
              ".config/gh", ".gnupg", ".aws/", ".claude/.credentials", ".codex/auth", "/proc/",
              "/etc/shadow", "gitea_token", "id_rsa", "id_ed25519")
@@ -126,9 +133,34 @@ GATES = [["npm", "run"], ["npm", "test"], ["dotnet", "build"], ["dotnet", "test"
 ADAPTER_READS = ("head", "comments", "threads")
 
 
+def unquoted_brace(command):
+    """True if `{` or `}` appears outside quotes, escaped or not: bash could expand it."""
+    quote, i = None, 0
+    while i < len(command):
+        c = command[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                quote = None
+        elif c == "\\":
+            if command[i + 1:i + 2] in ("{", "}"):
+                return True
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c in "{}":
+            return True
+        i += 1
+    return False
+
+
 def tokenize(command):
     """Return a list of segments (token lists), or None if any denied construct appears."""
-    if "`" in command or "$" in command:
+    if unquoted_brace(command) or "`" in command or "$" in command:
         return None
     lex = shlex.shlex(command, posix=True, punctuation_chars=OPERATOR_CHARS)
     lex.whitespace = " \t\r"
@@ -148,46 +180,96 @@ def tokenize(command):
     return [s for s in segments if s]
 
 
-def sensitive(arg):
-    path = os.path.expanduser(arg) if arg.startswith("~") else arg
-    return any(frag in path for frag in SENSITIVE)
+def resolved(arg, a):
+    """The absolute, normalised path a shell running in the worktree would open for `arg`."""
+    p = os.path.expanduser(arg) if arg.startswith("~") else arg
+    return os.path.normpath(os.path.join(a.worktree or os.getcwd(), p))
 
 
-def options_ok(args, spec, positional_ok):
-    """Vet options against a spec; positionals go through positional_ok. After `--`, all are positional."""
-    i, rest = 0, False
+def sensitive(arg, a):
+    p = resolved(arg, a) + "/"
+    return any(frag in p for frag in SENSITIVE) or any(frag in arg for frag in SENSITIVE)
+
+
+def roots(a, wildcard=False):
+    out = [os.path.realpath(a.worktree or os.getcwd())]
+    if a.report and not wildcard:
+        out.append(os.path.realpath(os.path.dirname(a.report)))
+    return out
+
+
+def within(path, bases):
+    return any(path == b or path.startswith(b.rstrip("/") + "/") for b in bases)
+
+
+def contained(arg, a):
+    """A path argument stays inside the worktree or the runs folder, after ~, .., // and symlinks.
+    A wildcard must have a static part inside the worktree, and every match must stay there."""
+    if sensitive(arg, a):
+        return False
+    p = resolved(arg, a)
+    if not WILDCARDS.search(p):
+        return within(os.path.realpath(p), roots(a))
+    static = []
+    for part in p.split("/"):
+        if WILDCARDS.search(part):
+            break
+        static.append(part)
+    bases = roots(a, wildcard=True)
+    if not within(os.path.realpath("/".join(static) or "/"), bases):
+        return False
+    return all(within(os.path.realpath(m), bases) and not sensitive(m, a) for m in glob.glob(p))
+
+
+def options_ok(args, spec, positional_ok, value_ok):
+    """Vet options against a spec. Positionals go through positional_ok(token, index) and option
+    values through value_ok. After `--`, all are positional."""
+    i, rest, n = 0, False, 0
     while i < len(args):
         tok = args[i]
         if rest or not tok.startswith("-") or tok == "-":
-            if not positional_ok(tok):
+            if not positional_ok(tok, n):
                 return False
+            n += 1
         elif tok == "--":
             rest = True
         elif tok in spec["flags"]:
             pass
         elif tok in spec["valued"]:
             i += 1
-            if i >= len(args):
+            if i >= len(args) or not value_ok(args[i]):
                 return False
         elif "=" in tok and tok.split("=", 1)[0] in spec["eq"]:
-            pass
+            if not value_ok(tok.split("=", 1)[1]):
+                return False
         elif any(re.fullmatch(rx, tok) for rx in spec["attached"]):
-            pass
+            if not value_ok(tok):
+                return False
         else:
             return False
         i += 1
     return True
 
 
-def read_positional(tok):
-    return not sensitive(tok)
+def reader_check(args, spec, a, pattern_first):
+    """Readers: every path positional stays contained. For grep-style tools the first positional
+    is the search pattern, not a path, unless the pattern came from -e (or rg --files)."""
+    explicit = any(t in ("-e", "--regexp", "--files") or t.startswith("--regexp=") for t in args)
+    skip = 0 if (explicit or not pattern_first) else 1
+    return options_ok(args, spec, lambda t, n: n < skip or contained(t, a), lambda v: not sensitive(v, a))
 
 
-def add_positional(tok):
-    norm = tok[2:] if tok.startswith("./") else tok
-    if norm in (".", "", "*") or norm.startswith(":") or sensitive(tok):
+def add_positional(tok, a):
+    if tok.startswith(":") or sensitive(tok, a):
         return False
-    return not any(norm.startswith(t) or norm + "/" == t for t in TOOL_CONFIG)
+    wt = os.path.realpath(a.worktree or os.getcwd())
+    p = os.path.realpath(resolved(tok, a))
+    if not p.startswith(wt + "/"):
+        return False
+    rel = os.path.relpath(p, wt)
+    if rel in (".", "*") or WILDCARDS.fullmatch(rel) or rel.split("/")[0] == ".git":
+        return False
+    return not any((rel + "/").startswith(t) for t in TOOL_CONFIG)
 
 
 def segment_ok(seg, a):
@@ -197,18 +279,17 @@ def segment_ok(seg, a):
             return False
         sub, args = seg[1], seg[2:]
         if sub in GIT_SPECS:
-            return options_ok(args, GIT_SPECS[sub], read_positional)
+            return reader_check(args, GIT_SPECS[sub], a, pattern_first=(sub == "grep"))
         if a.job == "resolve" and sub == "add":
-            return bool(args) and options_ok(args, dict(flags=set(), eq=set(), valued=set(), attached=[]),
-                                             add_positional)
+            none = dict(flags=set(), eq=set(), valued=set(), attached=[])
+            return bool(args) and options_ok(args, none, lambda t, n: add_positional(t, a), lambda v: False)
         if a.job == "resolve" and sub == "commit":
-            spec = dict(flags={"-q", "--quiet", "-s", "--signoff"}, eq={"--message", "--file"},
-                        valued={"-m", "-F"}, attached=[])
-            has_message = any(t in ("-m", "-F") or t.startswith(("--message=", "--file=")) for t in args)
-            return has_message and options_ok(args, spec, lambda t: False)
+            spec = dict(flags={"-q", "--quiet", "-s", "--signoff"}, eq={"--message"}, valued={"-m"}, attached=[])
+            has_message = any(t == "-m" or t.startswith("--message=") for t in args)
+            return has_message and options_ok(args, spec, lambda t, n: False, lambda v: not sensitive(v, a))
         return False
     if head in TOOL_SPECS:
-        return options_ok(seg[1:], TOOL_SPECS[head], read_positional)
+        return reader_check(seg[1:], TOOL_SPECS[head], a, pattern_first=head in ("grep", "rg"))
     if head == "python3":
         if len(seg) < 3 or seg[1] != a.adapter or seg[2] not in ADAPTER_READS:
             return False
@@ -223,7 +304,7 @@ def segment_ok(seg, a):
     if a.job == "resolve":
         for gate in GATES:
             if seg[:len(gate)] == gate and (len(seg) > len(gate) or gate != ["npm", "run"]):
-                return not any(sensitive(t) for t in seg)
+                return not any(sensitive(t, a) for t in seg)
     return False
 
 
@@ -243,10 +324,12 @@ GATE_SHELL = ["npm run *", "npm test", "npm test *", "dotnet build", "dotnet bui
               "composer lint *", "php artisan test", "php artisan test *", "vendor/bin/pint", "vendor/bin/pint *",
               "vendor/bin/phpunit", "vendor/bin/phpunit *", "./vendor/bin/pint", "./vendor/bin/pint *",
               "./vendor/bin/phpunit", "./vendor/bin/phpunit *"]
-COMMIT_SHELL = ["git add *", "git commit -m *", "git commit -F *"]
+COMMIT_SHELL = ["git add *", "git commit -m *"]
 DENY_SHELL = [
     "git push*", "*git push*", "git push --force*", "git reset --hard*", "git merge*", "git rebase*",
     "git difftool*", "*--output*", "*>*", "*<*", "*--ext-diff*", "*--textconv*", "* -x *",
+    "*{*,*}*", "*{*..*}*", "git commit -F*", "git commit * -F*", "git commit *--file*",
+    "git add *.agent-pool-context.md*",
     "git branch -D*", "git config*", "git -C*", "git -c*", "git --*", "git remote*", "git update-ref*",
     "git add -A*", "git add --all*", "git add -u*", "git add .", "git add . *", "git add :/*",
     "git add -f*", "git add --force*", "git add * -f*", "git add * --force*",
@@ -266,7 +349,8 @@ CURSOR_DENY = ["git push", "git push --force", "git reset --hard", "git merge", 
                "git diff --ext-diff", "git log --ext-diff", "git show --ext-diff",
                "git config", "git -C", "git -c", "git remote", "git update-ref", "git add -A", "git add --all",
                "git add -u", "git add .", "git add -f", "git add --force", "git add .cursor", "git add .grok",
-               "git add .claude", "git commit -a", "git commit --all", "git commit --amend",
+               "git add .claude", "git add .agent-pool-context.md", "git commit -a", "git commit --all",
+               "git commit --amend", "git commit -F", "git commit --file",
                "tea", "gh", "curl", "wget", "sudo", "rm -rf", "rm -fr", "systemctl", "crontab",
                "python3 -c", "python3 -", "node", "npx", "bash", "sh", "env", "eval",
                "rg --pre", "rg -z", "rg --search-zip", "git grep -O", "git grep --open-files-in-pager",
@@ -299,13 +383,17 @@ def git_paths(a):
     return [f"{wt}/.git", f"{wt}/.git/**", "**/.git/**"]
 
 
+def read_roots(a):
+    return [x for x in (a.worktree.rstrip("/"), os.path.dirname(a.report).rstrip("/")) if x]
+
+
 def rules(a):
     allow, deny = shell_rules(a)
     wt = a.worktree.rstrip("/")
     if a.provider == "claude":
         # Claude rule paths: //abs is an absolute path.
         ab = lambda p: "/" + p if p.startswith("/") else p
-        tools = ["Read", "Grep", "Glob", f"Write({ab(a.report)})"]
+        tools = [f"Read({ab(r)}/**)" for r in read_roots(a)] + ["Grep", "Glob", f"Write({ab(a.report)})"]
         if a.job == "resolve":
             tools += [f"Edit({ab(wt)}/**)", f"Write({ab(wt)}/**)"]
         denies = [f"Bash({r})" for r in deny]
@@ -313,7 +401,7 @@ def rules(a):
         denies += [f"Read({ab(p)})" for p in credential_globs()]
         return tools + [f"Bash({r})" for r in allow], denies
     if a.provider == "grok":
-        tools = ["Read", "Grep", f"Write({a.report})"]
+        tools = [f"Read({r}/**)" for r in read_roots(a)] + ["Grep", f"Write({a.report})"]
         if a.job == "resolve":
             tools += [f"Edit({wt}/**)", f"Write({wt}/**)"]
         denies = [f"Bash({r})" for r in deny]
@@ -322,7 +410,7 @@ def rules(a):
         return tools + [f"Bash({r})" for r in allow], denies
     if a.provider == "cursor":
         prefixes = [r[:-2] if r.endswith(" *") else r.rstrip("*").rstrip() for r in allow]
-        allow_rules = ["Read(**)", f"Write({a.report})"] + ([f"Write({wt}/**)"] if a.job == "resolve" else [])
+        allow_rules = [f"Read({r}/**)" for r in read_roots(a)] + [f"Write({a.report})"] + ([f"Write({wt}/**)"] if a.job == "resolve" else [])
         deny_rules = CURSOR_DENY + (CURSOR_REVIEW_DENY if a.job == "review" else [])
         deny_rules += [f"python3 {a.adapter} {sub}" for sub in ("comment", "label", "merge")]
         denies = [f"Shell({p})" for p in deny_rules]
@@ -357,12 +445,12 @@ def check(a, command):
 
 # ---------------------------------------------------------------- claude hook
 def write_allowed(path, a):
-    p = os.path.normpath(os.path.join(a.worktree or "/", os.path.expanduser(path)))
-    if p == os.path.normpath(a.report):
+    p = os.path.realpath(os.path.join(a.worktree or "/", os.path.expanduser(path)))
+    if p == os.path.realpath(a.report):
         return True
     if a.job != "resolve" or not a.worktree:
         return False
-    wt = os.path.normpath(a.worktree)
+    wt = os.path.realpath(a.worktree)
     if not p.startswith(wt + os.sep):
         return False
     rel = os.path.relpath(p, wt)
@@ -385,9 +473,13 @@ def hook(a):
         return 0
     paths = [str(data[k]) for k in ("file_path", "path", "notebook_path") if data.get(k)]
     if tool in ("Read", "Grep", "Glob", "LS", "NotebookRead"):
-        bad = [p for p in paths if sensitive(p)]
+        reads = list(paths)
+        if tool == "Glob" and data.get("pattern"):
+            reads.append(os.path.join(paths[0] if paths else (a.worktree or "."), str(data["pattern"])))
+        bad = [p for p in reads if not contained(p, a)]
+        bad += [str(data["glob"])] if data.get("glob") and sensitive(str(data["glob"]), a) else []
         if bad:
-            print(f"policy: credential path denied: {bad[0]}", file=sys.stderr)
+            print(f"policy: read outside the worktree and runs folder denied: {bad[0]}", file=sys.stderr)
             return 2
         return 0
     if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
