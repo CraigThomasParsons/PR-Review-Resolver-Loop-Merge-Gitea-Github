@@ -119,6 +119,7 @@ DONE="${AGENT_POOL_LABEL_DONE:-agent:done}"
 HUMAN="${AGENT_POOL_LABEL_NEEDS_HUMAN:-agent:needs-human}"
 PROTECTED="${AGENT_POOL_PROTECTED_BRANCHES:-develop,main,master,release}"
 NOPUSH_URL="/nonexistent/agent-pool-workers-never-push"
+CONTEXT_FILE=".agent-pool-context.md"
 
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 CURSOR_AGENT_BIN="${CURSOR_AGENT_BIN:-$HOME/.local/bin/cursor-agent}"
@@ -149,8 +150,10 @@ bin_for() { # provider
   esac
 }
 prompt_for() { # provider job
-  local var="AGENT_POOL_PROMPT_${1^^}_${2^^}"
-  printf '%s' "${!var:-$PROMPTS/$2.generic.txt}"
+  local var="AGENT_POOL_PROMPT_${1^^}_${2^^}" def="$PROMPTS/$2.generic.txt"
+  # agy reviews in plan mode, where every command is denied.
+  [ "$1/$2" = agy/review ] && def="$PROMPTS/review.agy.txt"
+  printf '%s' "${!var:-$def}"
 }
 
 setup_fault() { # provider reason
@@ -213,7 +216,7 @@ exclude_tool_config() { # wt
   local wt="$1" ex entry
   ex="$(git -C "$wt" rev-parse --path-format=absolute --git-path info/exclude 2>/dev/null)" || return 1
   mkdir -p "$(dirname "$ex")"; touch "$ex"
-  for entry in "/.cursor/cli.json" "/.grok/"; do
+  for entry in "/.cursor/cli.json" "/.grok/" "/$CONTEXT_FILE"; do
     grep -qxF "$entry" "$ex" || printf '%s\n' "$entry" >> "$ex"
   done
   if git -C "$wt" ls-files --error-unmatch .cursor/cli.json >/dev/null 2>&1; then
@@ -537,11 +540,27 @@ prepare_worktree() { # sha headref -> JOB_WT
   exclude_tool_config "$JOB_WT"
 }
 
+# write_context sha base -> $JOB_WT/$CONTEXT_FILE: what a worker that cannot run commands (agy in
+# plan mode) needs. A file, not an argument: one argument over 128 KiB fails exec with E2BIG.
+write_context() {
+  local f="$JOB_WT/$CONTEXT_FILE"
+  {
+    printf '# Context for PR #%s at %s (base %s), gathered by the pool controller\n\n' "$JOB_PR" "$1" "$2"
+    printf '## Commits (git log origin/%s..%s)\n\n```\n' "$2" "$1"
+    git -C "$MAIN" log --format='%h %s' "origin/$2..$1" 2>/dev/null
+    printf '```\n\n## Diff (git diff origin/%s...%s)\n\n```diff\n' "$2" "$1"
+    git -C "$MAIN" diff "origin/$2...$1" 2>/dev/null
+    printf '```\n\n## PR comments (JSON)\n\n```json\n'
+    python3 "$ADAPTER" comments --repo "$REPO" --pr "$JOB_PR" 2>/dev/null || echo '[] (could not read the comments)'
+    printf '```\n'
+  } > "$f"
+}
+
 render_prompt() { # provider sha headref base report -> prompt file path
   local out="$RUNS/prompt-$JOB_PR-${ATTEMPT:0:8}-$1.txt"
   python3 "$SCRIPTS/render-prompt.py" "$(prompt_for "$1" "$JOB_KIND")" "$out" "PR=$JOB_PR" "HEADREF=$3" \
     "SHA=$2" "BASE=$4" "REPO=$REPO" "ADAPTER=$ADAPTER" "COMMON=$COMMON" "REPORT=$5" \
-    "SENTINEL=POOL_RUN_DONE" "REVIEW_HEAD=$REVIEW_HEAD" "FINDINGS=$FINDINGS"
+    "SENTINEL=POOL_RUN_DONE" "REVIEW_HEAD=$REVIEW_HEAD" "FINDINGS=$FINDINGS" "CONTEXT=$JOB_WT/$CONTEXT_FILE"
   printf '%s' "$out"
 }
 
@@ -554,6 +573,7 @@ attempt() {
   tag="$JOB_PR-${ATTEMPT:0:8}-$p"
   report="$RUNS/report-$tag.md"; result="$RUNS/result-$tag.txt"; rm -f "$report" "$result"
   out="$RUNS/out-$tag.json"; err="$RUNS/err-$tag.txt"
+  write_context "$sha" "$base"
   prompt="$(render_prompt "$p" "$sha" "$headref" "$base" "$report")"
   if [ "$p" = cursor ]; then
     mkdir -p "$JOB_WT/.cursor"

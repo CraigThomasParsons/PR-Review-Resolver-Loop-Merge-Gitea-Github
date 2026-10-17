@@ -125,6 +125,7 @@ claim_provider="$(python3 "$STUB_CLAIMREC" show --repo "$STUB_REPO" --pr "$STUB_
   echo "CLAIM_PROVIDER=$claim_provider"
   echo "REPORT=$report"
   [ -f "$PWD/.cursor/cli.json" ] && echo "CURSOR_CLI_JSON=present"
+  [ -f "$PWD/.agent-pool-context.md" ] && echo "CONTEXT_DIFF_LINES=$(grep -c '^+change' "$PWD/.agent-pool-context.md")"
 } >> "$STUB_CALLS/$name.log"
 behave="$(cat "$STUB_BEHAVE/$name" 2>/dev/null || echo ok)"
 here() { git rev-parse HEAD; }
@@ -531,6 +532,20 @@ expect_not "agy without a model is not a setup fault" "$(cat "$TMP/out.txt")" "S
 expect_not "and is given no --model" "$(calls agy)" "ARG --model"
 expect "the controller posts agy's plan-mode response as the review" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
 expect "agy's conversation_id is logged" "$(cat "$TMP/out.txt")" "session conv-agy-1"
+agy_prompt="$(cat "$TMP/state/runs/prompt-7-"*-agy.txt)"
+expect "G3: agy reviews with the no-commands prompt" "$agy_prompt" "you cannot run commands"
+expect_not "G3: which never asks for git diff" "$agy_prompt" "git diff"
+expect_not "G3: nor for an adapter command" "$agy_prompt" "gitea-pr.py"
+expect "G3: it points at the controller's context file in the worktree" "$agy_prompt" "$TMP/wt/pool-7-"
+expect "G3: the controller wrote the diff into the context file before agy ran" "$(calls agy)" "CONTEXT_DIFF_LINES=1"
+expect "G3: the context file never reaches a commit" "$(cat "$TMP/main/.git/info/exclude")" "/.agent-pool-context.md"
+expect "G3: and the main clone stays clean" "$([ -z "$(git -C "$TMP/main" status --porcelain)" ] && echo clean || echo dirty)" "clean"
+expect_not "G3: the diff stays off agy's command line" "$(calls agy | grep '^ARG')" "diff --git"
+reset '["agent:ready"]'
+behave agy final-only
+printf 'custom agy review __SHA__ <!-- pulse-review:v1 head=__SHA__ findings=0 -->\n' > "$TMP/agy-custom.txt"
+AGENT_POOL_PROMPT_AGY_REVIEW="$TMP/agy-custom.txt" PROVIDER_ORDER=agy tick
+expect "G3: AGENT_POOL_PROMPT_AGY_REVIEW overrides the agy review prompt" "$(cat "$TMP/state/runs/prompt-7-"*-agy.txt)" "custom agy review $SHA"
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave agy resolve-noted
 PROVIDER_ORDER=agy tick
