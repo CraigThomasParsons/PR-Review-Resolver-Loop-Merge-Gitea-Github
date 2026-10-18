@@ -50,8 +50,11 @@ if ! flock -n 9; then log "previous merge tick still running; exiting"; exit 0; 
 
 if ! LISTING="$(python3 "$ADAPTER" list --repo "$REPO" --state open | python3 -c '
 import json, re, sys
+# agent:claimed/agent:needs-human block the same way review:in-progress/needs-human do --
+# agent-pool-core still owns this PR or has already flagged it for a human.
 blocked = {"review:needs-human", "review:in-progress", "review:resolving",
-           "review:findings", "review:requested", "review:merging"}
+           "review:findings", "review:requested", "review:merging",
+           "agent:claimed", "agent:needs-human"}
 skip = re.compile(r"docblock-backfill|^chore\(#152\)")
 for pr in json.load(sys.stdin):
     labels = set(pr["labels"])
@@ -59,8 +62,13 @@ for pr in json.load(sys.stdin):
     if labels & blocked: continue
     if pr["draft"] or pr["is_bot"]: continue
     if skip.search(pr["title"]) or skip.search(pr["head_ref"]): continue
-    path = "resolved" if "review:resolved" in labels else "clean" if "review:clean" in labels else ""
-    if not path: continue
+    # review:resolved/review:clean come from pr-loop.sh; agent:done comes from
+    # agent-pool-core. Either producer is accepted. "agent" defers the clean-vs-resolved
+    # call to the marker itself (read in bash below), since agent:done carries no such split.
+    if "review:resolved" in labels: path = "resolved"
+    elif "review:clean" in labels: path = "clean"
+    elif "agent:done" in labels: path = "agent"
+    else: continue
     print("\t".join([str(pr["number"]), pr["head_sha"], pr["base_ref"], path]))
 ')"; then
   die "gitea pr list failed; not treating that as an empty queue"
@@ -83,7 +91,7 @@ comment() { # pr body
 }
 fail_pr() { # pr reason; called only after a real claim
   local pr="$1" reason="$2"
-  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved" "review:needs-human"; then
+  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,agent:ready,agent:claimed,agent:done" "review:needs-human"; then
     log "#$pr FAILED: $reason; additionally failed to move claim to review:needs-human"
   else
     comment "$pr" "Automated merge stopped: $reason" || log "warning: failed to comment on #$pr"
@@ -103,7 +111,25 @@ trap cleanup_claim EXIT HUP INT TERM
 
 for row in "${CANDIDATES[@]}"; do
   IFS=$'\t' read -r pr sha base path <<<"$row"
-  if [ "$path" = "resolved" ]; then
+  if [ "$path" = "agent" ]; then
+    # agent:done alone doesn't say clean or resolved -- ask the marker directly. A resolve
+    # marker at this head with nothing deferred wins; otherwise fall back to a clean review
+    # marker at this head. Neither matching means not yet eligible, same as a label mismatch.
+    resolve_marker="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
+    read -r r_head _r_reviewed _r_fixed r_deferred _r_noted <<<"$resolve_marker"
+    if [ -n "$resolve_marker" ] && [ "$r_head" = "$sha" ] && [ "${r_deferred:-1}" = "0" ]; then
+      path="resolved"; marker="$resolve_marker"
+    else
+      latest_marker="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
+      read -r l_head l_findings <<<"$latest_marker"
+      if [ -n "$latest_marker" ] && [ "$l_head" = "$sha" ] && [ "${l_findings:-1}" = "0" ]; then
+        path="clean"; marker="$latest_marker"
+      else
+        log "#$pr not yet eligible: agent:done present but no clean/resolved marker at head $sha"
+        continue
+      fi
+    fi
+  elif [ "$path" = "resolved" ]; then
     marker="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
   else
     marker="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
@@ -120,7 +146,7 @@ for row in "${CANDIDATES[@]}"; do
     continue
   fi
 
-  if ! labels "$pr" "review:automerge,review:clean,review:resolved" "review:merging"; then
+  if ! labels "$pr" "review:automerge,review:clean,review:resolved,agent:ready,agent:done" "review:merging"; then
     log "#$pr claim failed; leaving labels unchanged where possible"
     continue
   fi
@@ -140,7 +166,7 @@ for row in "${CANDIDATES[@]}"; do
     fail_pr "$pr" "$merge_out"
     continue
   fi
-  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,review:requested,review:findings,review:in-progress,review:resolving,review:needs-human" "review:merged"; then
+  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,review:requested,review:findings,review:in-progress,review:resolving,review:needs-human,agent:ready,agent:claimed,agent:done" "review:merged"; then
     log "#$pr merged but terminal relabel failed; manual label repair required"
     continue
   fi

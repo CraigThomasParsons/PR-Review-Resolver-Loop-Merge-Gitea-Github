@@ -43,6 +43,14 @@ LABELS = {
     "review:merging":     ("ff7f0e", "The mechanical merge tick has claimed this PR"),
     "review:merged":      ("2ca02c", "The mechanical merge tick merged this PR"),
     "review:needs-human": ("b10026", "Automation stopped and a person must look"),
+    # agent-pool-core's own vocabulary (agent-pool/bin/prod-common.sh). Narrower than the
+    # review:* set above -- derive_job() decides review vs. resolve vs. settled from markers,
+    # not a separate label per stage. pr-merge.sh accepts agent:done the same way it accepts
+    # review:clean/review:resolved.
+    "agent:ready":        ("1f77b4", "Queued for the agent pool to claim"),
+    "agent:claimed":      ("ff7f0e", "An agent-pool worker is running against this PR"),
+    "agent:done":         ("2ca02c", "The agent pool finished; marker on the head names the result"),
+    "agent:needs-human":  ("b10026", "The agent pool stopped and a person must look"),
 }
 
 

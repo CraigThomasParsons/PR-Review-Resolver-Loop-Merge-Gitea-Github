@@ -30,6 +30,18 @@ print("$1 0")
 PY
 }
 
+write_marker_split() { # resolve-line latest-line (each may be empty for "no marker")
+  cat > "$TMP/marker.py" <<PY
+import sys
+if sys.argv[1] == "resolve":
+    line = "$1"
+else:
+    line = "$2"
+if line:
+    print(line)
+PY
+}
+
 run_tick() {
   DRY_RUN="${DRY_RUN_CASE:-0}" PR_LOOP_STATE="$TMP/state" \
     PR_MERGE_ADAPTER="$TMP/adapter.py" PR_MERGE_MARKER="$TMP/marker.py" \
@@ -63,6 +75,30 @@ check "mergeable false fails closed" "FAILED: not mergeable"
 write_adapter '["review:clean", "review:automerge"]' true
 DRY_RUN_CASE=1 check "dry run prints would-merge without mutation" "would claim and merge head"
 unset DRY_RUN_CASE
+
+echo "agent-pool-core interop"
+write_marker_split "" "$SHA 0"
+write_adapter '["agent:done", "review:automerge"]' true
+check "agent:done + clean marker merges" "merged head"
+
+write_marker_split "$SHA $SHA 1 0 0" ""
+write_adapter '["agent:done", "review:automerge"]' true
+check "agent:done + resolved marker (deferred=0) merges" "merged head"
+
+write_marker_split "$SHA $SHA 0 2 0" ""
+write_adapter '["agent:done", "review:automerge"]' true
+check "agent:done + resolved marker with deferred findings skips" "not yet eligible"
+
+write_marker_split "" "2222222222222222222222222222222222222222 0"
+write_adapter '["agent:done", "review:automerge"]' true
+check "agent:done + stale clean marker skips" "not yet eligible"
+
+write_marker "$SHA"
+write_adapter '["agent:claimed", "review:automerge"]' true
+check "agent:claimed blocks" "no eligible open PR"
+
+write_adapter '["agent:needs-human", "review:automerge"]' true
+check "agent:needs-human blocks" "no eligible open PR"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
