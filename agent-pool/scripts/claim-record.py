@@ -63,6 +63,7 @@ import os
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import poolstate
 
@@ -71,51 +72,51 @@ DEFAULT_GRACE = 3600
 HUMAN_LABELS = {"agent:needs-human", "review:needs-human"}
 
 
-def iso(ts):
+def iso(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def epoch(text):
+def epoch(text: str) -> float:
     return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=datetime.timezone.utc).timestamp()
 
 
-def claim_path(repo, pr):
+def claim_path(repo: str, pr: int) -> Path:
     return poolstate.state_dir() / "claims" / f"{poolstate.slug(repo)}__{int(pr)}.json"
 
 
-def hold_path(repo, pr):
+def hold_path(repo: str, pr: int) -> Path:
     return poolstate.state_dir() / "holds" / f"{poolstate.slug(repo)}__{int(pr)}.json"
 
 
-def readable(doc):
+def readable(doc: dict | None) -> bool:
     return bool(doc) and not doc.get("_unreadable") and bool(doc.get("attempt_id")) \
         and bool(doc.get("expected_deadline_at"))
 
 
-def is_stale(doc, now):
+def is_stale(doc: dict, now: float) -> bool:
     return now > epoch(doc["expected_deadline_at"])
 
 
-def deadline_secs(arg):
+def deadline_secs(arg: float | None) -> float:
     return float(arg if arg is not None else os.environ.get("AGENT_POOL_DEADLINE_SECS", DEFAULT_DEADLINE))
 
 
-def run(command, quiet=False):
+def run(command: list[str], quiet: bool = False) -> int:
     """Run CMD; quiet keeps its stdout off ours, where claim prints the attempt_id."""
     if not command:
         return 0
     return subprocess.run(command, stdout=subprocess.DEVNULL if quiet else None).returncode
 
 
-def remove(path):
+def remove(path: Path) -> None:
     try:
         path.unlink()
     except FileNotFoundError:
         pass
 
 
-def new_record(a, now, previous=None):
+def new_record(a: argparse.Namespace, now: float, previous: dict | None = None) -> dict:
     rec = {
         "version": 2, "repo_slug": a.repo, "issue_number": a.pr, "provider": a.provider,
         "worker_id": a.worker, "attempt_id": str(uuid.uuid4()), "branch": a.branch,
@@ -129,7 +130,7 @@ def new_record(a, now, previous=None):
     return rec
 
 
-def current(path, attempt):
+def current(path: Path, attempt: str) -> dict | None:
     """Return the record if `attempt` is its current attempt_id, else None (with a reason on stderr)."""
     doc = poolstate.load(path)
     if not doc:
@@ -144,7 +145,7 @@ def current(path, attempt):
     return doc
 
 
-def live_refusal(a):
+def live_refusal(a: argparse.Namespace) -> str | None:
     """Why the PR's live state no longer allows this claim, or None. Read under the job lock."""
     out = subprocess.run([sys.executable, a.adapter, "state", "--repo", a.repo, "--pr", str(a.pr)],
                          capture_output=True, text=True)
@@ -165,7 +166,7 @@ def live_refusal(a):
     return None
 
 
-def cmd_claim(a, path):
+def cmd_claim(a: argparse.Namespace, path: Path) -> int:
     doc = poolstate.load(path)
     if doc:
         state = "unreadable" if doc.get("_unreadable") else f"attempt {doc.get('attempt_id')} by {doc.get('worker_id')}"
@@ -186,7 +187,7 @@ def cmd_claim(a, path):
     return 0
 
 
-def cmd_reattempt(a, path):
+def cmd_reattempt(a: argparse.Namespace, path: Path) -> int:
     doc = current(path, a.attempt)
     if doc is None:
         return 4
@@ -196,11 +197,11 @@ def cmd_reattempt(a, path):
     return 0
 
 
-def cmd_check(a, path):
+def cmd_check(a: argparse.Namespace, path: Path) -> int:
     return 0 if current(path, a.attempt) is not None else 4
 
 
-def cmd_guard(a, path):
+def cmd_guard(a: argparse.Namespace, path: Path) -> int:
     if current(path, a.attempt) is None:
         print(f"claim: write blocked: {' '.join(a.command)[:200]}", file=sys.stderr)
         return 4
@@ -210,7 +211,7 @@ def cmd_guard(a, path):
     return run(a.command)
 
 
-def cmd_release(a, path):
+def cmd_release(a: argparse.Namespace, path: Path) -> int:
     if current(path, a.attempt) is None:
         return 4
     rc = run(a.command, quiet=True)
@@ -221,7 +222,7 @@ def cmd_release(a, path):
     return 0
 
 
-def labels_live(a):
+def labels_live(a: argparse.Namespace) -> set[str]:
     out = subprocess.run([sys.executable, a.adapter, "labels", "--repo", a.repo, "--pr", str(a.pr)],
                          capture_output=True, text=True)
     if out.returncode != 0:
@@ -229,12 +230,12 @@ def labels_live(a):
     return set(json.loads(out.stdout or "[]"))
 
 
-def relabel(a, remove_label, add_label):
+def relabel(a: argparse.Namespace, remove_label: str, add_label: str) -> int:
     return subprocess.run([sys.executable, a.adapter, "label", "--repo", a.repo, "--pr", str(a.pr),
                            "--remove", remove_label, "--add", add_label]).returncode
 
 
-def cmd_requeue(a, path):
+def cmd_requeue(a: argparse.Namespace, path: Path) -> int:
     doc = current(path, a.attempt)
     if doc is None:
         return 4
@@ -249,7 +250,7 @@ def cmd_requeue(a, path):
     return 0
 
 
-def cmd_reconcile(a, path):
+def cmd_reconcile(a: argparse.Namespace, path: Path) -> int:
     labels = labels_live(a)
     doc = poolstate.load(path)
     if a.claimed in labels:
@@ -271,12 +272,12 @@ def cmd_reconcile(a, path):
     return 0
 
 
-def cmd_show(a, path):
+def cmd_show(a: argparse.Namespace, path: Path) -> int:
     print(json.dumps(poolstate.load(path) or {}, indent=2, sort_keys=True))
     return 0
 
 
-def cmd_hold(a, path):
+def cmd_hold(a: argparse.Namespace, path: Path) -> int:
     now = poolstate.now()
     labels = set(json.loads(a.labels or "[]"))
     assignees = [x for x in json.loads(a.assignees or "[]") if x]
@@ -286,7 +287,7 @@ def cmd_hold(a, path):
     hp = hold_path(a.repo, a.pr)
     seen_doc = poolstate.load(hp) or {}
 
-    def out(state, reason):
+    def out(state: str, reason: str) -> int:
         print(f"{state}\t{reason}")
         return 0
 
@@ -312,7 +313,7 @@ def cmd_hold(a, path):
                                f"of {grace:.0f}s grace")
 
 
-def main():
+def main() -> int:
     argv = sys.argv[1:]
     command = []
     if "--" in argv:

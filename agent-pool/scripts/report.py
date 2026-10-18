@@ -20,6 +20,7 @@ import importlib.util
 import os
 import re
 import sys
+import types
 from pathlib import Path
 
 # Bare 40-hex is deliberately absent: commit SHAs have the same shape. The live token is matched
@@ -40,7 +41,7 @@ TOKEN_SHAPES = re.compile(
     re.IGNORECASE)
 
 
-def live_tokens():
+def live_tokens() -> list[str]:
     found = []
     env = os.environ.get("GITEA_TOKEN", "").strip()
     if env:
@@ -54,18 +55,18 @@ def live_tokens():
     return [t for t in found if len(t) >= 8]
 
 
-def leaks_secret(body):
+def leaks_secret(body: str) -> bool:
     return bool(TOKEN_SHAPES.search(body)) or any(t in body for t in live_tokens())
 
 
-def load_marker(path):
+def load_marker(path: str) -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("marker", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def main():
+def main() -> int | None:
     p = argparse.ArgumentParser()
     p.add_argument("job", choices=["review", "resolve", "scan"])
     p.add_argument("--marker-module")

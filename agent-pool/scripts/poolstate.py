@@ -14,7 +14,9 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 
 def now() -> float:
@@ -29,7 +31,7 @@ def state_dir() -> Path:
     return path
 
 
-def save(path: Path, doc) -> None:
+def save(path: Path, doc: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
     try:
@@ -49,7 +51,7 @@ def save(path: Path, doc) -> None:
             os.unlink(temporary)
 
 
-def load(path: Path):
+def load(path: Path) -> Any:
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
@@ -61,7 +63,7 @@ def load(path: Path):
 
 
 @contextlib.contextmanager
-def locked(path: Path):
+def locked(path: Path) -> Iterator[None]:
     """Hold an exclusive flock on a stable sibling inode while the JSON beside it is replaced."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(str(path) + ".lock", "a") as lock:

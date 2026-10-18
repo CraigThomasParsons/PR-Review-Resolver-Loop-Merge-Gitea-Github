@@ -60,6 +60,7 @@ import os
 import re
 import shlex
 import sys
+from collections.abc import Callable
 
 OPERATOR_CHARS = "();<>|&\n"
 SEPARATORS = {"&&", "||", "|", ";", "\n"}
@@ -138,7 +139,7 @@ GATES = [["npm", "run"], ["npm", "test"], ["dotnet", "build"], ["dotnet", "test"
 ADAPTER_READS = ("head", "comments", "threads")
 
 
-def unquoted_brace(command):
+def unquoted_brace(command: str) -> bool:
     """True if `{` or `}` appears outside quotes, escaped or not: bash could expand it."""
     quote, i = None, 0
     while i < len(command):
@@ -163,7 +164,7 @@ def unquoted_brace(command):
     return False
 
 
-def tokenize(command):
+def tokenize(command: str) -> list[list[str]] | None:
     """Return a list of segments (token lists), or None if any denied construct appears."""
     if unquoted_brace(command) or "`" in command or "$" in command:
         return None
@@ -185,13 +186,13 @@ def tokenize(command):
     return [s for s in segments if s]
 
 
-def resolved(arg, a):
+def resolved(arg: str, a: argparse.Namespace) -> str:
     """The absolute, normalised path a shell running in the worktree would open for `arg`."""
     p = os.path.expanduser(arg) if arg.startswith("~") else arg
     return os.path.normpath(os.path.join(a.worktree or os.getcwd(), p))
 
 
-def sensitive(arg, a):
+def sensitive(arg: str, a: argparse.Namespace) -> bool:
     """The argument names a credential: literally, once normalised, or once symlinks are followed
     (a PR can commit notes.txt -> ~/.ssh/id_ed25519)."""
     p = resolved(arg, a)
@@ -199,18 +200,18 @@ def sensitive(arg, a):
     return any(frag in form for form in forms for frag in SENSITIVE)
 
 
-def roots(a, wildcard=False):
+def roots(a: argparse.Namespace, wildcard: bool = False) -> list[str]:
     out = [os.path.realpath(a.worktree or os.getcwd())]
     if a.report and not wildcard:
         out.append(os.path.realpath(os.path.dirname(a.report)))
     return out
 
 
-def within(path, bases):
+def within(path: str, bases: list[str]) -> bool:
     return any(path == b or path.startswith(b.rstrip("/") + "/") for b in bases)
 
 
-def contained(arg, a):
+def contained(arg: str, a: argparse.Namespace) -> bool:
     """A path argument stays inside the worktree or the runs folder, after ~, .., // and symlinks.
     A wildcard must have a static part inside the worktree, and every match must stay there."""
     if sensitive(arg, a):
@@ -229,7 +230,8 @@ def contained(arg, a):
     return all(within(os.path.realpath(m), bases) and not sensitive(m, a) for m in glob.glob(p))
 
 
-def options_ok(args, spec, positional_ok, value_ok):
+def options_ok(args: list[str], spec: dict, positional_ok: Callable[[str, int], bool],
+               value_ok: Callable[[str], bool]) -> bool:
     """Vet options against a spec. Positionals go through positional_ok(token, index) and option
     values through value_ok. After `--`, all are positional."""
     i, rest, n = 0, False, 0
@@ -259,7 +261,7 @@ def options_ok(args, spec, positional_ok, value_ok):
     return True
 
 
-def reader_check(args, spec, a, pattern_first):
+def reader_check(args: list[str], spec: dict, a: argparse.Namespace, pattern_first: bool) -> bool:
     """Readers: every path positional stays contained. For grep-style tools the first positional
     is the search pattern, not a path, unless the pattern came from -e (or rg --files)."""
     explicit = any(t in ("-e", "--regexp", "--files") or t.startswith("--regexp=") for t in args)
@@ -267,7 +269,7 @@ def reader_check(args, spec, a, pattern_first):
     return options_ok(args, spec, lambda t, n: n < skip or contained(t, a), lambda v: not sensitive(v, a))
 
 
-def add_positional(tok, a):
+def add_positional(tok: str, a: argparse.Namespace) -> bool:
     if tok.startswith(":") or sensitive(tok, a):
         return False
     wt = os.path.realpath(a.worktree or os.getcwd())
@@ -280,7 +282,7 @@ def add_positional(tok, a):
     return not any((rel + "/").startswith(t) for t in TOOL_CONFIG)
 
 
-def segment_ok(seg, a):
+def segment_ok(seg: list[str], a: argparse.Namespace) -> bool:
     head = seg[0]
     if head == "git":
         if len(seg) < 2:
@@ -316,7 +318,7 @@ def segment_ok(seg, a):
     return False
 
 
-def argument_check(command, a):
+def argument_check(command: str, a: argparse.Namespace) -> bool:
     segments = tokenize(command)
     if segments is None:
         return False
@@ -372,17 +374,17 @@ CURSOR_DENY = list(dict.fromkeys(CURSOR_DENY))
 CURSOR_REVIEW_DENY = ["git add", "git commit"]
 
 
-def home():
+def home() -> str:
     return os.path.expanduser("~")
 
 
-def credential_globs():
+def credential_globs() -> list[str]:
     h = home()
     return [f"{h}/.ssh/**", f"{h}/.config/tea/**", f"{h}/.config/pulse/**", f"{h}/.netrc",
             f"{h}/.git-credentials", f"{h}/.config/gh/**", "/proc/**"]
 
 
-def shell_rules(a):
+def shell_rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
     allow = list(READ_SHELL) + [f"python3 {a.adapter} {sub} *" for sub in ADAPTER_READS]
     deny = list(DENY_SHELL)
     if a.job == "resolve":
@@ -392,16 +394,16 @@ def shell_rules(a):
     return allow, deny
 
 
-def git_paths(a):
+def git_paths(a: argparse.Namespace) -> list[str]:
     wt = a.worktree.rstrip("/")
     return [f"{wt}/.git", f"{wt}/.git/**", "**/.git/**"]
 
 
-def read_roots(a):
+def read_roots(a: argparse.Namespace) -> list[str]:
     return [x for x in (a.worktree.rstrip("/"), os.path.dirname(a.report).rstrip("/")) if x]
 
 
-def rules(a):
+def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
     allow, deny = shell_rules(a)
     wt = a.worktree.rstrip("/")
     if a.provider == "claude":
@@ -433,11 +435,11 @@ def rules(a):
     raise SystemExit(f"policy: no rule translation for provider {a.provider}")
 
 
-def prefix_match(command, prefix):
+def prefix_match(command: str, prefix: str) -> bool:
     return command == prefix or command.startswith(prefix + " ")
 
 
-def family_allows(segment, a):
+def family_allows(segment: str, a: argparse.Namespace) -> bool:
     allow, deny = shell_rules(a)
     if a.family == "prefix":
         allow = [r[:-2] if r.endswith(" *") else r.rstrip("*").rstrip() for r in allow]
@@ -448,13 +450,13 @@ def family_allows(segment, a):
         not any(fnmatch.fnmatchcase(segment, p) for p in deny)
 
 
-def writes_output(seg):
+def writes_output(seg: list[str]) -> bool:
     """--output (or an abbreviation git would accept, --ou...) anywhere in the segment, not
     only straight after the subcommand: `git log -p --output=/tmp/x` writes a file."""
     return any(t.split("=", 1)[0].startswith("--ou") for t in seg)
 
 
-def check(a, command):
+def check(a: argparse.Namespace, command: str) -> str:
     if not argument_check(command, a):
         return "deny"
     segments = tokenize(command)
@@ -467,7 +469,7 @@ def check(a, command):
 
 
 # ---------------------------------------------------------------- claude hook
-def write_allowed(path, a):
+def write_allowed(path: str, a: argparse.Namespace) -> bool:
     if sensitive(path, a):
         return False
     p = os.path.realpath(os.path.join(a.worktree or "/", os.path.expanduser(path)))
@@ -483,7 +485,7 @@ def write_allowed(path, a):
     return ".git" not in parts and not any((rel + "/").startswith(t) for t in TOOL_CONFIG)
 
 
-def hook(a):
+def hook(a: argparse.Namespace) -> int:
     try:
         event = json.load(sys.stdin)
     except ValueError:
@@ -516,14 +518,14 @@ def hook(a):
     return 0
 
 
-def hook_settings(a):
+def hook_settings(a: argparse.Namespace) -> dict:
     command = " ".join(shlex.quote(x) for x in [
         sys.executable, os.path.abspath(__file__), "hook", "--job", a.job, "--adapter", a.adapter,
         "--worktree", a.worktree, "--report", a.report])
     return {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command}]}]}}
 
 
-def main():
+def main() -> int:
     argv = sys.argv[1:]
     command = []
     if "--" in argv:

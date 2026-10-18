@@ -41,6 +41,8 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Iterator
+from typing import Any
 
 ANY_LIMIT = re.compile(
     r"\b429\b|too many requests|rate[ _-]?limit|quota[ _-]?exceeded|exceeded (?:your |the )?quota"
@@ -66,7 +68,7 @@ SESSION_KEYS = ("conversation_id", "session_id", "sessionId")
 SHORT_RESULT = 400
 
 
-def read(path):
+def read(path: str | None) -> str:
     if not path:
         return ""
     try:
@@ -76,7 +78,7 @@ def read(path):
         return ""
 
 
-def parse_object(text):
+def parse_object(text: str) -> dict | None:
     try:
         doc = json.loads(text)
         return doc if isinstance(doc, dict) else None
@@ -92,7 +94,7 @@ def parse_object(text):
     return None
 
 
-def parse_events(text):
+def parse_events(text: str) -> list[dict]:
     events = []
     for line in text.splitlines():
         try:
@@ -104,7 +106,7 @@ def parse_events(text):
     return events
 
 
-def denials(node, path=""):
+def denials(node: Any, path: str = "") -> Iterator[tuple[str, Any]]:
     """Yield (path, value) for every non-empty denial key anywhere in a JSON document."""
     if isinstance(node, dict):
         for key, value in node.items():
@@ -118,7 +120,7 @@ def denials(node, path=""):
             yield from denials(value, f"{path}[{i}]")
 
 
-def session_of(docs):
+def session_of(docs: list[dict]) -> str:
     for doc in docs:
         for key in SESSION_KEYS:
             if doc.get(key):
@@ -126,17 +128,17 @@ def session_of(docs):
     return ""
 
 
-def describe(found):
+def describe(found: list[tuple[str, Any]]) -> str:
     where, value = found[0]
     more = f" (+{len(found) - 1} more)" if len(found) > 1 else ""
     return f"{where}={json.dumps(value)[:160]}{more}"
 
 
-def limit_in(text):
+def limit_in(text: str) -> re.Match[str] | None:
     return ANY_LIMIT.search(text) or PRODUCT_LIMIT.search(text)
 
 
-def classify(provider, rc, out, err):
+def classify(provider: str, rc: int, out: str, err: str) -> tuple[str, str, str, str]:
     """Return (verdict, reason, session, result_text)."""
     if rc == 127:
         return "setup", f"{provider} binary missing (exit 127)", "", ""
@@ -205,7 +207,7 @@ def classify(provider, rc, out, err):
     return "ok", f"{provider} reported completion", session, result_text
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--provider", required=True)
     p.add_argument("--exit", required=True, type=int)
