@@ -74,7 +74,9 @@ def main() -> int:
     arguments = parser.parse_args()
     try:
         busy = held_by(arguments.repo, arguments.bot)
-    except (urllib.error.URLError, OSError, ValueError, KeyError):
+    # Anything held_by() can raise reads as busy, including token()'s SystemExit and the
+    # AttributeError/TypeError of an unexpected payload shape (an error object, not a list).
+    except (Exception, SystemExit):
         busy = True
     print("busy" if busy else "clear")
     return 0

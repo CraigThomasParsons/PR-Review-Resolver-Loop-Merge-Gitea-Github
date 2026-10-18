@@ -773,7 +773,8 @@ mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 # place the two systems' claims on the same repo could otherwise collide.
 NIGHTCREW_HOLD=0
 if [ -n "$NIGHTCREW_BOT" ]; then
-  if [ "$(python3 "$NIGHTCREW_HOLD_SCRIPT" --repo "$REPO" --bot "$NIGHTCREW_BOT" 2>>"$LOG")" = "busy" ]; then
+  # Only an exact "clear" lets claiming go on; empty output from a crash reads as held.
+  if [ "$(python3 "$NIGHTCREW_HOLD_SCRIPT" --repo "$REPO" --bot "$NIGHTCREW_BOT" 2>>"$LOG")" != "clear" ]; then
     NIGHTCREW_HOLD=1
     log "$REPO: TheNightCrew holds an open issue here; no PR claimed this tick"
   fi
