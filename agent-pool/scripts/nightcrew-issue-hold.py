@@ -4,11 +4,17 @@
 Check whether TheNightCrew's issue-kind worker currently holds any open issue in
 this repo, so agent-pool-core's claim path can skip a PR claim rather than run a
 worktree-mutating job in a repo an issue worker is actively touching. There is no
-database shared between the two systems; the one durable, always-set signal is
-the Gitea side-effect TheNightCrew's own GiteaFence.markClaimed() already performs
-on every claim: it assigns the crew bot to the issue (always) and optionally also
-applies a "status: in-progress" label (off by default) -- so the bot-assignee
-check is the one that cannot silently be absent even with the label feature off.
+database shared between the two systems; the signal used is the Gitea side-effect
+TheNightCrew's own GiteaFence.markClaimed() performs on an issue claim: it assigns
+the crew bot to the issue, and optionally also applies a "status: in-progress"
+label (off by default), so the assignee is the more reliable of the two.
+
+This is a partial proxy for ClaimNextJob::blockReason, not an equivalent. It
+misses: maintenance jobs and any job with no issue reference (markClaimed returns
+early, so the bot is never assigned); a disabled fence (no API root or token); and
+an assignment PATCH that failed, since markClaimed swallows and only logs that.
+It can also over-block: markDone never unassigns the bot, so the repo reads busy
+until the issue closes, not when the job ends.
 
 Prints "busy" or "clear" and always exits 0, except on a usage error (exit 2). On
 any read failure, uncertainty resolves to "busy": this check runs every tick, so a

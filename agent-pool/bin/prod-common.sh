@@ -69,6 +69,9 @@
 #                                  claiming any PR in this repo while that bot holds an open
 #                                  issue here (agent-pool/scripts/nightcrew-issue-hold.py).
 #                                  Unset (default): no check -- most repos aren't shared.
+#                                  A partial proxy for TheNightCrew's blockReason: it misses
+#                                  maintenance jobs and issue-less jobs, and stays busy until
+#                                  the issue closes (see the script's docstring).
 #   AGENT_POOL_PROTECTED_BRANCHES=develop,main,master,release   never pushed to (nor release/*)
 #   AGENT_POOL_BOT                 the pool's Gitea login; any other assignee is a human hold
 #   AGENT_POOL_MODEL_<PROVIDER>    model per provider (claude=opus cursor=auto grok=grok-build;
