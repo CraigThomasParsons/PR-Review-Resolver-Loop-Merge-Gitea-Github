@@ -1,6 +1,6 @@
 ---
 name: pr-merge-loop
-description: Run the separate mechanical Gitea PR merge tick for allowlisted repositories. It merges only open, non-draft, non-bot PRs explicitly labelled review:automerge plus review:clean or review:resolved after marker/head, mergeability, and base-branch gates pass. Use when asked to run or inspect the PR auto-merge tick. Never invoke it from the review or resolve workers.
+description: Run the separate mechanical Gitea PR merge tick for allowlisted repositories. It merges only open, non-draft, non-bot PRs explicitly labelled review:automerge plus review:clean, review:resolved or agent:done after marker/head, mergeability, and base-branch gates pass. Use when asked to run or inspect the PR auto-merge tick. Never invoke it from the review or resolve workers.
 ---
 
 # PR merge loop

@@ -75,7 +75,7 @@ for pr in json.load(sys.stdin):
 fi
 mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 if [ "${#CANDIDATES[@]}" -eq 0 ]; then
-  log "no eligible open PR carries review:automerge plus review:clean|review:resolved"
+  log "no eligible open PR carries review:automerge plus review:clean|review:resolved|agent:done"
   exit 0
 fi
 
