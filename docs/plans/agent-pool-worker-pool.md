@@ -86,6 +86,99 @@ supersedes the earlier reset-on-read mutable prompt design.
   already-confirmed, edit-capable, non-interactive CLI shapes (`claude -p`, `codex exec`).
   `prod-common.sh` is written provider-parameterized from day one so Agy/Grok/Cursor are pure
   additive follow-ups once their individual gaps (listed below) close — not a redesign.
+  **Superseded by owner decision (PR #2 review):** the Cursor, Agy and Grok adapters that were
+  built alongside Claude and Codex stay in. They are not trimmed back to Claude and Codex.
+  `PROVIDER_ORDER` still defaults to Claude alone, and Codex is never in the default order, so
+  nothing beyond Claude runs unless an operator lists it.
+
+## Owner decisions from the PR #2 review (binding for the build)
+
+- **Labels and job kind.** The pool uses the `agent:ready` / `agent:claimed` / `agent:done` /
+  `agent:needs-human` labels above, never `review:*`. There is no review/resolve mode argument:
+  the job kind is derived per PR from its markers. A review marker for the current head with
+  findings > 0 means resolve. A clean review marker, or a resolve marker that already answered
+  the latest review at the current head, is settled to `agent:done` without running a provider.
+  Anything else is a review. A review with findings goes back to `agent:ready`, queued for the
+  resolve.
+- **Write-once claims.** Heartbeat-renewed leases are gone. `scripts/claim-record.py`
+  implements the v2 claim record, attempt fencing and reconciliation table below. A provider
+  fallback inside one job is a new attempt (`reattempt`): a fresh `attempt_id` and deadline
+  naming the provider actually running, written atomically over the old record. This keeps
+  records write-once and fences off the previous provider's stragglers.
+- **Workers never publish.** Workers only read, edit, commit locally (resolve) and write a
+  report file. If they cannot write files, the report is their final response. The controller,
+  `bin/prod-common.sh`, confirms the claim is still held. It then validates the report's marker
+  and its finding counts, and checks that the worker's commits fast-forward the reviewed head.
+  It also checks that `origin/<headref>` has not moved, then pushes `HEAD:refs/heads/<headref>`
+  and posts the report, every write through `claim-record.py guard`. It never pushes a
+  protected branch (develop, main, master, release, `release/*`) or a `+` refspec, and never
+  force-pushes.
+- **Worker containment.** Each worker runs under `setsid` in its own process group, with
+  `remote.origin.pushurl` overridden to a dead path in its environment. A read-only watcher
+  (not a renewer) re-reads the claim every `AGENT_POOL_WATCH_SECS`. If the attempt is
+  superseded, the watcher kills the whole group. Stragglers are killed when the worker exits.
+- **Permissions are an allowlist** (`scripts/policy.py`, one policy translated per CLI). It
+  allows specific read commands, the adapter's `head|comments|threads` reads by absolute path,
+  named-path staging and `git commit -m` (resolve only; `-F` and `--file` are denied), and named
+  gate commands. It never allows `python3 *`, `node *`, `npx *`, broad `git`, or any push or
+  Gitea write. Explicit denies for `git push --force`, `git reset --hard` and `git merge` stay
+  in the policy of every adapter that takes a rule list, and deny rules never depend on an
+  absolute path alone. Cursor runs without `--force`, using a per-worktree `.cursor/cli.json`.
+  Agy has no rule list. It reviews in `--mode plan`, and the controller posts its `response`. It
+  takes resolve jobs only with `AGY_AUTO_APPROVE=1`.
+  **Codex is exempt from the rule list too, by owner decision** (PR #2 review, Spec 1): it runs
+  with `--sandbox workspace-write`, which has no network and confines filesystem writes to the
+  worktree, so it cannot push or write to Gitea regardless of what `policy.py` would allow. The
+  sandbox does not restrict reads: a Codex worker can still read credential files that every
+  other provider is denied. What contains a secret it reads is the controller: `report.py`'s
+  secret scan on the posted report and the pre-push scan of commit messages and added lines.
+  Like Agy, it relies on the pushurl override and controller-only publication that already apply
+  to every provider, not on a translated rule list. The exemption holds only for
+  `CODEX_SANDBOX_MODE` set to `workspace-write` (the default) or `read-only`; any other value,
+  such as `danger-full-access`, gives the worker network and unrestricted writes with no rule
+  list, and is outside this decision.
+- **Timing.** `expected_deadline_at` is seeded at `AGENT_POOL_DEADLINE_SECS` (2700s) until the
+  effort baseline exists. `WORKER_TIMEOUT` (default 2400s) must be shorter than the deadline, or
+  the tick refuses to start. A provider timeout with no marker requeues to `agent:ready`, never
+  `agent:needs-human`. agy has no inner timeout and `--print-timeout 0`.
+
+### Built so far (on `feature/agent-pool-core`)
+
+`bin/prod-common.sh` (the controller tick: reconcile, claim, run, publish, verify, release),
+`scripts/claim-record.py`, `scripts/policy.py`, `scripts/cooldown.py`, `scripts/classify.py`,
+`scripts/report.py`, `scripts/render-prompt.py`, `scripts/poolstate.py`, and the offline tests
+`tests/verify-lease.sh` (unit) and `tests/verify-providers.sh` (end-to-end, stub CLIs).
+
+**Not built yet:** the thin `prod-<provider>.sh` entrypoints, `doctor.sh`, `mailbox.py`,
+`effort-baseline.py` (the deadline is the seed only), the cooldown recovery probe, and the
+systemd units and installer. Until the doctor exists, each tick does the reconciliation itself:
+a stale claim found under the job lock is requeued and its provider cooled down.
+
+**Open questions:** Agy has no deny list, so an auto-approved Agy resolve relies on the
+pushurl override and controller publication alone. Codex's `workspace-write` sandbox has no
+network, so its adapter reads fail and it cannot write a report outside the worktree. It falls
+back to a final-response report. Gate commands (`npm run`, `just`, `composer`) run repository
+code that a resolve worker can edit. Push and publication are still controller-only, but the
+gate is not a sandbox. Cursor's `.cursor/cli.json` prefix rules cannot deny an option at an
+arbitrary position (`git log -p -n 3 --output=/tmp/x` starts with the allowed `git log`),
+redirection, a symlinked path or brace expansion; `policy.py check` denies all of these, but
+Cursor's own CLI enforces only the prefixes, so Cursor is not contained by cli.json alone.
+
+**Decisions:** Codex's exemption from the rule list is recorded under Worker containment above.
+D1 is decided: the controller will run gate commands itself from a pinned list after the worker
+exits (not built yet). **D2 is decided too (Craig, 2026-10-18): exactly one host runs the pool
+against a given repo, for v1.** Claims stay local files; there is no shared claim store and no
+plan to add one for now. There are real plans for a second host later — tracked separately in
+issue #5 ("Plan to plan: multi-host support for the agent pool") rather than designed here, so
+this PR isn't blocked waiting on that design. The guard against a second host belongs in the
+tick, since the tick is what claims: today a second host's tick that sees `agent:claimed` with no
+local claim holds, then reclaims once `AGENT_POOL_ORPHAN_GRACE` has passed. The tick (and
+`doctor.sh`, once it exists) should refuse to claim against a repo another
+`AGENT_POOL_STATE`/host is already active on, rather than silently double-claiming; not built
+yet, so there is nothing to enforce this today.
+
+Resolve workers must not run unattended until the controller-gates follow-up (branch
+docs/controller-gates-plan, docs/plans/controller-gates.md) lands.
 
 ## What already exists and gets reused, not rebuilt
 
@@ -124,35 +217,44 @@ supersedes the earlier reset-on-read mutable prompt design.
 ```
 agent-pool/
   bin/
-    prod-common.sh       # shared claim -> invoke -> verify -> release; provider-parameterized
-    prod-claude.sh       # thin entrypoint, sources prod-common.sh
-    prod-codex.sh
-    doctor.sh            # zero-LLM driver; uses deterministic helpers, systemctl and git/Gitea; optional retalk
+    prod-common.sh       # shared reconcile -> claim -> invoke -> publish -> verify -> release; provider-parameterized
+    prod-claude.sh       # thin entrypoint, sources prod-common.sh (not built yet)
+    prod-codex.sh        # (not built yet)
+    doctor.sh            # zero-LLM driver; uses deterministic helpers, systemctl and git/Gitea; optional retalk (not built yet)
   scripts/
     claim-record.py      # atomic per-job claim file; attempt_id fencing; reconciliation (see below)
-    mailbox.py           # atomic enqueue/pending/ack; stable worker IDs and message IDs
-    effort-baseline.py   # parses pool.log -> rolling avg per provider; seeds at 2700s
-    eligible.py           # cooldown-gated next-eligible selection (adapted from lease.py)
-    record-cooldown.py    # single place cooldowns get written; called by both the EXIT trap and doctor.sh
+    policy.py            # the one worker permission allowlist, translated per provider CLI
+    cooldown.py          # cooldown-gated eligible selection and the single place cooldowns and setup faults are written
+    classify.py          # provider run -> ok | setup | limit | timeout | incomplete
+    report.py            # validates a worker's report marker before the controller publishes it
+    render-prompt.py     # literal placeholder substitution for prompt templates
+    poolstate.py         # atomic writes, flock, state dir, injectable clock
+    mailbox.py           # atomic enqueue/pending/ack; stable worker IDs and message IDs (not built yet)
+    effort-baseline.py   # parses pool.log -> rolling avg per provider; seeds at 2700s (not built yet)
   prompts/
-    claim-job.txt         # default "go claim a job" template
-    reassigned.txt         # "your task was reassigned, go pick a new one" template
-  systemd/
+    claim-job.txt         # default "go claim a job" template (not built yet)
+    reassigned.txt         # "your task was reassigned, go pick a new one" template (not built yet)
+  systemd/                   # (not built yet)
     prod-claude.{timer,service}
     prod-codex.{timer,service}
     doctor.{timer,service}
-  install_systemd_units.sh   # same idempotent/--force/--list shape as install_skills_and_actions.sh
-  docs/HANDOFF-agent-pool.md # state machine + decision log, mirrors HANDOFF-pr-automerge.md
+  install_systemd_units.sh   # same idempotent/--force/--list shape as install_skills_and_actions.sh (not built yet)
+  docs/HANDOFF-agent-pool.md # state machine + decision log, mirrors HANDOFF-pr-automerge.md (not built yet)
   tests/
-    verify-claim-record.sh   # offline unit tests for claim-record.py's fencing/reconciliation logic,
-                              # mirroring pr-loops-common/tests/verify-merge.sh's style
-    inject-staleness.sh      # offline synthetic end-to-end scenarios, see Verification
+    verify-lease.sh          # offline unit tests: claim-record.py fencing/reconciliation/deadline
+                              # boundary, holds, cooldowns, classification, prompt rendering, policy
+    verify-providers.sh      # offline end-to-end ticks against stub CLIs, a stub Gitea adapter and
+                              # a local bare remote: publication, fencing, reconciliation, adapters
+    inject-staleness.sh      # doctor scenarios, see Verification (not built yet)
 ```
+
+The shared prompts live in `skills/pr-loops-common/prompts/review.generic.txt` and
+`resolve.generic.txt`, not under `agent-pool/prompts/`.
 
 Runtime state (not checked in), `~/.local/state/agent-pool/`:
 `pool.log` (same `date -Is [MODE] msg` format as `pr-loop.log`, keyed by `repo#issue` **and**
 `attempt_id` — see below), `claims/<repo>__<issue>.json`,
-`mailboxes/<worker_id>/<message_id>.json`, `cooldowns.json`, `doctor.log`,
+`mailboxes/<worker_id>/<message_id>.json`, `cooldowns/<provider>.json`, `doctor.log`,
 `prod-<provider>.log`. Prompt templates remain static; per-launch prompts are rendered
 from templates plus pending notices. Worker IDs are configured explicitly and stable
 across restarts; multiple workers using one provider have separate mailboxes.
@@ -269,9 +371,9 @@ before releasing**, not just release-and-log:
 2. Check it against a small set of known provider-exhaustion signatures (the literal
    "Credit balance too low" text, an HTTP 429, other recognized quota/auth error strings —
    necessarily incomplete; unclassifiable failures just skip this and behave as before).
-3. On a classified provider-level failure, call `scripts/record-cooldown.py` — the **same**
-   helper the doctor calls — before relabeling to `agent:ready`, with an increasing backoff
-   tracked per provider in `cooldowns.json` on repeated classified failures.
+3. On a classified provider-level failure, call `scripts/cooldown.py record`, the **same**
+   helper the doctor calls, before relabeling to `agent:ready`, with an increasing backoff
+   tracked per provider in `cooldowns/<provider>.json` on repeated classified failures.
 4. Each provider's service, before attempting a real claim, checks whether it's currently in
    its own cooldown window; if so it runs a cheap recovery probe first (the `<cli> -p "say OK"`
    pattern already proven working for Claude/Codex/Agy this session) and skips claiming
@@ -382,7 +484,10 @@ mechanism by which it can't itself be rate-limited.
 Two test files, both fully offline and deterministic — no waiting hours for a real rate limit,
 and no dependency on scenario order.
 
-### `agent-pool/tests/verify-claim-record.sh` — unit-level, pure logic
+### `agent-pool/tests/verify-lease.sh` — unit-level, pure logic
+
+(Planned as `verify-claim-record.sh`; built as `verify-lease.sh`, which also covers cooldowns,
+classification, prompt rendering and the permission policy.)
 
 Mirrors `pr-loops-common/tests/verify-merge.sh`'s style: direct calls into `claim-record.py`
 with a fixed/injected clock, no systemd, no real Gitea calls (a stub adapter). Covers the
@@ -408,7 +513,7 @@ capture its `attempt_id`. Force the deadline into the past and fire `doctor.sh` 
 new claim (new `attempt_id`). *Then*, simulate the original attempt's EXIT trap
 firing late, using its stale captured `attempt_id`. Assert: the trap's re-read sees a mismatch
 and no-ops (does not relabel, does not delete the new claim record, does not touch
-`cooldowns.json`); the doctor's reassignment is the one that stands.
+`cooldowns/<provider>.json`); the doctor's reassignment is the one that stands.
 
 **Scenario 3 — partial Gitea failures.** (a) Mock the claim path so the local record write
 succeeds but the simulated Gitea label call fails/times out. Assert the next tick's
@@ -428,8 +533,8 @@ attempt-scoping fix, not just asserting the end state.
 
 **Scenario 5 — immediate provider rejection (fast-path classification).** Simulate the EXIT
 trap seeing a classified failure signature (inject a fake "Credit balance too low" string into
-the captured output) on a fresh claim. Assert: `record-cooldown.py` is called immediately from
-the trap itself, before the doctor ever ticks; `cooldowns.json` reflects it. Then simulate that
+the captured output) on a fresh claim. Assert: `cooldown.py record` is called immediately from
+the trap itself, before the doctor ever ticks; `cooldowns/<provider>.json` reflects it. Then simulate that
 same provider's *next* prod firing while the cooldown is still active: assert its recovery probe
 runs first, the probe is made to fail too, and the service skips claiming entirely for that
 tick (no job touched, no second failure logged) — rather than claiming a real job and

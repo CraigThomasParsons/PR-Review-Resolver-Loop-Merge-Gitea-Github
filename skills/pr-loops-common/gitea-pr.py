@@ -19,8 +19,10 @@ workers deny that command; the deterministic merge tick is its sole caller.
 
 Subcommands:
   list   --repo O/R [--state open]   PRs as JSON with number, draft, labels,
-                                     head_sha, author, is_bot
+                                     head_sha, author, is_bot, assignees
   head   --repo O/R --pr N           print the current head SHA (the gate)
+  labels --repo O/R --pr N           the PR's current label names as JSON (read live)
+  state  --repo O/R --pr N           {head_sha, labels, assignees} from one live read
   label  --repo O/R --pr N [--add L] [--remove L]
   comment --repo O/R --pr N --body-file F
   comments --repo O/R --pr N         existing comments as JSON (marker lookup)
@@ -113,6 +115,8 @@ def cmd_list(a):
             # Gitea has no is_bot flag; treat the known automation identities as bots.
             "is_bot": login.lower() in {"gitea-actions", "actions-user"} or login.endswith("[bot]"),
             "labels": [l.get("name") for l in (p.get("labels") or [])],
+            # The agent pool reads a non-bot assignee as a human hold.
+            "assignees": [u.get("login") for u in (p.get("assignees") or []) if u.get("login")],
             "url": p.get("html_url", ""),
         })
     print(json.dumps(out, indent=2))
@@ -124,6 +128,17 @@ def cmd_head(a):
     if not sha:
         raise SystemExit(f"gitea-pr: no head sha for {a.repo}#{a.pr}")
     print(sha)
+
+
+def cmd_labels(a):
+    print(json.dumps([l.get("name") for l in api(f"/repos/{a.repo}/issues/{a.pr}/labels")]))
+
+
+def cmd_state(a):
+    p = api(f"/repos/{a.repo}/pulls/{a.pr}")
+    print(json.dumps({"head_sha": ((p.get("head") or {}).get("sha") or ""),
+                      "labels": [l.get("name") for l in (p.get("labels") or [])],
+                      "assignees": [u.get("login") for u in (p.get("assignees") or []) if u.get("login")]}))
 
 
 def cmd_label(a):
@@ -227,6 +242,8 @@ def main():
     s.set_defaults(fn=cmd_list)
 
     add("head", cmd_head)
+    add("labels", cmd_labels)
+    add("state", cmd_state)
     s = add("label", cmd_label); s.add_argument("--add"); s.add_argument("--remove")
     s = add("comment", cmd_comment); s.add_argument("--body-file", required=True)
     add("comments", cmd_comments)
