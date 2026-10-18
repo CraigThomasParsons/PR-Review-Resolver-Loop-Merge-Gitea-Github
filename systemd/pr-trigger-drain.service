@@ -1,0 +1,20 @@
+[Unit]
+Description=PR event trigger: label, review and resolve each queued PR
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+# Explicit PATH, as in pr-pipeline.service: systemd gives a thin one and the
+# stages need claude, tmux, tea, node and php.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin:%h/.npm-global/bin
+ExecStart=%h/.local/bin/pr-drain
+# No start timeout: killing a drain mid-review strands review:in-progress, and
+# every inner step is already bounded by WORKER_TIMEOUT and the lock wait.
+TimeoutStartSec=infinity
+# pr-loop.sh may be the process that starts the tmux server. With the default
+# control-group kill mode, the drain finishing would take that server down,
+# and with it any worker the hourly tick or a person started there since.
+KillMode=process
+StandardOutput=append:%h/.local/state/gitea-pr-loops/trigger.log
+StandardError=append:%h/.local/state/gitea-pr-loops/trigger.log

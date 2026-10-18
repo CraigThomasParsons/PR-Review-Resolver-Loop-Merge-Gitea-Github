@@ -29,7 +29,10 @@
 #   MIN_FREE_GB=6      skip the tick when less memory than this is available
 #   SKIP_BUSY_GUARD=1  run even if another pulse-* tmux worker is mid-task
 #   PR_LOOP_WORKTREES  where worker worktrees go (default: .prloop-worktrees next to the clone)
-#   PR_LOOP_STATE      lock, log and per-run files (default: ~/.local/state/pulse-pr-loops)
+#   PR_LOOP_STATE      lock, log and per-run files (default: ~/.local/state/gitea-pr-loops)
+#   PR_LOOP_PR=N       consider only PR #N (the event trigger's drainer sets this); unset = every PR
+#   PR_LOOP_LOCK_WAIT=S  wait up to S seconds for the MODE lock instead of exiting at once when a
+#                      previous tick holds it; unset = exit at once (the hourly timer's behaviour)
 #
 # Exit codes: 0 always for a normal tick (including "nothing to do"); 2 for a setup fault.
 
@@ -85,6 +88,8 @@ POLL="${POLL:-30}"
 MIN_FREE_GB="${MIN_FREE_GB:-6}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_BUSY_GUARD="${SKIP_BUSY_GUARD:-0}"
+ONLY_PR="${PR_LOOP_PR:-}"
+LOCK_WAIT="${PR_LOOP_LOCK_WAIT:-}"
 CLASSIFY="$COMMON/classify-pane.sh"
 
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -120,10 +125,12 @@ DENY=("Bash(tea pr merge *)" "Bash(tea pr approve *)" "Bash(tea pr close *)" "Ba
   "Bash(*gitea-pr.py label*)" "Bash(*gitea-pr.py merge*)" "Bash(tea pr edit *)")
 
 mkdir -p "$STATE" "$WT_ROOT"
-log() { printf '%s [%s] %s\n' "$(date -Is)" "$MODE" "$*" | tee -a "$LOG" >&2; }
+log() { printf '%s [%s] [%s] %s\n' "$(date -Is)" "$MODE" "$REPO" "$*" | tee -a "$LOG" >&2; }
 die() { log "FATAL: $*"; exit 2; }
 
 # ---------------------------------------------------------------- preconditions
+[ -z "$ONLY_PR" ] || [[ "$ONLY_PR" =~ ^[1-9][0-9]*$ ]] || die "PR_LOOP_PR must be a PR number (got '$ONLY_PR')"
+[ -z "$LOCK_WAIT" ] || [[ "$LOCK_WAIT" =~ ^[0-9]+$ ]] || die "PR_LOOP_LOCK_WAIT must be whole seconds (got '$LOCK_WAIT')"
 command -v claude >/dev/null || die "claude not on PATH"
 command -v tea >/dev/null || [ -x "$HOME/.local/bin/tea" ] || die "tea not on PATH"
 [ -f "$ADAPTER" ] || die "missing Gitea adapter: $ADAPTER"
@@ -133,7 +140,12 @@ command -v tmux >/dev/null || die "tmux not on PATH"
 [ -n "$MAIN" ] && [ -e "$MAIN/.git" ] || die "no checkout for $REPO: set PR_LOOP_MAIN to its clone (got '$MAIN')"
 
 exec 9>"$STATE/$MODE.lock"
-if ! flock -n 9; then log "previous $MODE tick still running; exiting"; exit 0; fi
+if [ -z "$LOCK_WAIT" ]; then
+  if ! flock -n 9; then log "previous $MODE tick still running; exiting"; exit 0; fi
+elif ! flock -n 9; then
+  log "previous $MODE tick still running; waiting up to ${LOCK_WAIT}s for it"
+  if ! flock -w "$LOCK_WAIT" 9; then log "gave up waiting ${LOCK_WAIT}s for the $MODE lock; exiting"; exit 0; fi
+fi
 
 if [ "$DRY_RUN" != "1" ]; then
   if [ "$SKIP_BUSY_GUARD" != "1" ]; then
@@ -166,14 +178,16 @@ git -C "$MAIN" fetch origin --quiet --prune || log "warning: fetch failed; conti
 # A failing gh call must be a fault, not an empty list; otherwise a broken query reads as "nothing
 # to do" and the loop silently never reviews anything.
 if ! LISTING="$(TRIGGER="$TRIGGER" python3 "$ADAPTER" list --repo "$REPO" --state open \
-  | TRIGGER="$TRIGGER" python3 -c '
+  | TRIGGER="$TRIGGER" ONLY_PR="$ONLY_PR" python3 -c '
 import json, os, re, sys
 trigger = os.environ["TRIGGER"]
+only = os.environ.get("ONLY_PR", "")
 # Gitea has no is_bot flag and AMPB nightly PRs are authored by craigpars, so the
 # upstream dependabot check cannot catch them. Skip by pattern instead.
 raw = os.environ.get("PR_LOOP_SKIP_PATTERN", r"docblock-backfill|^chore\(#152\)")
 rx = re.compile(raw) if raw else None
 for pr in json.load(sys.stdin):
+    if only and str(pr["number"]) != only: continue
     if trigger not in pr["labels"]:      continue
     if pr["draft"] or pr["is_bot"]:      continue
     if rx and (rx.search(pr["title"]) or rx.search(pr["head_ref"])): continue
@@ -183,7 +197,11 @@ for pr in json.load(sys.stdin):
 fi
 mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 
-if [ "${#CANDIDATES[@]}" -eq 0 ]; then log "no open, non-draft, non-bot PR carries $TRIGGER"; exit 0; fi
+if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+  if [ -n "$ONLY_PR" ]; then log "#$ONLY_PR is not an open, non-draft, non-bot PR carrying $TRIGGER"
+  else log "no open, non-draft, non-bot PR carries $TRIGGER"; fi
+  exit 0
+fi
 
 relabel() { # pr from to
   if [ "$DRY_RUN" = "1" ]; then log "DRY: #$1 $2 -> $3"; return 0; fi

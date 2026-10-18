@@ -43,18 +43,57 @@ setup and `skills/pr-review-resolver/SKILL.md` for the resolver's own rules.
 
 ## Installing
 
+Production (`~/.claude/skills/*` on the review host) is a **copy** of a
+committed revision, not a symlink to this checkout. Deploy it with:
+
 ```sh
-./install_skills_and_actions.sh              # symlinks into ~/.claude/skills
-./install_skills_and_actions.sh --list        # dry run
-./install_skills_and_actions.sh --target DIR  # install somewhere else too
+./install.sh --list       # dry run, including drift in the live copy
+./install.sh              # deploy from a clean master checkout
+./install.sh --rollback   # put the previous copy back
 ```
 
-Symlinked, not copied: editing a skill here takes effect immediately wherever
-it's installed. The script never overwrites an existing plain directory or a
-differently-targeted symlink without `--force` — see the script's own header
-comment for why `~/.codex/skills/pr-review-resolver` specifically should not
-be a default target. It is a separately maintained variant adapted for AMPB's
+`install.sh` copies every `skills/<name>` from `git archive` (tracked files
+only), stamps `.deployed-from`, installs `~/.local/bin/pr-trigger` and
+`~/.local/bin/pr-drain`, installs and enables the `pr-trigger-drain` systemd
+user units, and swaps each copy in atomically while holding the loop's locks.
+It refuses a dirty tree, a non-master HEAD, or a live copy that was edited by
+hand, unless told otherwise. See its header and
+`skills/pr-loops-common/docs/EVENT-TRIGGER.md`.
+
+For development only, `install_skills_and_actions.sh` symlinks the skills
+instead, so edits here take effect immediately:
+
+```sh
+./install_skills_and_actions.sh --list        # dry run
+./install_skills_and_actions.sh --target DIR  # e.g. a scratch skills directory
+```
+
+It never overwrites an existing plain directory or a differently-targeted
+symlink without `--force` — see the script's own header comment for why
+`~/.codex/skills/pr-review-resolver` specifically should not be a default
+target. It is a separately maintained variant adapted for AMPB's
 slice-pipeline, not an older copy of this one.
+
+## Event trigger
+
+Besides the hourly timer, a Gitea Actions job (template owned by
+TheGiteaCodeFactory, `runs-on: factory-host`) calls
+`~/.local/bin/pr-trigger --repo OWNER/NAME --pr N --sha HEAD [--event E] [--label L]`
+on `pull_request_target`. It queues the PR and returns at once; a systemd path
+unit runs `pr-drain`, which takes that one PR through label, review and resolve
+under the same locks and markers as the timer. Contract, queue semantics,
+Gitea checks and troubleshooting: `skills/pr-loops-common/docs/EVENT-TRIGGER.md`.
+
+## Tests
+
+```sh
+skills/pr-loops-common/tests/verify-resolve.sh
+skills/pr-loops-common/tests/verify-merge.sh
+skills/pr-loops-common/tests/verify-trigger.sh
+tests/verify-install.sh
+```
+
+All offline: stubbed adapter and CLIs, temporary home, no systemctl.
 
 ## Not version controlled before this
 

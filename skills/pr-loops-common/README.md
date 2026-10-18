@@ -6,6 +6,10 @@ no `SKILL.md` on purpose.
 
 - `pr-loop.sh review|resolve` one tick of the loop
 - `pr-merge.sh` one mechanical, opt-in merge tick (no model worker)
+- `pr-trigger.sh` the event entry point, installed as `~/.local/bin/pr-trigger`: validates
+  `--repo --pr --sha [--event] [--label]` and queues the PR (exit 0/2/3)
+- `pr-drain.sh` installed as `~/.local/bin/pr-drain`, run by `pr-trigger-drain.service`: takes
+  each queued PR through label, review and resolve. See `docs/EVENT-TRIGGER.md`
 - `prompts/review.txt`, `prompts/resolve.txt` the prompts pasted into each worker
 - `prompts/review.generic.txt`, `prompts/resolve.generic.txt` provider-neutral prompts for the
   headless agent pool (`../../agent-pool/bin/prod-common.sh`); no Claude-only skills, staging is
@@ -28,5 +32,10 @@ no `SKILL.md` on purpose.
   worker permission policy
 - `../../agent-pool/tests/verify-providers.sh` offline end-to-end ticks of the agent pool against
   stub provider CLIs, a stub Gitea adapter and a local git remote
+- `tests/verify-trigger.sh` offline cases for `pr-trigger`, `pr-drain` and the `PR_LOOP_PR` /
+  `PR_LOOP_LOCK_WAIT` knobs in `pr-loop.sh`
+
+Production runs a copy of this folder deployed by the repo's top-level `install.sh`;
+`.deployed-from` in the deployed copy names the commit.
 
 Operator setup: [`docs/agents/pr-loops-setup.md`](../../../docs/agents/pr-loops-setup.md).
