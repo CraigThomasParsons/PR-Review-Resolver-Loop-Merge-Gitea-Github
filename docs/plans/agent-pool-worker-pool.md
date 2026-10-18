@@ -123,6 +123,11 @@ supersedes the earlier reset-on-read mutable prompt design.
   policy, and deny rules never depend on an absolute path alone. Cursor runs without `--force`,
   using a per-worktree `.cursor/cli.json`. Agy has no rule list. It reviews in `--mode plan`,
   and the controller posts its `response`. It takes resolve jobs only with `AGY_AUTO_APPROVE=1`.
+  **Codex is exempt from the rule list too, by owner decision** (PR #2 review, Spec 1): it runs
+  with `--sandbox workspace-write`, which has no network and confines filesystem writes to the
+  worktree, so it cannot reach credentials or push regardless of what `policy.py` would allow.
+  Like Agy, it relies on the pushurl override and controller-only publication that already apply
+  to every provider, not on a translated rule list.
 - **Timing.** `expected_deadline_at` is seeded at `AGENT_POOL_DEADLINE_SECS` (2700s) until the
   effort baseline exists. `WORKER_TIMEOUT` (default 2400s) must be shorter than the deadline, or
   the tick refuses to start. A provider timeout with no marker requeues to `agent:ready`, never

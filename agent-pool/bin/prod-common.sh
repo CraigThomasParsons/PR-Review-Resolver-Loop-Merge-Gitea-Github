@@ -41,7 +41,10 @@
 # Permissions come from scripts/policy.py, per worktree and per invocation only: claude
 # --allowedTools/--disallowedTools, cursor .cursor/cli.json in the worktree (no --force), grok
 # --allow/--deny. agy has no rule list: it reviews in --mode plan and is only eligible for
-# resolve with AGY_AUTO_APPROVE=1. Nothing global is widened.
+# resolve with AGY_AUTO_APPROVE=1. codex also has no rule list, by owner decision (PR #2
+# review, Spec 1): --sandbox workspace-write has no network and confines writes to the
+# worktree, so the pushurl override and controller-only publication contain it instead.
+# Nothing global is widened.
 #
 # Environment knobs (all optional unless marked):
 #   AGENT_POOL_MAIN (required, or PR_LOOP_MAIN)  the repo's main clone
