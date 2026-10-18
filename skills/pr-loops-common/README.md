@@ -16,10 +16,12 @@ no `SKILL.md` on purpose.
   by named path only, and workers never push or comment (the pool controller publishes).
   Resolve workers must not run unattended until the controller-gates follow-up (branch
   docs/controller-gates-plan, docs/plans/controller-gates.md) lands.
+- `prompts/review.agy.txt` the agent pool's review prompt for Agy, which runs in plan mode with
+  no commands; the controller gathers the diff and discussion into a context file for it
 - `marker.py` reads the hidden `pulse-review:v1` and `pulse-resolve:v1` markers off a PR. A
   resolve marker counts each finding as `fixed`, `noted` (non-blocking, left for the author) or
   `deferred` (blocking); only `deferred` sends a PR to `review:needs-human`
-- `gitea-pr.py` the Gitea adapter (list, head, labels, label, comment, comments,
+- `gitea-pr.py` the Gitea adapter (list, head, labels, state, label, comment, comments,
   threads, diff, merge)
 - `classify-pane.sh` classifies a worker pane (WORKING, BLOCKED, PARKED, DONE, IDLE, STALLED)
   from the pane text and an idle-streak state file. The loop depends on the four-argument form

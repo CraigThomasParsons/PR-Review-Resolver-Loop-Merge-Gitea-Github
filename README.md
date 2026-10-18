@@ -26,6 +26,9 @@ An alternate form of this I would like to enable are long living feature branche
 - `skills/pr-review-resolver/` — the skill a resolve worker actually runs:
   address review comments or conflicts, land the fix on the PR's branch, never
   merge.
+- `agent-pool/`: the pull-based, multi-provider worker pool (in progress): the
+  controller tick `bin/prod-common.sh`, its helper scripts and offline tests. Design in
+  `docs/plans/agent-pool-worker-pool.md`.
 - `skills/pr-merge-loop/` — a **third, deliberately separate, mechanical**
   tick. No model worker at all: it merges only PRs an operator has explicitly
   labelled `review:automerge`, that also carry `review:clean` or
