@@ -113,15 +113,19 @@ for row in "${CANDIDATES[@]}"; do
   IFS=$'\t' read -r pr sha base path <<<"$row"
   if [ "$path" = "agent" ]; then
     # agent:done alone doesn't say clean or resolved -- ask the marker directly. A resolve
-    # marker at this head with nothing deferred wins; otherwise fall back to a clean review
-    # marker at this head. Neither matching means not yet eligible, same as a label mismatch.
+    # marker at this head with nothing deferred wins, but only if it answers the latest review
+    # (the same r_reviewed = latest-head rule as derive_job in agent-pool/bin/prod-common.sh),
+    # so a newer review posted after the resolve is never skipped. Otherwise fall back to a
+    # clean review marker at this head. Neither matching means not yet eligible, same as a
+    # label mismatch.
+    latest_marker="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
+    read -r l_head l_findings <<<"$latest_marker"
     resolve_marker="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
-    read -r r_head _r_reviewed _r_fixed r_deferred _r_noted <<<"$resolve_marker"
-    if [ -n "$resolve_marker" ] && [ "$r_head" = "$sha" ] && [ "${r_deferred:-1}" = "0" ]; then
+    read -r r_head r_reviewed _r_fixed r_deferred _r_noted <<<"$resolve_marker"
+    if [ -n "$resolve_marker" ] && [ -n "$latest_marker" ] && [ "$r_head" = "$sha" ] \
+       && [ "$r_reviewed" = "$l_head" ] && [ "${r_deferred:-1}" = "0" ]; then
       path="resolved"; marker="$resolve_marker"
     else
-      latest_marker="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
-      read -r l_head l_findings <<<"$latest_marker"
       if [ -n "$latest_marker" ] && [ "$l_head" = "$sha" ] && [ "${l_findings:-1}" = "0" ]; then
         path="clean"; marker="$latest_marker"
       else

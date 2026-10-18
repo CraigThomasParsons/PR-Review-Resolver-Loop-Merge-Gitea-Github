@@ -6,6 +6,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/state"
 SHA=1111111111111111111111111111111111111111
+OLD=3333333333333333333333333333333333333333
 
 write_adapter() { # labels-json mergeable(true|false)
   local mergeable="False"
@@ -81,11 +82,19 @@ write_marker_split "" "$SHA 0"
 write_adapter '["agent:done", "review:automerge"]' true
 check "agent:done + clean marker merges" "merged head"
 
-write_marker_split "$SHA $SHA 1 0 0" ""
+write_marker_split "$SHA $OLD 1 0 0" "$OLD 1"
 write_adapter '["agent:done", "review:automerge"]' true
 check "agent:done + resolved marker (deferred=0) merges" "merged head"
 
-write_marker_split "$SHA $SHA 0 2 0" ""
+write_marker_split "$SHA $OLD 1 0 0" "$SHA 2"
+write_adapter '["agent:done", "review:automerge"]' true
+check "agent:done + resolve answering an older review skips" "not yet eligible"
+
+write_marker_split "$SHA $OLD 1 0 0" ""
+write_adapter '["agent:done", "review:automerge"]' true
+check "agent:done + resolve marker with no review marker skips" "not yet eligible"
+
+write_marker_split "$SHA $OLD 0 2 0" "$OLD 2"
 write_adapter '["agent:done", "review:automerge"]' true
 check "agent:done + resolved marker with deferred findings skips" "not yet eligible"
 
