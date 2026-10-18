@@ -31,8 +31,8 @@ An alternate form of this I would like to enable are long living feature branche
   `docs/plans/agent-pool-worker-pool.md`.
 - `skills/pr-merge-loop/` — a **third, deliberately separate, mechanical**
   tick. No model worker at all: it merges only PRs an operator has explicitly
-  labelled `review:automerge`, that also carry `review:clean` or
-  `review:resolved`, after re-verifying the marker, head, mergeability, and
+  labelled `review:automerge`, that also carry `review:clean`,
+  `review:resolved` or agent-pool-core's `agent:done`, after re-verifying the marker, head, mergeability, and
   base branch immediately before calling `tea pr merge`. Review and resolve
   workers are denied `tea pr merge` and every merge-adjacent command outright
   — merging only ever happens through this one path. Allowlisted per-repo
