@@ -161,14 +161,19 @@ gate is not a sandbox. Cursor's `.cursor/cli.json` prefix rules cannot deny an o
 arbitrary position (`git log -p -n 3 --output=/tmp/x` starts with the allowed `git log`),
 redirection, a symlinked path or brace expansion; `policy.py check` denies all of these, but
 Cursor's own CLI enforces only the prefixes, so Cursor is not contained by cli.json alone.
+
+**Decisions:** Codex's exemption from the rule list is recorded under Worker containment above.
 D1 is decided: the controller will run gate commands itself from a pinned list after the worker
 exits (not built yet). **D2 is decided too (Craig, 2026-10-18): exactly one host runs the pool
 against a given repo, for v1.** Claims stay local files; there is no shared claim store and no
 plan to add one for now. There are real plans for a second host later — tracked separately in
 issue #5 ("Plan to plan: multi-host support for the agent pool") rather than designed here, so
-this PR isn't blocked waiting on that design. Once `doctor.sh` exists, it should refuse to run
-against a repo another `AGENT_POOL_STATE`/host is already active on, rather than silently
-double-claiming; not built yet, so there is nothing to enforce this today.
+this PR isn't blocked waiting on that design. The guard against a second host belongs in the
+tick, since the tick is what claims: today a second host's tick that sees `agent:claimed` with no
+local claim holds, then reclaims once `AGENT_POOL_ORPHAN_GRACE` has passed. The tick (and
+`doctor.sh`, once it exists) should refuse to claim against a repo another
+`AGENT_POOL_STATE`/host is already active on, rather than silently double-claiming; not built
+yet, so there is nothing to enforce this today.
 
 Resolve workers must not run unattended until the controller-gates follow-up (branch
 docs/controller-gates-plan, docs/plans/controller-gates.md) lands.
