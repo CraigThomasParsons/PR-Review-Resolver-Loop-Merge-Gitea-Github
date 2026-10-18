@@ -49,5 +49,19 @@ def boom(repo):
 hold.open_issues = boom
 '
 
+check "no token anywhere resolves to busy, not a crash" "busy" '
+def no_token():
+    raise SystemExit("nightcrew-issue-hold: no token")
+hold.token = no_token
+'
+
+check "an error object instead of a list resolves to busy" "busy" '
+class Reply:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def read(self): return b"{\"message\": \"token is required\"}"
+hold.urllib.request.urlopen = lambda *a, **k: Reply()
+'
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

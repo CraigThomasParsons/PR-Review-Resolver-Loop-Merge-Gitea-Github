@@ -750,6 +750,16 @@ tick
 expect "claiming resumes once the hold clears" "$(ncalls claude)" "1"
 expect "the review lands normally" "$(comments)" "pulse-review:v1"
 
+cat > "$TMP/common/nightcrew-issue-hold.py" <<'PY'
+import sys
+sys.exit(1)
+PY
+reset '["agent:ready"]'
+behave claude ok
+tick
+expect "a hold check that crashes with no output claims nothing" "$(ncalls claude)" "0"
+expect "the PR stays queued after a crashed hold check" "$(labels)" "agent:ready"
+
 unset AGENT_POOL_NIGHTCREW_BOT AGENT_POOL_NIGHTCREW_HOLD_SCRIPT
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
