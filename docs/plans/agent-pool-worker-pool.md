@@ -161,7 +161,13 @@ arbitrary position (`git log -p -n 3 --output=/tmp/x` starts with the allowed `g
 redirection, a symlinked path or brace expansion; `policy.py check` denies all of these, but
 Cursor's own CLI enforces only the prefixes, so Cursor is not contained by cli.json alone.
 D1 is decided: the controller will run gate commands itself from a pinned list after the worker
-exits (not built yet); D2 (one host per repo) is still pending Craig's decision.
+exits (not built yet). **D2 is decided too (Craig, 2026-10-18): exactly one host runs the pool
+against a given repo, for v1.** Claims stay local files; there is no shared claim store and no
+plan to add one for now. There are real plans for a second host later — tracked separately in
+issue #5 ("Plan to plan: multi-host support for the agent pool") rather than designed here, so
+this PR isn't blocked waiting on that design. Once `doctor.sh` exists, it should refuse to run
+against a repo another `AGENT_POOL_STATE`/host is already active on, rather than silently
+double-claiming; not built yet, so there is nothing to enforce this today.
 
 Resolve workers must not run unattended until the controller-gates follow-up (branch
 docs/controller-gates-plan, docs/plans/controller-gates.md) lands.
