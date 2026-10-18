@@ -33,6 +33,9 @@
 #   PR_LOOP_PR=N       consider only PR #N (the event trigger's drainer sets this); unset = every PR
 #   PR_LOOP_LOCK_WAIT=S  wait up to S seconds for the MODE lock instead of exiting at once when a
 #                      previous tick holds it; unset = exit at once (the hourly timer's behaviour)
+#   PR_LOOP_REMOTE     the remote that carries this repo's PR branches (default: origin). Only
+#                      needed when a repo's "origin" is not Gitea -- see TheGiteaCodeFactory,
+#                      whose "origin" is its GitHub mirror and whose Gitea remote is "gitea".
 #
 # Exit codes: 0 always for a normal tick (including "nothing to do"); 2 for a setup fault.
 
@@ -78,6 +81,12 @@ if [ -z "$MAIN" ]; then
   MAIN="$(git -C "$COMMON" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   MAIN="${MAIN%/.git}"
 fi
+# The remote that actually carries this repo's PR branches. Every repo in this estate but one
+# has "origin" pointing at Gitea; TheGiteaCodeFactory's "origin" is its GitHub mirror, with the
+# Gitea remote named "gitea" instead -- a hardcoded "origin" there fetches a branch that isn't
+# there and fails every time, not intermittently. PR_LOOP_REMOTE lets that one repo's invocation
+# say so without changing the default for everyone else.
+PR_LOOP_REMOTE="${PR_LOOP_REMOTE:-origin}"
 WT_ROOT="${PR_LOOP_WORKTREES:-$(dirname "$MAIN")/.prloop-worktrees}"
 mkdir -p "$WT_ROOT"
 STATE="${PR_LOOP_STATE:-$HOME/.local/state/gitea-pr-loops}"
@@ -113,7 +122,7 @@ ALLOW_COMMON=(Read Grep Glob Agent
   # PR reads/writes go through the adapter; Bash(python3 *) below already reaches it.
   "Bash(python3 *)" "Bash(node *)" "Bash(cat *)" "Bash(sed *)" "Bash(wc *)" "Bash(ls *)" "Bash(head *)" "Bash(tail *)")
 ALLOW_RESOLVE=(Edit Write MultiEdit
-  "Bash(git add *)" "Bash(git commit *)" "Bash(git push origin HEAD:*)"
+  "Bash(git add *)" "Bash(git commit *)" "Bash(git push $PR_LOOP_REMOTE HEAD:*)"
   "Bash(npm run *)" "Bash(npm ci *)" "Bash(npx *)" "Bash(dotnet build *)" "Bash(dotnet test *)" "Bash(just *)"
   "Bash(composer test*)" "Bash(composer lint*)" "Bash(php artisan test*)" "Bash(vendor/bin/pint *)" "Bash(vendor/bin/phpunit*)")
 DENY=("Bash(tea pr merge *)" "Bash(tea pr approve *)" "Bash(tea pr close *)" "Bash(tea pr reject *)"
@@ -166,7 +175,7 @@ if [ "$DRY_RUN" != "1" ]; then
   fi
 fi
 
-git -C "$MAIN" fetch origin --quiet --prune || log "warning: fetch failed; continuing with what is local"
+git -C "$MAIN" fetch "$PR_LOOP_REMOTE" --quiet --prune || log "warning: fetch failed; continuing with what is local"
 
 # ---------------------------------------------------------------- candidates
 # Bots (Dependabot included) and drafts never reach a worker. review mode also skips a head that
@@ -296,7 +305,7 @@ spawn() { # row
   if [ "$DRY_RUN" = "1" ]; then log "DRY: would spawn $sess at $sha ($headref -> $base)"; return 0; fi
   if tmux has-session -t "$sess" 2>/dev/null; then log "#$pr: session $sess already exists; leaving it alone"; return 1; fi
   relabel "$pr" "$TRIGGER" "$CLAIM"
-  git -C "$MAIN" fetch origin --quiet "$headref" || { log "#$pr: fetch $headref failed"; relabel "$pr" "$CLAIM" "$FAIL"; return 1; }
+  git -C "$MAIN" fetch "$PR_LOOP_REMOTE" --quiet "$headref" || { log "#$pr: fetch $headref failed"; relabel "$pr" "$CLAIM" "$FAIL"; return 1; }
   [ -d "$wt" ] && git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1
   git -C "$MAIN" worktree add --detach "$wt" "$sha" >/dev/null 2>&1 || { log "#$pr: worktree add failed"; relabel "$pr" "$CLAIM" "$FAIL"; return 1; }
   pretrust_worktree "$wt"
@@ -369,7 +378,9 @@ verify() { # pr -> prints ok|clean|fail:<reason>
     # because the head had moved. So the head check stays, and the disposition is checked too.
     local newsha; newsha="$(python3 "$ADAPTER" head --repo "$REPO" --pr "$pr" 2>/dev/null)"
     if [ -z "$newsha" ]; then echo "fail:could not read the PR head after the run"; return; fi
-    git -C "$MAIN" fetch origin --quiet "$headref"
+    # verify() is extracted standalone by the test harness (sed between the function markers),
+    # without the top-level default assignment in scope, so the fallback is inlined here too.
+    git -C "$MAIN" fetch "${PR_LOOP_REMOTE:-origin}" --quiet "$headref"
 
     local rm; rm="$(python3 "$COMMON/marker.py" resolve "$pr" 2>/dev/null || true)"
     if [ -z "$rm" ]; then echo "fail:the resolver left no disposition marker, so what it did to each finding is unknown"; return; fi

@@ -21,10 +21,12 @@ provider's *next* prod to say "your task was reassigned, go pick a new one" inst
 self-report.
 
 This plan covers the **prove-it-out phase only**, inside the already-created
-`PR-Review-Resolver-Loop-Merge-Gitea-Github` repo (local clone staged at `/tmp/pr-loop-skills`,
-real clone should land under `/home/craigpar/Code/`). Porting this into the publicly-shared
-`TheGiteaCodeFactory` repo is an explicitly separate, later phase (already agreed with the user)
-and is out of scope here.
+`PR-Review-Resolver-Loop-Merge-Gitea-Github` repo, cloned standalone at
+`/home/craigpar/Code/PR-Review-Resolver-Loop-Merge-Gitea-Github` (registered in
+`~/.config/pulse/night_crew_repositories.json` as the NightCrew worker's project dir — not a
+worktree, to avoid the exact base-branch contention `RTSColonyTerrainGenerator#106` hit).
+Porting this into the publicly-shared `TheGiteaCodeFactory` repo is an explicitly separate,
+later phase (already agreed with the user) and is out of scope here.
 
 ### Audit finding (confirms the urgency, informs scope)
 
@@ -450,9 +452,9 @@ real reassignments, and a per-repo allowlist (mirroring `pr-merge.sh`'s
 
 ## Critical files to read again at implementation time
 
-- `/tmp/pr-loop-skills/skills/pr-loops-common/pr-loop.sh` — claim/spawn/verify/finish pattern
-- `/tmp/pr-loop-skills/skills/pr-loops-common/pr-merge.sh` — doctor's bash-driver shape
-- `/tmp/pr-loop-skills/skills/pr-loops-common/gitea-pr.py` — the adapter to reuse
+- `skills/pr-loops-common/pr-loop.sh` (this repo) — claim/spawn/verify/finish pattern
+- `skills/pr-loops-common/pr-merge.sh` (this repo) — doctor's bash-driver shape
+- `skills/pr-loops-common/gitea-pr.py` (this repo) — the adapter to reuse
 - `~/.codex/skills/tmux-multi-pipeline/lease.py` — atomic-write + `eligible()` to adapt
 - `/home/craigpar/.local/bin/pr-pipeline.sh`, `pr-merge-tick.sh` — already-running automation,
   now confirmed to be what ran on the stale key for nine-plus days
