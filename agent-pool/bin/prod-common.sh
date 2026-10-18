@@ -43,7 +43,9 @@
 # --allow/--deny. agy has no rule list: it reviews in --mode plan and is only eligible for
 # resolve with AGY_AUTO_APPROVE=1. codex also has no rule list, by owner decision (PR #2
 # review, Spec 1): --sandbox workspace-write has no network and confines writes to the
-# worktree, so the pushurl override and controller-only publication contain it instead.
+# worktree, so the pushurl override and controller-only publication contain it instead. The
+# sandbox does not stop reads; the report and pre-push secret scans contain what it reads. The
+# exemption holds only for CODEX_SANDBOX_MODE=workspace-write or read-only.
 # Nothing global is widened.
 #
 # Environment knobs (all optional unless marked):

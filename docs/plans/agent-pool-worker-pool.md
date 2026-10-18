@@ -119,15 +119,21 @@ supersedes the earlier reset-on-read mutable prompt design.
   allows specific read commands, the adapter's `head|comments|threads` reads by absolute path,
   named-path staging and `git commit -m|-F` (resolve only), and named gate commands. It never
   allows `python3 *`, `node *`, `npx *`, broad `git`, or any push or Gitea write. Explicit
-  denies for `git push --force`, `git reset --hard` and `git merge` stay in every adapter's
-  policy, and deny rules never depend on an absolute path alone. Cursor runs without `--force`,
+  denies for `git push --force`, `git reset --hard` and `git merge` stay in the policy of every
+  adapter that takes a rule list, and deny rules never depend on an absolute path alone. Cursor runs without `--force`,
   using a per-worktree `.cursor/cli.json`. Agy has no rule list. It reviews in `--mode plan`,
   and the controller posts its `response`. It takes resolve jobs only with `AGY_AUTO_APPROVE=1`.
   **Codex is exempt from the rule list too, by owner decision** (PR #2 review, Spec 1): it runs
   with `--sandbox workspace-write`, which has no network and confines filesystem writes to the
-  worktree, so it cannot reach credentials or push regardless of what `policy.py` would allow.
+  worktree, so it cannot push or write to Gitea regardless of what `policy.py` would allow. The
+  sandbox does not restrict reads: a Codex worker can still read credential files that every
+  other provider is denied. What contains a secret it reads is the controller: `report.py`'s
+  secret scan on the posted report and the pre-push scan of commit messages and added lines.
   Like Agy, it relies on the pushurl override and controller-only publication that already apply
-  to every provider, not on a translated rule list.
+  to every provider, not on a translated rule list. The exemption holds only for
+  `CODEX_SANDBOX_MODE` set to `workspace-write` (the default) or `read-only`; any other value,
+  such as `danger-full-access`, gives the worker network and unrestricted writes with no rule
+  list, and is outside this decision.
 - **Timing.** `expected_deadline_at` is seeded at `AGENT_POOL_DEADLINE_SECS` (2700s) until the
   effort baseline exists. `WORKER_TIMEOUT` (default 2400s) must be shorter than the deadline, or
   the tick refuses to start. A provider timeout with no marker requeues to `agent:ready`, never
