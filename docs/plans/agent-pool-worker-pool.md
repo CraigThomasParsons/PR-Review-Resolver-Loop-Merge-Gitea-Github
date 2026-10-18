@@ -230,14 +230,14 @@ agent-pool/
     mailbox.py           # atomic enqueue/pending/ack; stable worker IDs and message IDs (not built yet)
     effort-baseline.py   # parses pool.log -> rolling avg per provider; seeds at 2700s (not built yet)
   prompts/
-    claim-job.txt         # default "go claim a job" template
-    reassigned.txt         # "your task was reassigned, go pick a new one" template
-  systemd/
+    claim-job.txt         # default "go claim a job" template (not built yet)
+    reassigned.txt         # "your task was reassigned, go pick a new one" template (not built yet)
+  systemd/                   # (not built yet)
     prod-claude.{timer,service}
     prod-codex.{timer,service}
     doctor.{timer,service}
-  install_systemd_units.sh   # same idempotent/--force/--list shape as install_skills_and_actions.sh
-  docs/HANDOFF-agent-pool.md # state machine + decision log, mirrors HANDOFF-pr-automerge.md
+  install_systemd_units.sh   # same idempotent/--force/--list shape as install_skills_and_actions.sh (not built yet)
+  docs/HANDOFF-agent-pool.md # state machine + decision log, mirrors HANDOFF-pr-automerge.md (not built yet)
   tests/
     verify-lease.sh          # offline unit tests: claim-record.py fencing/reconciliation/deadline
                               # boundary, holds, cooldowns, classification, prompt rendering, policy
@@ -252,7 +252,7 @@ The shared prompts live in `skills/pr-loops-common/prompts/review.generic.txt` a
 Runtime state (not checked in), `~/.local/state/agent-pool/`:
 `pool.log` (same `date -Is [MODE] msg` format as `pr-loop.log`, keyed by `repo#issue` **and**
 `attempt_id` — see below), `claims/<repo>__<issue>.json`,
-`mailboxes/<worker_id>/<message_id>.json`, `cooldowns.json`, `doctor.log`,
+`mailboxes/<worker_id>/<message_id>.json`, `cooldowns/<provider>.json`, `doctor.log`,
 `prod-<provider>.log`. Prompt templates remain static; per-launch prompts are rendered
 from templates plus pending notices. Worker IDs are configured explicitly and stable
 across restarts; multiple workers using one provider have separate mailboxes.
@@ -369,9 +369,9 @@ before releasing**, not just release-and-log:
 2. Check it against a small set of known provider-exhaustion signatures (the literal
    "Credit balance too low" text, an HTTP 429, other recognized quota/auth error strings —
    necessarily incomplete; unclassifiable failures just skip this and behave as before).
-3. On a classified provider-level failure, call `scripts/record-cooldown.py` — the **same**
-   helper the doctor calls — before relabeling to `agent:ready`, with an increasing backoff
-   tracked per provider in `cooldowns.json` on repeated classified failures.
+3. On a classified provider-level failure, call `scripts/cooldown.py record`, the **same**
+   helper the doctor calls, before relabeling to `agent:ready`, with an increasing backoff
+   tracked per provider in `cooldowns/<provider>.json` on repeated classified failures.
 4. Each provider's service, before attempting a real claim, checks whether it's currently in
    its own cooldown window; if so it runs a cheap recovery probe first (the `<cli> -p "say OK"`
    pattern already proven working for Claude/Codex/Agy this session) and skips claiming
@@ -511,7 +511,7 @@ capture its `attempt_id`. Force the deadline into the past and fire `doctor.sh` 
 new claim (new `attempt_id`). *Then*, simulate the original attempt's EXIT trap
 firing late, using its stale captured `attempt_id`. Assert: the trap's re-read sees a mismatch
 and no-ops (does not relabel, does not delete the new claim record, does not touch
-`cooldowns.json`); the doctor's reassignment is the one that stands.
+`cooldowns/<provider>.json`); the doctor's reassignment is the one that stands.
 
 **Scenario 3 — partial Gitea failures.** (a) Mock the claim path so the local record write
 succeeds but the simulated Gitea label call fails/times out. Assert the next tick's
@@ -531,8 +531,8 @@ attempt-scoping fix, not just asserting the end state.
 
 **Scenario 5 — immediate provider rejection (fast-path classification).** Simulate the EXIT
 trap seeing a classified failure signature (inject a fake "Credit balance too low" string into
-the captured output) on a fresh claim. Assert: `record-cooldown.py` is called immediately from
-the trap itself, before the doctor ever ticks; `cooldowns.json` reflects it. Then simulate that
+the captured output) on a fresh claim. Assert: `cooldown.py record` is called immediately from
+the trap itself, before the doctor ever ticks; `cooldowns/<provider>.json` reflects it. Then simulate that
 same provider's *next* prod firing while the cooldown is still active: assert its recovery probe
 runs first, the probe is made to fail too, and the service skips claiming entirely for that
 tick (no job touched, no second failure logged) — rather than claiming a real job and
