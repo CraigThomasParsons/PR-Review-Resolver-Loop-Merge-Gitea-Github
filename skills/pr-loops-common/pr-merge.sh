@@ -50,11 +50,12 @@ if ! flock -n 9; then log "previous merge tick still running; exiting"; exit 0; 
 
 if ! LISTING="$(python3 "$ADAPTER" list --repo "$REPO" --state open | python3 -c '
 import json, re, sys
-# agent:claimed/agent:needs-human block the same way review:in-progress/needs-human do --
-# agent-pool-core still owns this PR or has already flagged it for a human.
+# agent:ready/agent:claimed/agent:needs-human block the same way review:findings/
+# in-progress/needs-human do -- agent-pool-core has queued this PR for work, still owns
+# it, or has already flagged it for a human.
 blocked = {"review:needs-human", "review:in-progress", "review:resolving",
            "review:findings", "review:requested", "review:merging",
-           "agent:claimed", "agent:needs-human"}
+           "agent:ready", "agent:claimed", "agent:needs-human"}
 skip = re.compile(r"docblock-backfill|^chore\(#152\)")
 for pr in json.load(sys.stdin):
     labels = set(pr["labels"])

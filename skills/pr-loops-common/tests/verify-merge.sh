@@ -109,5 +109,8 @@ check "agent:claimed blocks" "no eligible open PR"
 write_adapter '["agent:needs-human", "review:automerge"]' true
 check "agent:needs-human blocks" "no eligible open PR"
 
+write_adapter '["agent:ready", "review:clean", "review:automerge"]' true
+check "agent:ready blocks even with review:clean" "no eligible open PR"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
