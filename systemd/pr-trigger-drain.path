@@ -1,0 +1,15 @@
+[Unit]
+# pr-trigger drops one file per PR into the queue; this starts the drainer
+# whenever the queue is not empty. Inert until something calls pr-trigger.
+Description=PR event trigger: drain the queue when it is not empty
+
+[Path]
+DirectoryNotEmpty=%h/.local/state/gitea-pr-loops/queue
+MakeDirectory=yes
+Unit=pr-trigger-drain.service
+# Guard against a spin if the drainer ever exits without consuming the queue.
+TriggerLimitIntervalSec=60
+TriggerLimitBurst=10
+
+[Install]
+WantedBy=default.target
