@@ -65,6 +65,10 @@
 #   AGENT_POOL_TIMEOUT_COOLDOWN=900    a timed-out provider pauses this long (no strike); the job
 #                                      falls through to the next provider
 #   AGENT_POOL_HOLD_LABELS="status: in-progress"   extra labels that read as a hold
+#   AGENT_POOL_NIGHTCREW_BOT       TheNightCrew's issue-kind Gitea bot login; when set, skip
+#                                  claiming any PR in this repo while that bot holds an open
+#                                  issue here (agent-pool/scripts/nightcrew-issue-hold.py).
+#                                  Unset (default): no check -- most repos aren't shared.
 #   AGENT_POOL_PROTECTED_BRANCHES=develop,main,master,release   never pushed to (nor release/*)
 #   AGENT_POOL_BOT                 the pool's Gitea login; any other assignee is a human hold
 #   AGENT_POOL_MODEL_<PROVIDER>    model per provider (claude=opus cursor=auto grok=grok-build;
@@ -125,6 +129,10 @@ READY="${AGENT_POOL_LABEL_READY:-agent:ready}"
 CLAIMED="${AGENT_POOL_LABEL_CLAIMED:-agent:claimed}"
 DONE="${AGENT_POOL_LABEL_DONE:-agent:done}"
 HUMAN="${AGENT_POOL_LABEL_NEEDS_HUMAN:-agent:needs-human}"
+# Unset (default) disables the check entirely -- opt-in per repo, since most repos this pool
+# runs against today aren't tracked by TheNightCrew's issue intake at all.
+NIGHTCREW_BOT="${AGENT_POOL_NIGHTCREW_BOT:-}"
+NIGHTCREW_HOLD_SCRIPT="${AGENT_POOL_NIGHTCREW_HOLD_SCRIPT:-$SCRIPTS/nightcrew-issue-hold.py}"
 PROTECTED="${AGENT_POOL_PROTECTED_BRANCHES:-develop,main,master,release}"
 NOPUSH_URL="/nonexistent/agent-pool-workers-never-push"
 CONTEXT_FILE=".agent-pool-context.md"
@@ -760,6 +768,17 @@ fi
 mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 [ "${#CANDIDATES[@]}" -eq 0 ] && { log "no open PR in $REPO carries $READY or $CLAIMED"; exit 0; }
 
+# One check per tick, not per PR -- every candidate below is in the same repo. Nothing else
+# in agent-pool-core shares state with TheNightCrew's issue-kind job board; this is the one
+# place the two systems' claims on the same repo could otherwise collide.
+NIGHTCREW_HOLD=0
+if [ -n "$NIGHTCREW_BOT" ]; then
+  if [ "$(python3 "$NIGHTCREW_HOLD_SCRIPT" --repo "$REPO" --bot "$NIGHTCREW_BOT" 2>>"$LOG")" = "busy" ]; then
+    NIGHTCREW_HOLD=1
+    log "$REPO: TheNightCrew holds an open issue here; no PR claimed this tick"
+  fi
+fi
+
 # reconcile_pr pr -> 0 to go on considering the PR (labels may have become ready), 1 to skip it.
 reconcile_pr() {
   local out st aid prov info f mark
@@ -802,6 +821,7 @@ for row in "${CANDIDATES[@]}"; do
     [ "$RECONCILED_READY" = 1 ] && labels="${labels//\"$CLAIMED\"/\"$READY\"}"
   fi
   [[ "$labels" == *"\"$READY\""* ]] || continue
+  if [ "$NIGHTCREW_HOLD" = 1 ]; then continue; fi
   hold="$(JOB_PR="$pr" claim hold --labels "$labels" --assignees "$assignees" --hold-labels "$EXTRA_HOLD" --bot "$BOT" 2>>"$LOG")"
   state="${hold%%$'\t'*}"; why="${hold#*$'\t'}"
   remove="$READY"

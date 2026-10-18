@@ -729,5 +729,28 @@ expect_not "no prompt tells a worker to post a comment" "$(cat "$REAL_COMMON/pro
 expect_not "no prompt tells a worker to push" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "git push origin"
 expect "a rendered prompt has no unfilled placeholder" "$(cat "$TMP/state/runs/prompt-7-"*-codex.txt | grep -c '__[A-Z_]*__')" "0"
 
+echo
+echo "TheNightCrew issue hold (opt-in cross-system mutex)"
+cat > "$TMP/common/nightcrew-issue-hold.py" <<'PY'
+import sys
+print(open(sys.argv[0].rsplit("/", 1)[0] + "/hold-state").read().strip())
+PY
+export AGENT_POOL_NIGHTCREW_BOT=night-crew-bot AGENT_POOL_NIGHTCREW_HOLD_SCRIPT="$TMP/common/nightcrew-issue-hold.py"
+
+reset '["agent:ready"]'
+echo busy > "$TMP/common/hold-state"
+behave claude ok
+tick
+expect "no provider is invoked while TheNightCrew holds an issue here" "$(ncalls claude)" "0"
+expect "the PR is left exactly as queued, not claimed" "$(labels)" "agent:ready"
+expect "the hold is logged" "$(cat "$TMP/out.txt")" "TheNightCrew holds an open issue here"
+
+echo clear > "$TMP/common/hold-state"
+tick
+expect "claiming resumes once the hold clears" "$(ncalls claude)" "1"
+expect "the review lands normally" "$(comments)" "pulse-review:v1"
+
+unset AGENT_POOL_NIGHTCREW_BOT AGENT_POOL_NIGHTCREW_HOLD_SCRIPT
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
