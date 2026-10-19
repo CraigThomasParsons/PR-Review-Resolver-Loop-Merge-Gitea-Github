@@ -31,7 +31,7 @@ same() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; 
 ALL_OUTPUT="$TMP/all-output.txt"
 : > "$ALL_OUTPUT"
 
-SECRET="gitea-test-token-91c4e2"
+SECRET="gitea-fixture-$RANDOM$RANDOM$RANDOM"
 TOKEN_FILE="$TMP/gitea_token"
 printf '%s\n' "$SECRET" > "$TOKEN_FILE"
 export NIGHT_SHIFT_GITEA_TOKEN_FILE="$TOKEN_FILE"
