@@ -53,7 +53,11 @@ printf '%s\n' "$@" > "$STUB_STATE/argv"
 cp .cursor/cli.json "$STUB_STATE/cli.json" 2>/dev/null
 echo '{"type":"system","subtype":"init"}'
 case "${STUB_MODE:-commit}" in
-  commit) echo widget > widget.txt; git add widget.txt; git commit -qm "add widget"; echo '{"type":"result","result":"done"}' ;;
+  commit) echo widget > widget.txt; git add widget.txt; git commit -qm "add widget"
+    echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
+    echo '{"type":"result","subtype":"success","result":"done"}' ;;
+  errorresult) echo e > err.txt; git add err.txt; git commit -qm "partial"; echo '{"type":"result","subtype":"error","is_error":true}' ;;
+  shortlimit) echo s > short.txt; git add short.txt; git commit -qm "partial"; echo '{"type":"result","subtype":"success","result":"You have hit your usage limit."}' ;;
   secret) echo x > .env.local; git add .env.local; git commit -qm "oops" ;;
   nocommit) echo '{"type":"result","result":"nothing to do"}' ;;
   limit) echo "You've hit your usage limit. Resets at 3am."; exit 1 ;;
@@ -169,10 +173,21 @@ same "nothing pushed for a credential-shaped filename" "$(remote_has_branch feat
 git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
 
 echo
+echo "clean exit without a successful result"
+STUB_MODE=errorresult run "$PROJECT" 7
+same "exit 0 with an error result -> exit 1" "$CODE" 1
+same "nothing pushed for an error result" "$(remote_has_branch feature/7-nightcrew)" no
+git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
+STUB_MODE=shortlimit run "$PROJECT" 7
+same "exit 0 with a short usage-limit result -> exit 75 even with a commit" "$CODE" 75
+same "nothing pushed for a limit" "$(remote_has_branch feature/7-nightcrew)" no
+git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
+
+echo
 echo "success"
 RECEIPT="$TMP/receipts/job-1.json"
 NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=commit run "$PROJECT" 7
-same "success -> exit 0" "$CODE" 0
+same "success (with a denied compound command along the way) -> exit 0" "$CODE" 0
 same "branch pushed by the launcher" "$(remote_has_branch feature/7-nightcrew)" yes
 same "one PR opened" "$(created_count)" 1
 pr_fields="$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readline()); print(b["head"], b["base"], b["title"], "Closes #7" in b["body"])' "$GITEA/created.jsonl")"

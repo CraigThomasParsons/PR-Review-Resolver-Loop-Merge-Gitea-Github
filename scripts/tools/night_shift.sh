@@ -237,12 +237,42 @@ log "classified — ${VERDICT}"
 # commits the interrupted attempt left on the local branch.
 NEW_COMMITS="$(git -C "$WORKTREE" rev-list --count "origin/${BASE_BRANCH}..HEAD")"
 
-if [ "${VERDICT%%$'\t'*}" = "limit" ] && { [ "$AGENT_EXIT" -ne 0 ] || [ "$NEW_COMMITS" -eq 0 ]; }; then
+CLASS="${VERDICT%%$'\t'*}"
+
+# Any limit parks, even with commits: they stay on the local branch and the rerun after the
+# reset publishes them with whatever the agent still had to do.
+if [ "$CLASS" = "limit" ]; then
   log "PARK: provider limit reached; exiting 75 so this issue is requeued, not failed"
   exit 75
 fi
 if [ "$AGENT_EXIT" -ne 0 ]; then
   log "ERROR agent failed with exit ${AGENT_EXIT}; nothing published"
+  exit 1
+fi
+# A clean exit still needs Cursor's own success result. "setup" is the classifier's verdict for
+# any denied tool call (a compound command, say), which a finished run often carries, so it
+# publishes only when the final result event reports success.
+if [ "$CLASS" = "setup" ]; then
+  if ! "$PYTHON_BIN" - "$AGENT_LOG" <<'PY'
+import json, sys
+results = []
+for line in open(sys.argv[1], errors="replace"):
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    if isinstance(event, dict) and event.get("type") == "result":
+        results.append(event)
+last = results[-1] if results else {}
+sys.exit(0 if results and not last.get("is_error") and last.get("subtype") in (None, "success") else 1)
+PY
+  then
+    log "ERROR agent reported no successful result; nothing published"
+    exit 1
+  fi
+  log "WARN a tool call was denied during the run; its successful result stands"
+elif [ "$CLASS" != "ok" ]; then
+  log "ERROR agent run classified ${CLASS}; nothing published"
   exit 1
 fi
 if [ "$NEW_COMMITS" -eq 0 ]; then
