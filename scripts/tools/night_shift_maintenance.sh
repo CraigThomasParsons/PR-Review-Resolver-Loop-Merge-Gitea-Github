@@ -25,13 +25,19 @@ case "$TASK" in
   quality)
     cd "$PROJECT_DIR"
     failed=0
+    output="$(mktemp)"
+    trap 'rm -f "$output"' EXIT
     for suite in agent-pool/tests/verify-*.sh skills/pr-loops-common/tests/verify-*.sh tests/verify-*.sh \
         scripts/tools/tests/verify-*.sh; do
       [ -f "$suite" ] || continue
-      if bash "$suite" >/dev/null 2>&1; then
+      # A minimal environment: operator variables (AGENT_POOL_*, PROVIDER_ORDER ...) inherited
+      # from the caller change what the suites exercise and fail them with no real defect.
+      if env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C.UTF-8}" \
+          bash "$suite" > "$output" 2>&1; then
         log "ok   ${suite}"
       else
         log "FAIL ${suite}"
+        tail -n 20 "$output"
         failed=1
       fi
     done

@@ -42,7 +42,7 @@ python3 "$ROOT/scripts/tools/tests/fake-gitea.py" "$GITEA" "$SECRET" &
 PIDS+=("$!")
 for _ in $(seq 1 50); do [ -s "$GITEA/port" ] && break; sleep 0.1; done
 export GITEA_BASE_URL="http://127.0.0.1:$(cat "$GITEA/port")"
-printf '{"number": 7, "title": "Add a widget", "body": "Make `widget.txt`. $(touch /tmp/never)"}' > "$GITEA/issue.json"
+printf '{"number": 7, "title": "Add a widget", "body": "Make `widget.txt`. $(touch /tmp/never) Gate: bash agent-pool/tests/verify-widget.sh; not ../../etc/verify-x.sh"}' > "$GITEA/issue.json"
 
 # Stub cursor-agent: records its argv and the cli.json it was given, then acts per STUB_MODE.
 STUB="$TMP/bin/cursor-agent"
@@ -57,6 +57,7 @@ case "${STUB_MODE:-commit}" in
   secret) echo x > .env.local; git add .env.local; git commit -qm "oops" ;;
   nocommit) echo '{"type":"result","result":"nothing to do"}' ;;
   limit) echo "You've hit your usage limit. Resets at 3am."; exit 1 ;;
+  readlimit) echo '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"result":{"success":{"content":"this module is rate-limitable; rate limit 429"}}}}}'; exit 1 ;;
   fail) echo "something broke"; exit 1 ;;
 esac
 SH
@@ -70,9 +71,9 @@ SEED="$TMP/seed"
 mkdir -p "$SEED/scripts/tools" "$SEED/agent-pool/scripts" "$SEED/agent-pool/tests" "$SEED/skills/pr-loops-common"
 cp "$ROOT/scripts/tools/night_shift.sh" "$ROOT/scripts/tools/night_shift_maintenance.sh" \
   "$ROOT/scripts/tools/night_shift_gitea.py" "$SEED/scripts/tools/"
-cp "$ROOT/agent-pool/scripts/policy.py" "$SEED/agent-pool/scripts/"
+cp "$ROOT/agent-pool/scripts/policy.py" "$ROOT/agent-pool/scripts/classify.py" "$SEED/agent-pool/scripts/"
 cp "$ROOT/AGENTS.md" "$SEED/"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$SEED/agent-pool/tests/verify-ok.sh"
+printf '#!/usr/bin/env bash\n[ -z "${AGENT_POOL_MAIN:-}" ]\n' > "$SEED/agent-pool/tests/verify-ok.sh"
 touch "$SEED/skills/pr-loops-common/gitea-pr.py"
 git -C "$SEED" init -q
 git -C "$SEED" add -A
@@ -152,6 +153,8 @@ STUB_MODE=fail run "$PROJECT" 7
 same "agent failure -> exit 1" "$CODE" 1
 case "$OUT" in *"replacing a stale"*) ok "a stale lock file without the flock is replaced" ;; *) bad "stale lock" "$OUT" ;; esac
 same "the replaced lock is removed on exit" "$( [ -e "$PROJECT/logs/night_shift.lock" ] && echo present || echo gone)" gone
+STUB_MODE=readlimit run "$PROJECT" 7
+same "limit wording only in what the worker read -> exit 1, not 75" "$CODE" 1
 STUB_MODE=limit run "$PROJECT" 7
 same "provider limit -> exit 75" "$CODE" 75
 case "$OUT" in *"PARK: provider limit reached"*) ok "limit prints the client's PARK marker" ;; *) bad "PARK marker" "$OUT" ;; esac
@@ -193,11 +196,12 @@ print(bool(adapter_reads) and all(a.startswith(f"Shell(python3 {project}/skills/
       all(x in allow for x in ("Shell(python3 -m unittest)", "Shell(python3 -m behave)",
                                "Shell(bash agent-pool/tests/verify-ok.sh)", "Shell(git commit -m)")),
       "Shell(git push)" in deny, any(d.startswith("Read(") and ".config/pulse" in d for d in deny),
-      any(a.startswith("Shell(python3 -c") or a == "Shell(python3)" for a in allow))
+      any(a.startswith("Shell(python3 -c") or a == "Shell(python3)" for a in allow),
+      "Shell(bash agent-pool/tests/verify-widget.sh)" in allow and not any("etc/verify-x" in a for a in allow))
 PY
 )"
-same "cli.json: project-checkout adapter; tests and commits allowed; push and credential reads denied; no bare python3" \
-  "$cli" "True True True True False"
+same "cli.json: project adapter; tests, commits and issue-named gates allowed; push, credential reads, ../ paths denied" \
+  "$cli" "True True True True False True"
 # Effective decision, as Cursor applies it: allowed only when an allow prefix matches and no deny
 # prefix does. Checked under both readings of "prefix" (whole tokens, and plain string), since
 # a test command a deny rule shadows would leave the worker unable to run its gate.
@@ -270,8 +274,8 @@ OUT="$(bash "$MAINT" "$PROJECT" unknown 2>&1)"; CODE=$?
 same "unknown maintenance task -> exit 2" "$CODE" 2
 OUT="$(bash "$MAINT" "$PROJECT" 2>&1)"; CODE=$?
 same "missing maintenance task -> exit 2" "$CODE" 2
-OUT="$(bash "$MAINT" "$PROJECT" quality 2>&1)"; CODE=$?
-same "quality runs the offline suites -> exit 0" "$CODE" 0
+OUT="$(AGENT_POOL_MAIN=/leaked bash "$MAINT" "$PROJECT" quality 2>&1)"; CODE=$?
+same "quality runs the offline suites without the caller's operator variables -> exit 0" "$CODE" 0
 case "$OUT" in *"ok   agent-pool/tests/verify-ok.sh"*) ok "quality ran the verify suite" ;; *) bad "quality output" "$OUT" ;; esac
 
 echo
