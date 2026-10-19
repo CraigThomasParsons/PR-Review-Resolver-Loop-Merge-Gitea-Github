@@ -239,6 +239,35 @@ NEW_COMMITS="$(git -C "$WORKTREE" rev-list --count "origin/${BASE_BRANCH}..HEAD"
 
 CLASS="${VERDICT%%$'\t'*}"
 
+# classify.py reports "setup" for any denied tool call before it reads limit or result wording,
+# and a finished run often carries a harmless denial (a compound command, say). Classify again
+# without the denial events: a real setup signature (login, unknown model) still reads as setup.
+if [ "$CLASS" = "setup" ]; then
+  FILTERED_LOG="$LOG_DIR/runs/issue-${ISSUE_NUMBER}-agent-without-denials.log"
+  "$PYTHON_BIN" - "$AGENT_LOG" "$FILTERED_LOG" <<'PY'
+import json, sys
+DENIAL_KEYS = {"rejected", "permissionDenied", "denied_actions", "permission_denials"}
+def denied(value):
+    if isinstance(value, dict):
+        return bool(DENIAL_KEYS & value.keys()) or any(denied(item) for item in value.values())
+    if isinstance(value, list):
+        return any(denied(item) for item in value)
+    return False
+with open(sys.argv[1], errors="replace") as source, open(sys.argv[2], "w") as target:
+    for line in source:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if not denied(event):
+            target.write(line)
+PY
+  VERDICT="$("$PYTHON_BIN" "$PROJECT_DIR/agent-pool/scripts/classify.py" --provider cursor --exit "$AGENT_EXIT" \
+    --stdout "$FILTERED_LOG" --stderr "$AGENT_ERR" | cut -f1,2)" || VERDICT="incomplete"
+  log "classified without denied tool calls — ${VERDICT}"
+  CLASS="${VERDICT%%$'\t'*}"
+fi
+
 # Any limit parks, even with commits: they stay on the local branch and the rerun after the
 # reset publishes them with whatever the agent still had to do.
 if [ "$CLASS" = "limit" ]; then
@@ -249,29 +278,8 @@ if [ "$AGENT_EXIT" -ne 0 ]; then
   log "ERROR agent failed with exit ${AGENT_EXIT}; nothing published"
   exit 1
 fi
-# A clean exit still needs Cursor's own success result. "setup" is the classifier's verdict for
-# any denied tool call (a compound command, say), which a finished run often carries, so it
-# publishes only when the final result event reports success.
-if [ "$CLASS" = "setup" ]; then
-  if ! "$PYTHON_BIN" - "$AGENT_LOG" <<'PY'
-import json, sys
-results = []
-for line in open(sys.argv[1], errors="replace"):
-    try:
-        event = json.loads(line)
-    except ValueError:
-        continue
-    if isinstance(event, dict) and event.get("type") == "result":
-        results.append(event)
-last = results[-1] if results else {}
-sys.exit(0 if results and not last.get("is_error") and last.get("subtype") in (None, "success") else 1)
-PY
-  then
-    log "ERROR agent reported no successful result; nothing published"
-    exit 1
-  fi
-  log "WARN a tool call was denied during the run; its successful result stands"
-elif [ "$CLASS" != "ok" ]; then
+# A clean exit still needs the classifier's "ok": Cursor's own final result reports success.
+if [ "$CLASS" != "ok" ]; then
   log "ERROR agent run classified ${CLASS}; nothing published"
   exit 1
 fi

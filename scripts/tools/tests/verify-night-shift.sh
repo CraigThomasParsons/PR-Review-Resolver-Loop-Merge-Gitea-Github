@@ -57,6 +57,13 @@ case "${STUB_MODE:-commit}" in
     echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
     echo '{"type":"result","subtype":"success","result":"done"}' ;;
   errorresult) echo e > err.txt; git add err.txt; git commit -qm "partial"; echo '{"type":"result","subtype":"error","is_error":true}' ;;
+  deniedlimit) echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
+    echo "You've hit your usage limit. Resets at 3am."; exit 1 ;;
+  deniedshortlimit) echo d > denied.txt; git add denied.txt; git commit -qm "partial"
+    echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
+    echo '{"type":"result","subtype":"success","result":"You have hit your usage limit."}' ;;
+  deniedlogin) echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
+    echo "Please run /login to continue"; exit 1 ;;
   shortlimit) echo s > short.txt; git add short.txt; git commit -qm "partial"; echo '{"type":"result","subtype":"success","result":"You have hit your usage limit."}' ;;
   secret) echo x > .env.local; git add .env.local; git commit -qm "oops" ;;
   nocommit) echo '{"type":"result","result":"nothing to do"}' ;;
@@ -182,6 +189,14 @@ STUB_MODE=shortlimit run "$PROJECT" 7
 same "exit 0 with a short usage-limit result -> exit 75 even with a commit" "$CODE" 75
 same "nothing pushed for a limit" "$(remote_has_branch feature/7-nightcrew)" no
 git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
+STUB_MODE=deniedlimit run "$PROJECT" 7
+same "a denied tool call does not hide a provider limit (nonzero exit) -> exit 75" "$CODE" 75
+STUB_MODE=deniedshortlimit run "$PROJECT" 7
+same "a denied tool call does not hide a short usage-limit result (exit 0) -> exit 75" "$CODE" 75
+same "nothing pushed for a limit behind a denial" "$(remote_has_branch feature/7-nightcrew)" no
+git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
+STUB_MODE=deniedlogin run "$PROJECT" 7
+same "a real setup signature behind a denial -> exit 1" "$CODE" 1
 
 echo
 echo "success"
