@@ -18,6 +18,9 @@ cleanup() {
   while read -r pid; do
     [[ "$(ps -o args= -p "$pid" 2>/dev/null)" == "sleep "* ]] && kill "$pid" 2>/dev/null
   done < <(cat "$TMP/stub-pids" 2>/dev/null)
+  while read -r pid; do
+    [[ "$(ps -o args= -p "$pid" 2>/dev/null)" == *fake-nightcrew.py* ]] && kill "$pid" 2>/dev/null
+  done < <(cat "$TMP/server-pids" 2>/dev/null)
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -728,6 +731,137 @@ expect_not "the generic prompts use no Claude-only skill" "$(cat "$REAL_COMMON/p
 expect_not "no prompt tells a worker to post a comment" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "__ADAPTER__ comment "
 expect_not "no prompt tells a worker to push" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "git push origin"
 expect "a rendered prompt has no unfilled placeholder" "$(cat "$TMP/state/runs/prompt-7-"*-codex.txt | grep -c '__[A-Z_]*__')" "0"
+
+echo
+echo "TheNightCrew issue hold (opt-in check against GET /repos/{repo}/issue-hold)"
+# A stub hold script whose behavior is the word in hold-state; every invocation is recorded.
+cat > "$TMP/common/nightcrew-issue-hold.py" <<'PY'
+import os, sys, time
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+open(os.path.join(here, "hold-calls"), "a").write(" ".join(sys.argv[1:]) + "\n")
+mode = open(os.path.join(here, "hold-state")).read().strip()
+if mode == "busy": print("busy")
+elif mode == "clear": print("clear")
+elif mode == "clear-rc1": print("clear"); sys.exit(1)
+elif mode == "clear-twice": print("clear"); print("clear")
+elif mode == "padded": print(" clear")
+elif mode == "crash": sys.exit(1)
+elif mode == "hang": time.sleep(30); print("clear")
+PY
+hold_calls() { if [ -f "$TMP/common/hold-calls" ]; then wc -l < "$TMP/common/hold-calls" | tr -d ' '; else echo 0; fi; }
+hold_reset() { reset '["agent:ready"]'; behave claude ok; rm -f "$TMP/common/hold-calls"; echo "$1" > "$TMP/common/hold-state"; }
+export AGENT_POOL_NIGHTCREW_HOLD_SCRIPT="$TMP/common/nightcrew-issue-hold.py"
+unset AGENT_POOL_NIGHTCREW_HOLD AGENT_POOL_NIGHTCREW_BOT AGENT_POOL_NIGHTCREW_TIMEOUT
+
+hold_reset busy
+tick
+expect "not opted in: the hold check is never run" "$(hold_calls)" "0"
+expect "not opted in: claiming is unaffected" "$(ncalls claude)" "1"
+
+export AGENT_POOL_NIGHTCREW_HOLD=1
+hold_reset busy
+tick
+expect "opted in: the check runs once per tick for this repo" "$(cat "$TMP/common/hold-calls" 2>/dev/null)" "--repo $R"
+expect "no provider is invoked while TheNightCrew reports the repo held" "$(ncalls claude)" "0"
+expect "the PR is left exactly as queued, not claimed" "$(labels)" "agent:ready"
+expect "the hold is logged" "$(cat "$TMP/out.txt")" "TheNightCrew reports active issue/maintenance work"
+
+echo clear > "$TMP/common/hold-state"
+tick
+expect "claiming resumes once the hold is released" "$(ncalls claude)" "1"
+expect "the review lands normally" "$(comments)" "pulse-review:v1"
+
+for mode in crash clear-rc1 clear-twice padded; do
+  hold_reset "$mode"
+  tick
+  expect "a hold check that answers '$mode' claims nothing" "$(ncalls claude)" "0"
+  expect "the PR stays queued after a '$mode' hold check" "$(labels)" "agent:ready"
+  expect "a '$mode' hold check is logged as failing closed" "$(cat "$TMP/out.txt")" "failing closed"
+done
+
+hold_reset clear
+AGENT_POOL_NIGHTCREW_HOLD_SCRIPT="$TMP/common/no-such-hold-script.py" tick
+expect "a missing hold script claims nothing" "$(ncalls claude)" "0"
+
+hold_reset hang
+started=$(date +%s)
+AGENT_POOL_NIGHTCREW_TIMEOUT=1 tick
+expect "a hung hold check claims nothing" "$(ncalls claude)" "0"
+expect "a hung hold check is cut off by the outer bound" "$(( $(date +%s) - started < 20 ))" "1"
+
+hold_reset clear
+AGENT_POOL_NIGHTCREW_TIMEOUT=soon tick
+expect "an invalid AGENT_POOL_NIGHTCREW_TIMEOUT claims nothing" "$(ncalls claude)" "0"
+expect "an invalid timeout is logged" "$(cat "$TMP/out.txt")" "AGENT_POOL_NIGHTCREW_TIMEOUT"
+
+for value in yes on true TRUE ture; do
+  hold_reset busy
+  AGENT_POOL_NIGHTCREW_HOLD="$value" tick
+  expect "AGENT_POOL_NIGHTCREW_HOLD=$value turns the check on" "$(ncalls claude)" "0"
+done
+for value in 0 off false no; do
+  hold_reset busy
+  AGENT_POOL_NIGHTCREW_HOLD="$value" tick
+  expect "AGENT_POOL_NIGHTCREW_HOLD=$value leaves the check off" "$(ncalls claude)" "1"
+done
+
+unset AGENT_POOL_NIGHTCREW_HOLD
+echo "  (upgrade from the Gitea bot-assignee proxy)"
+hold_reset busy
+AGENT_POOL_NIGHTCREW_BOT=night-crew-bot tick
+expect "the old AGENT_POOL_NIGHTCREW_BOT alone still turns the check on" "$(hold_calls)" "1"
+expect "the old variable alone still blocks a held repo" "$(ncalls claude)" "0"
+expect "the old variable is reported as deprecated" "$(cat "$TMP/out.txt")" "AGENT_POOL_NIGHTCREW_BOT is deprecated"
+expect_not "the old bot login is not passed to the new check" "$(cat "$TMP/common/hold-calls" 2>/dev/null)" "night-crew-bot"
+hold_reset busy
+AGENT_POOL_NIGHTCREW_BOT=night-crew-bot AGENT_POOL_NIGHTCREW_HOLD=0 tick
+expect "AGENT_POOL_NIGHTCREW_HOLD=0 cannot switch off a still-set old variable" "$(ncalls claude)" "0"
+
+echo "  (the real hold script, installed layout, loopback fake NightCrew)"
+unset AGENT_POOL_NIGHTCREW_HOLD_SCRIPT
+INSTALLED="$TMP/installed/agent-pool"
+mkdir -p "$INSTALLED"
+cp -R "$ROOT/agent-pool/bin" "$ROOT/agent-pool/scripts" "$INSTALLED/"
+python3 "$ROOT/agent-pool/tests/fake-nightcrew.py" "$TMP/nc.json" "$TMP/nc.log" "$TMP/nc.port" &
+echo $! >> "$TMP/server-pids"
+for _ in $(seq 1 50); do [ -s "$TMP/nc.port" ] && break; sleep 0.1; done
+NC_SECRET="nc-provider-test-token-91c4"
+mkdir -p "$HOME/.config/pulse"
+installed_tick() {
+  AGENT_POOL_COMMON="$REAL_COMMON" AGENT_POOL_NIGHTCREW_HOLD=1 \
+    AGENT_POOL_NIGHTCREW_URL="http://127.0.0.1:$(cat "$TMP/nc.port")/api" \
+    bash "$INSTALLED/bin/prod-common.sh" > "$TMP/out.txt" 2>&1
+}
+nc_answer() { printf '{"status": %s, "body": %s}' "$1" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2")" > "$TMP/nc.json"; : > "$TMP/nc.log"; }
+
+hold_reset unused
+nc_answer 200 "{\"repo\": \"$R\", \"held\": false}"
+installed_tick
+expect "no Worker token file: nothing is claimed" "$(ncalls claude)" "0"
+expect "no Worker token file: no request is sent" "$(wc -l < "$TMP/nc.log" | tr -d ' ')" "0"
+printf '%s\n' "$NC_SECRET" > "$HOME/.config/pulse/night_crew_token"
+
+hold_reset unused
+nc_answer 200 "{\"repo\": \"$R\", \"held\": true}"
+installed_tick
+expect "installed: a held repo claims nothing" "$(ncalls claude)" "0"
+expect "installed: the endpoint is asked for this repo" "$(cat "$TMP/nc.log")" "\"path\": \"/api/repos/$R/issue-hold\""
+expect "installed: with the Worker token as a bearer" "$(cat "$TMP/nc.log")" "\"authorization\": \"Bearer $NC_SECRET\""
+nc_answer 200 "{\"repo\": \"$R\", \"held\": false}"
+installed_tick
+expect "installed: the released repo is claimed on the next tick" "$(ncalls claude)" "1"
+
+for answer in "401|{\"repo\": \"$R\", \"held\": false}" "403|{\"repo\": \"$R\", \"held\": false}" \
+              "500|{\"repo\": \"$R\", \"held\": false}" "200|{\"repo\": \"owner/other\", \"held\": false}" \
+              "200|{\"repo\": \"$R\", \"held\": \"false\"}" "200|{\"repo\": \"$R\"}" "200|not json"; do
+  hold_reset unused
+  nc_answer "${answer%%|*}" "${answer#*|}"
+  installed_tick
+  expect "installed: HTTP ${answer%%|*} ${answer#*|} claims nothing" "$(ncalls claude)" "0"
+done
+expect_not "installed: the Worker token never reaches the pool log" "$(cat "$TMP/state/pool.log" "$TMP/out.txt" 2>/dev/null)" "$NC_SECRET"
+
+unset AGENT_POOL_NIGHTCREW_HOLD AGENT_POOL_NIGHTCREW_BOT AGENT_POOL_NIGHTCREW_TIMEOUT
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

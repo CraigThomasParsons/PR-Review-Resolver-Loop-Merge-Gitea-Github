@@ -65,6 +65,26 @@
 #   AGENT_POOL_TIMEOUT_COOLDOWN=900    a timed-out provider pauses this long (no strike); the job
 #                                      falls through to the next provider
 #   AGENT_POOL_HOLD_LABELS="status: in-progress"   extra labels that read as a hold
+#   AGENT_POOL_NIGHTCREW_HOLD=1    for a repo shared with TheNightCrew: before claiming, ask its
+#                                  GET <api>/repos/<repo>/issue-hold (scripts/nightcrew-issue-hold.py)
+#                                  and claim nothing this tick unless the answer is exactly
+#                                  clear. Any failure (no token, HTTP error, timeout, bad answer,
+#                                  a crashed or hung check) also claims nothing. Unset, 0, off,
+#                                  false or no (default): no check -- most repos aren't shared.
+#                                  Any other value turns it on.
+#   AGENT_POOL_NIGHTCREW_URL       the NightCrew API base including /api (else NIGHT_CREW_URL,
+#                                  else http://localhost:8771/api)
+#   AGENT_POOL_NIGHTCREW_TOKEN_FILE  file holding a NightCrew Worker token whose served_repos
+#                                  include this repo (default ~/.config/pulse/night_crew_token)
+#   AGENT_POOL_NIGHTCREW_TIMEOUT=10  seconds per request; the whole check is cut off at 2x+3
+#                                  The answer is a snapshot, not a cross-system mutex: an issue
+#                                  job TheNightCrew claims right after a clear answer still
+#                                  overlaps, so TheNightCrew's own ClaimNextJob::blockReason and
+#                                  this pool's claim records both stay in force.
+#   AGENT_POOL_NIGHTCREW_BOT       deprecated (the old Gitea bot-assignee proxy, now removed).
+#                                  Still set, it turns the endpoint check on, even over
+#                                  AGENT_POOL_NIGHTCREW_HOLD=0, and logs a warning each tick;
+#                                  replace it with AGENT_POOL_NIGHTCREW_HOLD=1 plus a Worker token.
 #   AGENT_POOL_PROTECTED_BRANCHES=develop,main,master,release   never pushed to (nor release/*)
 #   AGENT_POOL_BOT                 the pool's Gitea login; any other assignee is a human hold
 #   AGENT_POOL_MODEL_<PROVIDER>    model per provider (claude=opus cursor=auto grok=grok-build;
@@ -125,6 +145,16 @@ READY="${AGENT_POOL_LABEL_READY:-agent:ready}"
 CLAIMED="${AGENT_POOL_LABEL_CLAIMED:-agent:claimed}"
 DONE="${AGENT_POOL_LABEL_DONE:-agent:done}"
 HUMAN="${AGENT_POOL_LABEL_NEEDS_HUMAN:-agent:needs-human}"
+# Opt-in per repo, since most repos this pool runs against aren't tracked by TheNightCrew. Only
+# the explicit off words disable it, so a typo cannot silently drop the protection.
+NIGHTCREW_LEGACY_BOT="${AGENT_POOL_NIGHTCREW_BOT:-}"
+case "$(printf '%s' "${AGENT_POOL_NIGHTCREW_HOLD:-}" | tr '[:upper:]' '[:lower:]')" in
+  ""|0|off|false|no) NIGHTCREW_CHECK=0 ;;
+  *) NIGHTCREW_CHECK=1 ;;
+esac
+[ -n "$NIGHTCREW_LEGACY_BOT" ] && NIGHTCREW_CHECK=1
+NIGHTCREW_TIMEOUT="${AGENT_POOL_NIGHTCREW_TIMEOUT:-10}"
+NIGHTCREW_HOLD_SCRIPT="${AGENT_POOL_NIGHTCREW_HOLD_SCRIPT:-$SCRIPTS/nightcrew-issue-hold.py}"
 PROTECTED="${AGENT_POOL_PROTECTED_BRANCHES:-develop,main,master,release}"
 NOPUSH_URL="/nonexistent/agent-pool-workers-never-push"
 CONTEXT_FILE=".agent-pool-context.md"
@@ -760,6 +790,33 @@ fi
 mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 [ "${#CANDIDATES[@]}" -eq 0 ] && { log "no open PR in $REPO carries $READY or $CLAIMED"; exit 0; }
 
+# One check per tick, not per PR -- every candidate below is in the same repo. Nothing else
+# in agent-pool-core shares state with TheNightCrew's issue/maintenance job board; this is the
+# one place the two systems' claims on the same repo could otherwise collide.
+NIGHTCREW_HOLD=0
+if [ "$NIGHTCREW_CHECK" = 1 ]; then
+  [ -n "$NIGHTCREW_LEGACY_BOT" ] && log "AGENT_POOL_NIGHTCREW_BOT is deprecated and no longer read as a bot login;" \
+    "the NightCrew issue-hold endpoint check is on because it is set. Replace it with AGENT_POOL_NIGHTCREW_HOLD=1."
+  # Only exit 0 with exactly "clear" lets claiming go on; a crash, a hang, a nonzero exit or
+  # any other output reads as held.
+  hold_out="" hold_rc=0
+  if [[ "$NIGHTCREW_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]]; then
+    hold_out="$(timeout -k 5 "$(( NIGHTCREW_TIMEOUT * 2 + 3 ))" python3 "$NIGHTCREW_HOLD_SCRIPT" --repo "$REPO" \
+      --timeout "$NIGHTCREW_TIMEOUT" 2>>"$LOG")" || hold_rc=$?
+  else
+    hold_rc=2
+    log "AGENT_POOL_NIGHTCREW_TIMEOUT must be whole seconds from 1 to 999"
+  fi
+  if [ "$hold_rc" -ne 0 ] || [ "$hold_out" != "clear" ]; then
+    NIGHTCREW_HOLD=1
+    if [ "$hold_rc" -eq 0 ] && [ "$hold_out" = "busy" ]; then
+      log "$REPO: TheNightCrew reports active issue/maintenance work here; no PR claimed this tick"
+    else
+      log "$REPO: TheNightCrew issue-hold check failed (exit $hold_rc); failing closed, no PR claimed this tick"
+    fi
+  fi
+fi
+
 # reconcile_pr pr -> 0 to go on considering the PR (labels may have become ready), 1 to skip it.
 reconcile_pr() {
   local out st aid prov info f mark
@@ -802,6 +859,7 @@ for row in "${CANDIDATES[@]}"; do
     [ "$RECONCILED_READY" = 1 ] && labels="${labels//\"$CLAIMED\"/\"$READY\"}"
   fi
   [[ "$labels" == *"\"$READY\""* ]] || continue
+  if [ "$NIGHTCREW_HOLD" = 1 ]; then continue; fi
   hold="$(JOB_PR="$pr" claim hold --labels "$labels" --assignees "$assignees" --hold-labels "$EXTRA_HOLD" --bot "$BOT" 2>>"$LOG")"
   state="${hold%%$'\t'*}"; why="${hold#*$'\t'}"
   remove="$READY"
