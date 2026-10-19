@@ -747,6 +747,9 @@ elif mode == "clear-twice": print("clear"); print("clear")
 elif mode == "padded": print(" clear")
 elif mode == "crash": sys.exit(1)
 elif mode == "hang": time.sleep(30); print("clear")
+elif mode == "clear-then-busy":
+    n = sum(1 for _ in open(os.path.join(here, "hold-calls")))
+    print("clear" if n <= 2 else "busy")
 PY
 hold_calls() { if [ -f "$TMP/common/hold-calls" ]; then wc -l < "$TMP/common/hold-calls" | tr -d ' '; else echo 0; fi; }
 hold_reset() { reset '["agent:ready"]'; behave claude ok; rm -f "$TMP/common/hold-calls"; echo "$1" > "$TMP/common/hold-state"; }
@@ -770,6 +773,28 @@ echo clear > "$TMP/common/hold-state"
 tick
 expect "claiming resumes once the hold is released" "$(ncalls claude)" "1"
 expect "the review lands normally" "$(comments)" "pulse-review:v1"
+
+echo "  (a cached clear from before the first claim must not cover the second, Codex PR #13)"
+hold_reset clear-then-busy
+python3 - "$STUB_GITEA" <<'PY'
+import json, sys
+path = sys.argv[1]
+st = json.load(open(path))
+st["prs"]["8"] = dict(st["prs"]["7"], labels=["agent:ready"], comments=[])
+st["prs"]["9"] = dict(st["prs"]["7"], labels=["agent:ready"], comments=[])
+json.dump(st, open(path, "w"))
+PY
+tick
+expect "the first job still claims and runs (hold was clear)" "$(ncalls claude)" "1"
+expect "pr 7 ran and requeued for resolve (review with findings, not a crash or a skip)" \
+  "$(python3 "$STUB_ADAPTER" comments --repo $R --pr 7)" "pulse-review:v1"
+expect "pr 8 was never touched -- skipped before any provider ran" \
+  "$(python3 "$STUB_ADAPTER" comments --repo $R --pr 8)" "[]"
+expect "pr 8 is skipped (hold went busy between claims, not cached from tick start)" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prs"]["8"]["labels"])' "$STUB_GITEA")" "agent:ready"
+expect "the rechecked skip is logged" "$(cat "$TMP/out.txt")" "rechecked before claim"
+expect "pr 9 was never touched either" "$(python3 "$STUB_ADAPTER" comments --repo "$R" --pr 9)" "[]"
+expect "the check ran three times: the early filter, job 1, then job 2's busy answer stops the rest" "$(hold_calls)" "3"
 
 for mode in crash clear-rc1 clear-twice padded; do
   hold_reset "$mode"

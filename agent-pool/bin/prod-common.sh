@@ -65,9 +65,9 @@
 #   AGENT_POOL_TIMEOUT_COOLDOWN=900    a timed-out provider pauses this long (no strike); the job
 #                                      falls through to the next provider
 #   AGENT_POOL_HOLD_LABELS="status: in-progress"   extra labels that read as a hold
-#   AGENT_POOL_NIGHTCREW_HOLD=1    for a repo shared with TheNightCrew: before claiming, ask its
+#   AGENT_POOL_NIGHTCREW_HOLD=1    for a repo shared with TheNightCrew: before each claim, ask its
 #                                  GET <api>/repos/<repo>/issue-hold (scripts/nightcrew-issue-hold.py)
-#                                  and claim nothing this tick unless the answer is exactly
+#                                  and claim nothing more this tick unless the answer is exactly
 #                                  clear. Any failure (no token, HTTP error, timeout, bad answer,
 #                                  a crashed or hung check) also claims nothing. Unset, 0, off,
 #                                  false or no (default): no check -- most repos aren't shared.
@@ -790,16 +790,20 @@ fi
 mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 [ "${#CANDIDATES[@]}" -eq 0 ] && { log "no open PR in $REPO carries $READY or $CLAIMED"; exit 0; }
 
-# One check per tick, not per PR -- every candidate below is in the same repo. Nothing else
-# in agent-pool-core shares state with TheNightCrew's issue/maintenance job board; this is the
-# one place the two systems' claims on the same repo could otherwise collide.
-NIGHTCREW_HOLD=0
-if [ "$NIGHTCREW_CHECK" = 1 ]; then
-  [ -n "$NIGHTCREW_LEGACY_BOT" ] && log "AGENT_POOL_NIGHTCREW_BOT is deprecated and no longer read as a bot login;" \
-    "the NightCrew issue-hold endpoint check is on because it is set. Replace it with AGENT_POOL_NIGHTCREW_HOLD=1."
+# Every candidate below is in the same repo, so a cheap first pass here skips the whole tick
+# early when already busy. It is NOT the real gate: MAX_JOBS can run more than one job per
+# tick, each up to WORKER_TIMEOUT long, and NightCrew can start a job in that window, so a
+# result cached from before the first claim would otherwise go stale before the second. Nothing
+# else in agent-pool-core shares state with TheNightCrew's issue/maintenance job board; this is
+# the one place the two systems' claims on the same repo could otherwise collide.
+#
+# nightcrew_busy asks fresh every time it is called -- here once up front, and again,
+# immediately before each real claim below (Codex adversarial review, PR #13).
+nightcrew_busy() {
+  [ "$NIGHTCREW_CHECK" = 1 ] || return 1
   # Only exit 0 with exactly "clear" lets claiming go on; a crash, a hang, a nonzero exit or
   # any other output reads as held.
-  hold_out="" hold_rc=0
+  local hold_out="" hold_rc=0
   if [[ "$NIGHTCREW_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]]; then
     hold_out="$(timeout -k 5 "$(( NIGHTCREW_TIMEOUT * 2 + 3 ))" python3 "$NIGHTCREW_HOLD_SCRIPT" --repo "$REPO" \
       --timeout "$NIGHTCREW_TIMEOUT" 2>>"$LOG")" || hold_rc=$?
@@ -808,14 +812,19 @@ if [ "$NIGHTCREW_CHECK" = 1 ]; then
     log "AGENT_POOL_NIGHTCREW_TIMEOUT must be whole seconds from 1 to 999"
   fi
   if [ "$hold_rc" -ne 0 ] || [ "$hold_out" != "clear" ]; then
-    NIGHTCREW_HOLD=1
     if [ "$hold_rc" -eq 0 ] && [ "$hold_out" = "busy" ]; then
-      log "$REPO: TheNightCrew reports active issue/maintenance work here; no PR claimed this tick"
+      log "$REPO: TheNightCrew reports active issue/maintenance work here"
     else
-      log "$REPO: TheNightCrew issue-hold check failed (exit $hold_rc); failing closed, no PR claimed this tick"
+      log "$REPO: TheNightCrew issue-hold check failed (exit $hold_rc); failing closed"
     fi
+    return 0
   fi
-fi
+  return 1
+}
+[ "$NIGHTCREW_CHECK" = 1 ] && [ -n "$NIGHTCREW_LEGACY_BOT" ] && log "AGENT_POOL_NIGHTCREW_BOT is deprecated and no longer read as a bot login;" \
+  "the NightCrew issue-hold endpoint check is on because it is set. Replace it with AGENT_POOL_NIGHTCREW_HOLD=1."
+NIGHTCREW_HOLD=0
+nightcrew_busy && { NIGHTCREW_HOLD=1; log "$REPO: no PR claimed this tick"; }
 
 # reconcile_pr pr -> 0 to go on considering the PR (labels may have become ready), 1 to skip it.
 reconcile_pr() {
@@ -894,6 +903,13 @@ for row in "${QUEUE[@]}"; do
   if [ "$DRY_RUN" = 1 ]; then
     log "DRY: would claim $REPO#$pr at $sha for $job with providers ${JOB_PROVIDERS[*]}"
   else
+    if nightcrew_busy; then
+      # One busy answer settles it for the rest of the tick: no more provider jobs, so no more
+      # checks (each can cost up to 2 * AGENT_POOL_NIGHTCREW_TIMEOUT + 3 s failing closed).
+      log "$REPO#$pr: TheNightCrew holds this repo (rechecked before claim); skipping, only settling from here"
+      stopped=1
+      continue
+    fi
     run_job "$pr" "$headref" "$sha" "$base" "$job" "$vbase" "$rhead" "$nfind" "$remove" "${JOB_PROVIDERS[@]}"
     drop_cooling_providers
     [ "${#PROVIDERS[@]}" -eq 0 ] && { log "every provider is cooling down; only settling from here"; stopped=1; }
