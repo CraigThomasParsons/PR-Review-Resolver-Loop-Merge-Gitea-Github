@@ -55,7 +55,7 @@ echo '{"type":"system","subtype":"init"}'
 case "${STUB_MODE:-commit}" in
   commit) echo widget > widget.txt; git add widget.txt; git commit -qm "add widget"
     echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
-    echo '{"type":"result","subtype":"success","result":"done"}' ;;
+    echo '{"type":"result","subtype":"success","result":"done","permission_denials":[]}' ;;
   errorresult) echo e > err.txt; git add err.txt; git commit -qm "partial"; echo '{"type":"result","subtype":"error","is_error":true}' ;;
   deniedlimit) echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
     echo "You've hit your usage limit. Resets at 3am."; exit 1 ;;
@@ -63,7 +63,7 @@ case "${STUB_MODE:-commit}" in
     echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
     echo '{"type":"result","subtype":"success","result":"You have hit your usage limit."}' ;;
   deniedlogin) echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
-    echo "Please run /login to continue"; exit 1 ;;
+    echo "Error: not logged in"; exit 1 ;;
   shortlimit) echo s > short.txt; git add short.txt; git commit -qm "partial"; echo '{"type":"result","subtype":"success","result":"You have hit your usage limit."}' ;;
   secret) echo x > .env.local; git add .env.local; git commit -qm "oops" ;;
   nocommit) echo '{"type":"result","result":"nothing to do"}' ;;
@@ -197,6 +197,8 @@ same "nothing pushed for a limit behind a denial" "$(remote_has_branch feature/7
 git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
 STUB_MODE=deniedlogin run "$PROJECT" 7
 same "a real setup signature behind a denial -> exit 1" "$CODE" 1
+case "$OUT" in *"classified without denied tool calls — setup"*) ok "the setup signature survives the second classification" ;;
+  *) bad "setup behind a denial" "$OUT" ;; esac
 
 echo
 echo "success"

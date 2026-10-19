@@ -244,22 +244,20 @@ CLASS="${VERDICT%%$'\t'*}"
 # without the denial events: a real setup signature (login, unknown model) still reads as setup.
 if [ "$CLASS" = "setup" ]; then
   FILTERED_LOG="$LOG_DIR/runs/issue-${ISSUE_NUMBER}-agent-without-denials.log"
-  "$PYTHON_BIN" - "$AGENT_LOG" "$FILTERED_LOG" <<'PY'
+  # The classifier's own denials() decides what to drop, so an empty denial field (a success
+  # result carrying "permission_denials": []) is kept exactly as the classifier would count it.
+  "$PYTHON_BIN" - "$PROJECT_DIR/agent-pool/scripts" "$AGENT_LOG" "$FILTERED_LOG" <<'PY'
 import json, sys
-DENIAL_KEYS = {"rejected", "permissionDenied", "denied_actions", "permission_denials"}
-def denied(value):
-    if isinstance(value, dict):
-        return bool(DENIAL_KEYS & value.keys()) or any(denied(item) for item in value.values())
-    if isinstance(value, list):
-        return any(denied(item) for item in value)
-    return False
-with open(sys.argv[1], errors="replace") as source, open(sys.argv[2], "w") as target:
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+from classify import denials
+with open(sys.argv[2], errors="replace") as source, open(sys.argv[3], "w") as target:
     for line in source:
         try:
             event = json.loads(line)
         except ValueError:
             event = None
-        if not denied(event):
+        if next(denials(event), None) is None:
             target.write(line)
 PY
   VERDICT="$("$PYTHON_BIN" "$PROJECT_DIR/agent-pool/scripts/classify.py" --provider cursor --exit "$AGENT_EXIT" \
