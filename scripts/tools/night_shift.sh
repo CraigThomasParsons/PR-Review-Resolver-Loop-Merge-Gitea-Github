@@ -25,6 +25,9 @@ set -euo pipefail
 USAGE="Usage: night_shift.sh <project_dir> <issue_number> [agent]"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[night_shift] $(ts) $*"; }
+# Any step set -e stops on (fetch, policy, open-pr, receipt...) is logged here and exits 1, so the
+# client log names the failure and exit 2/3/75 keep the meanings the header gives them.
+trap 'rc=$?; log "ERROR line ${LINENO}: a launcher step failed with exit ${rc}; nothing further done"; exit 1' ERR
 
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
   log "ABORT — ${USAGE}"
@@ -220,11 +223,10 @@ ${ISSUE_CONTEXT}"
 AGENT_LOG="$LOG_DIR/night_shift_agent.log"
 AGENT_ERR="$LOG_DIR/night_shift_agent.err"
 log "launching cursor-agent (timeout ${AGENT_TIMEOUT}s); output in ${AGENT_LOG}"
-set +e
+# A failing agent is classified below, so its status is captured on an || list the ERR trap skips.
+AGENT_EXIT=0
 (cd "$WORKTREE" && timeout --kill-after=60 "$AGENT_TIMEOUT" "$CURSOR_AGENT_BIN" -p --trust --workspace "$WORKTREE" \
-  --output-format stream-json --model "$MODEL" "$PROMPT") > "$AGENT_LOG" 2> "$AGENT_ERR"
-AGENT_EXIT=$?
-set -e
+  --output-format stream-json --model "$MODEL" "$PROMPT") > "$AGENT_LOG" 2> "$AGENT_ERR" || AGENT_EXIT=$?
 log "agent exited ${AGENT_EXIT}"
 tail -n 20 "$AGENT_LOG" | cut -c1-400 || true
 

@@ -68,6 +68,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        if (STATE / "post-fails").exists():
+            self.reply(409, {"message": "pull request already exists"})
+            return
         with (STATE / "created.jsonl").open("a") as created:
             created.write(json.dumps(body) + "\n")
         self.reply(201, {"number": 99, "html_url": "http://gitea.test/owner/repo/pulls/99"})

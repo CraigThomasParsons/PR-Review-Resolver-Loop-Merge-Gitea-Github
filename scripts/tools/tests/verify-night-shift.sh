@@ -212,6 +212,18 @@ same "no PR opened after a rejected push" "$(created_count)" 0
 git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
 
 echo
+echo "PR creation fails after the push"
+touch "$GITEA/post-fails"
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/failed-pr.json" STUB_MODE=commit run "$PROJECT" 7
+rm -f "$GITEA/post-fails"
+same "a failed PR creation -> exit 1" "$CODE" 1
+case "$OUT" in *"[night_shift] "*"ERROR line "*"failed with exit 1"*) ok "the failed step is logged by the launcher" ;; *) bad "failed step log" "$OUT" ;; esac
+same "no receipt without a PR" "$( [ -e "$TMP/receipts/failed-pr.json" ] && echo written || echo none)" none
+same "the lock file is removed after a failed step" "$( [ -e "$PROJECT/logs/night_shift.lock" ] && echo present || echo gone)" gone
+git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
+git -C "$TMP/origin.git" branch -D feature/7-nightcrew >/dev/null 2>&1
+
+echo
 echo "success"
 RECEIPT="$TMP/receipts/job-1.json"
 NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=commit run "$PROJECT" 7
