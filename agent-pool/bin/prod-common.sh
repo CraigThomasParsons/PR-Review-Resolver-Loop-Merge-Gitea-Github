@@ -904,7 +904,10 @@ for row in "${QUEUE[@]}"; do
     log "DRY: would claim $REPO#$pr at $sha for $job with providers ${JOB_PROVIDERS[*]}"
   else
     if nightcrew_busy; then
-      log "$REPO#$pr: TheNightCrew holds this repo (rechecked before claim); skipping"
+      # One busy answer settles it for the rest of the tick: no more provider jobs, so no more
+      # checks (each can cost up to 2 * AGENT_POOL_NIGHTCREW_TIMEOUT + 3 s failing closed).
+      log "$REPO#$pr: TheNightCrew holds this repo (rechecked before claim); skipping, only settling from here"
+      stopped=1
       continue
     fi
     run_job "$pr" "$headref" "$sha" "$base" "$job" "$vbase" "$rhead" "$nfind" "$remove" "${JOB_PROVIDERS[@]}"

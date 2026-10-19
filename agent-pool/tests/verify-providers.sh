@@ -781,6 +781,7 @@ import json, sys
 path = sys.argv[1]
 st = json.load(open(path))
 st["prs"]["8"] = dict(st["prs"]["7"], labels=["agent:ready"], comments=[])
+st["prs"]["9"] = dict(st["prs"]["7"], labels=["agent:ready"], comments=[])
 json.dump(st, open(path, "w"))
 PY
 tick
@@ -792,7 +793,8 @@ expect "pr 8 was never touched -- skipped before any provider ran" \
 expect "pr 8 is skipped (hold went busy between claims, not cached from tick start)" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prs"]["8"]["labels"])' "$STUB_GITEA")" "agent:ready"
 expect "the rechecked skip is logged" "$(cat "$TMP/out.txt")" "rechecked before claim"
-expect "the check ran three times: the early filter, then once per real claim attempted" "$(hold_calls)" "3"
+expect "pr 9 was never touched either" "$(python3 "$STUB_ADAPTER" comments --repo "$R" --pr 9)" "[]"
+expect "the check ran three times: the early filter, job 1, then job 2's busy answer stops the rest" "$(hold_calls)" "3"
 
 for mode in crash clear-rc1 clear-twice padded; do
   hold_reset "$mode"
