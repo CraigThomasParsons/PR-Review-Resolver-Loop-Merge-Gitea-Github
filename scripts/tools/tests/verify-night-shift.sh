@@ -55,7 +55,7 @@ echo '{"type":"system","subtype":"init"}'
 case "${STUB_MODE:-commit}" in
   commit) echo widget > widget.txt; git add widget.txt; git commit -qm "add widget"
     echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
-    echo '{"type":"result","subtype":"success","result":"done","permission_denials":[]}' ;;
+    echo '{"type":"result","subtype":"success","result":"done","permission_denials":[{"tool_name":"Shell","command":"a; b"}]}' ;;
   errorresult) echo e > err.txt; git add err.txt; git commit -qm "partial"; echo '{"type":"result","subtype":"error","is_error":true}' ;;
   deniedlimit) echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"a; b"}}}}}'
     echo "You've hit your usage limit. Resets at 3am."; exit 1 ;;
@@ -201,6 +201,17 @@ case "$OUT" in *"classified without denied tool calls — setup"*) ok "the setup
   *) bad "setup behind a denial" "$OUT" ;; esac
 
 echo
+echo "push rejected"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/origin.git/hooks/pre-receive"
+chmod +x "$TMP/origin.git/hooks/pre-receive"
+STUB_MODE=commit run "$PROJECT" 7
+rm -f "$TMP/origin.git/hooks/pre-receive"
+same "a rejected push -> exit 1" "$CODE" 1
+case "$OUT" in *"ERROR push of feature/7-nightcrew rejected"*) ok "a rejected push is logged" ;; *) bad "push rejected log" "$OUT" ;; esac
+same "no PR opened after a rejected push" "$(created_count)" 0
+git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
+
+echo
 echo "success"
 RECEIPT="$TMP/receipts/job-1.json"
 NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=commit run "$PROJECT" 7
@@ -218,6 +229,7 @@ argv="$(tr '\n' ' ' < "$STUB_STATE/argv")"
 case "$argv" in *"-p --trust --workspace $PROJECT/logs/worktrees/issue-7 --output-format stream-json --model auto"*) ok "cursor-agent gets -p --trust --workspace --model" ;; *) bad "cursor argv" "$argv" ;; esac
 case "$argv" in *"--force"*|*"--yolo"*) bad "no --force" "$argv" ;; *) ok "cursor-agent never gets --force" ;; esac
 case "$argv" in *'$(touch /tmp/never)'*) ok "issue text reaches the prompt as data" ;; *) bad "issue text in prompt" "missing" ;; esac
+case "$argv" in *"verify-*.sh script that exists in this worktree"*) ok "the prompt names the gates the allow list grants" ;; *) bad "prompt gate wording" "missing" ;; esac
 cli="$(python3 - "$STUB_STATE/cli.json" "$(cd "$PROJECT" && pwd -P)" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1]))["permissions"]
