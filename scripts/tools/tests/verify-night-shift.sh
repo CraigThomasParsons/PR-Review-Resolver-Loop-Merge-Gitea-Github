@@ -126,6 +126,18 @@ same "the lock file is removed after a refusal" "$( [ -e "$PROJECT/logs/night_sh
 rm -f "$PROJECT/scratch.txt"
 
 echo
+echo "dirty leftover worktree"
+git -C "$PROJECT" worktree add -q --detach "$PROJECT/logs/worktrees/issue-7" origin/master
+echo "unsaved work" > "$PROJECT/logs/worktrees/issue-7/unsaved.txt"
+run "$PROJECT" 7
+same "a dirty leftover worktree -> exit 1" "$CODE" 1
+case "$OUT" in *"Unowned worktree exists"*) ok "the leftover worktree is reported" ;; *) bad "leftover report" "$OUT" ;; esac
+same "the leftover's uncommitted work survives the abort" \
+  "$(cat "$PROJECT/logs/worktrees/issue-7/unsaved.txt" 2>/dev/null)" "unsaved work"
+same "no agent ran beside a leftover worktree" "$( [ -e "$STUB_STATE/argv" ] && echo ran || echo none)" none
+git -C "$PROJECT" worktree remove --force "$PROJECT/logs/worktrees/issue-7"
+
+echo
 echo "agent exits 0 without a commit"
 STUB_MODE=nocommit run "$PROJECT" 7
 same "no commit -> exit 1" "$CODE" 1
@@ -171,17 +183,21 @@ argv="$(tr '\n' ' ' < "$STUB_STATE/argv")"
 case "$argv" in *"-p --trust --workspace $PROJECT/logs/worktrees/issue-7 --output-format stream-json --model auto"*) ok "cursor-agent gets -p --trust --workspace --model" ;; *) bad "cursor argv" "$argv" ;; esac
 case "$argv" in *"--force"*|*"--yolo"*) bad "no --force" "$argv" ;; *) ok "cursor-agent never gets --force" ;; esac
 case "$argv" in *'$(touch /tmp/never)'*) ok "issue text reaches the prompt as data" ;; *) bad "issue text in prompt" "missing" ;; esac
-cli="$(python3 - "$STUB_STATE/cli.json" <<'PY'
+cli="$(python3 - "$STUB_STATE/cli.json" "$(cd "$PROJECT" && pwd -P)" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1]))["permissions"]
 allow, deny = p["allow"], p["deny"]
-print(all(x in allow for x in ("Shell(python3 -m unittest)", "Shell(python3 -m behave)",
+project = sys.argv[2]
+adapter_reads = [a for a in allow if "gitea-pr.py" in a]
+print(bool(adapter_reads) and all(a.startswith(f"Shell(python3 {project}/skills/") for a in adapter_reads),
+      all(x in allow for x in ("Shell(python3 -m unittest)", "Shell(python3 -m behave)",
                                "Shell(bash agent-pool/tests/verify-ok.sh)", "Shell(git commit -m)")),
       "Shell(git push)" in deny, any(d.startswith("Read(") and ".config/pulse" in d for d in deny),
       any(a.startswith("Shell(python3 -c") or a == "Shell(python3)" for a in allow))
 PY
 )"
-same "cli.json allows tests and commits, denies push and credential reads, no bare python3" "$cli" "True True True False"
+same "cli.json: project-checkout adapter; tests and commits allowed; push and credential reads denied; no bare python3" \
+  "$cli" "True True True True False"
 # Effective decision, as Cursor applies it: allowed only when an allow prefix matches and no deny
 # prefix does. Checked under both readings of "prefix" (whole tokens, and plain string), since
 # a test command a deny rule shadows would leave the worker unable to run its gate.
