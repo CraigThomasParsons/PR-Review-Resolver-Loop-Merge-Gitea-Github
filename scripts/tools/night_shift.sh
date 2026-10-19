@@ -80,6 +80,11 @@ if ! flock -n 9; then
   log "ABORT — Another issue is already locked for ${PROJECT_DIR}"
   exit 3
 fi
+# Holding the flock proves no shift is running: a lock file left by a hard-killed launcher
+# (SIGKILL, OOM, power loss skip the trap) is stale and replaced here.
+if [ -e "$SHIFT_LOCK" ]; then
+  log "WARN replacing a stale ${SHIFT_LOCK} left by a launcher that did not exit cleanly"
+fi
 printf '{"pid": %s, "issue": %s, "branch": "%s"}\n' "$$" "$ISSUE_NUMBER" "$BRANCH" > "$SHIFT_LOCK"
 
 WORKTREE="$LOG_DIR/worktrees/issue-${ISSUE_NUMBER}"
@@ -122,6 +127,16 @@ fi
 git -C "$PROJECT_DIR" worktree prune
 mkdir -p "$(dirname "$WORKTREE")"
 if git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+  # Reconcile before the agent runs, not at push time: a remote branch that moved on (resolve
+  # fixes pushed to the PR) fast-forwards the local one; a diverged pair needs a human.
+  if [ "$REMOTE_BRANCH" = 1 ]; then
+    if git -C "$PROJECT_DIR" merge-base --is-ancestor "refs/heads/${BRANCH}" "origin/${BRANCH}"; then
+      git -C "$PROJECT_DIR" branch -q -f "$BRANCH" "origin/${BRANCH}"
+    elif ! git -C "$PROJECT_DIR" merge-base --is-ancestor "origin/${BRANCH}" "refs/heads/${BRANCH}"; then
+      log "ABORT — local ${BRANCH} and origin/${BRANCH} have diverged; reconcile them by hand"
+      exit 1
+    fi
+  fi
   git -C "$PROJECT_DIR" worktree add -q "$WORKTREE" "$BRANCH"
 elif [ "$REMOTE_BRANCH" = 1 ]; then
   git -C "$PROJECT_DIR" worktree add -q -b "$BRANCH" "$WORKTREE" "origin/${BRANCH}"
@@ -149,7 +164,7 @@ mkdir -p "$WORKTREE/.cursor"
 "$PYTHON_BIN" "$POLICY" cursor-json --job resolve --adapter "$WORKTREE/skills/pr-loops-common/gitea-pr.py" \
   --worktree "$WORKTREE" --report "$REPORT" > "$WORKTREE/.cursor/cli.json.base"
 "$PYTHON_BIN" - "$WORKTREE" <<'PY'
-import json, os, sys
+import json, os, sys, tempfile
 from pathlib import Path
 worktree = Path(sys.argv[1])
 config = json.loads((worktree / ".cursor/cli.json.base").read_text())
@@ -159,9 +174,19 @@ for folder in ("agent-pool/tests", "skills/pr-loops-common/tests", "tests", "scr
 tests.append("bash agent-pool/tests/verify-conduits.sh")
 allow = config["permissions"]["allow"]
 allow += [f"Shell({command})" for command in dict.fromkeys(tests) if f"Shell({command})" not in allow]
-handle = worktree / ".cursor/cli.json.tmp"
-handle.write_text(json.dumps(config, indent=2) + "\n")
-os.replace(handle, worktree / ".cursor/cli.json")
+# Deny wins over allow, and Cursor may compare prefixes as plain strings: the resolve policy's
+# bare "bash" and "python3 -" would refuse every test command above. Nothing outside the allow
+# list runs anyway (no --force), so they are replaced by narrower option denies.
+deny = [rule for rule in config["permissions"]["deny"] if rule not in ("Shell(bash)", "Shell(python3 -)")]
+deny += [rule for rule in ("Shell(bash -)", "Shell(bash -c)", "Shell(bash -s)", "Shell(python3 -c)")
+         if rule not in deny]
+config["permissions"]["deny"] = deny
+handle, temporary = tempfile.mkstemp(dir=str(worktree / ".cursor"), prefix="cli.json.")
+with os.fdopen(handle, "w") as output:
+    output.write(json.dumps(config, indent=2) + "\n")
+    output.flush()
+    os.fsync(output.fileno())
+os.replace(temporary, worktree / ".cursor/cli.json")
 (worktree / ".cursor/cli.json.base").unlink()
 PY
 if git -C "$WORKTREE" ls-files --error-unmatch .cursor/cli.json >/dev/null 2>&1; then

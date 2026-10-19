@@ -135,8 +135,11 @@ same "the worktree is removed" "$( [ -d "$PROJECT/logs/worktrees/issue-7" ] && e
 
 echo
 echo "agent failure and provider limit"
+echo '{"pid": 1, "issue": 7}' > "$PROJECT/logs/night_shift.lock"
 STUB_MODE=fail run "$PROJECT" 7
 same "agent failure -> exit 1" "$CODE" 1
+case "$OUT" in *"replacing a stale"*) ok "a stale lock file without the flock is replaced" ;; *) bad "stale lock" "$OUT" ;; esac
+same "the replaced lock is removed on exit" "$( [ -e "$PROJECT/logs/night_shift.lock" ] && echo present || echo gone)" gone
 STUB_MODE=limit run "$PROJECT" 7
 same "provider limit -> exit 75" "$CODE" 75
 case "$OUT" in *"PARK: provider limit reached"*) ok "limit prints the client's PARK marker" ;; *) bad "PARK marker" "$OUT" ;; esac
@@ -179,14 +182,71 @@ print(all(x in allow for x in ("Shell(python3 -m unittest)", "Shell(python3 -m b
 PY
 )"
 same "cli.json allows tests and commits, denies push and credential reads, no bare python3" "$cli" "True True True False"
+# Effective decision, as Cursor applies it: allowed only when an allow prefix matches and no deny
+# prefix does. Checked under both readings of "prefix" (whole tokens, and plain string), since
+# a test command a deny rule shadows would leave the worker unable to run its gate.
+effective="$(python3 - "$STUB_STATE/cli.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))["permissions"]
+shell = lambda rules: [r[len("Shell("):-1] for r in rules if r.startswith("Shell(")]
+allow, deny = shell(p["allow"]), shell(p["deny"])
+token = lambda cmd, pre: cmd == pre or cmd.startswith(pre + " ")
+string = lambda cmd, pre: cmd.startswith(pre)
+def decide(cmd):
+    verdicts = {any(m(cmd, a) for a in allow) and not any(m(cmd, d) for d in deny) for m in (token, string)}
+    return "allow" if verdicts == {True} else "deny" if verdicts == {False} else "split"
+for cmd in ("bash agent-pool/tests/verify-ok.sh", "python3 -m unittest discover -s agent-pool/tests/conduits -v",
+            "python3 -m behave agent-pool/tests/features/conduits.feature --strict", "git commit -m msg",
+            "git push origin HEAD", "bash -c id", "bash /tmp/x.sh", "python3 -c 1", "python3 x.py",
+            "curl http://x", "sh x", "env"):
+    print(cmd.split()[0] + ":" + decide(cmd), end=" ")
+PY
+)"
+same "effective permissions: tests and commit run; push, shells, inline python, network denied" "$effective" \
+  "bash:allow python3:allow python3:allow git:allow git:deny bash:deny bash:deny python3:deny python3:deny curl:deny sh:deny env:deny "
 same "all Gitea requests were authorized" "$(grep -c ' unauthorized$' "$GITEA/requests.log")" 0
 
 echo
-echo "rerun reuses the open PR"
-printf '[{"number": 99, "html_url": "http://gitea.test/owner/repo/pulls/99", "head": {"ref": "feature/7-nightcrew"}}]' > "$GITEA/pulls.json"
+echo "rerun reuses the open PR, found on a later page"
+python3 - "$GITEA/pulls.json" <<'PY'
+import json, sys
+others = [{"number": n, "html_url": f"http://gitea.test/p/{n}", "head": {"ref": f"feature/x-{n}"},
+           "base": {"ref": "master"}} for n in range(1, 61)]
+mine = {"number": 99, "html_url": "http://gitea.test/owner/repo/pulls/99", "head": {"ref": "feature/7-nightcrew"},
+        "base": {"ref": "master"}}
+json.dump(others + [mine], open(sys.argv[1], "w"))
+PY
 NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=commit run "$PROJECT" 7
 same "rerun -> exit 0" "$CODE" 0
 same "no second PR created" "$(created_count)" 1
+
+echo
+echo "remote branch moved on"
+SIDE="$TMP/side"
+git clone -q "$TMP/origin.git" "$SIDE"
+git -C "$SIDE" checkout -q feature/7-nightcrew
+echo fix > "$SIDE/review-fix.txt"
+git -C "$SIDE" add review-fix.txt
+git -C "$SIDE" commit -qm "review fix"
+git -C "$SIDE" push -q origin feature/7-nightcrew
+STUB_MODE=nocommit run "$PROJECT" 7
+same "a local branch behind the remote is fast-forwarded and published -> exit 0" "$CODE" 0
+same "the local branch now carries the remote fix" \
+  "$(git -C "$PROJECT" rev-parse feature/7-nightcrew)" "$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/7-nightcrew)"
+echo diverged > "$SIDE/remote-only.txt"
+git -C "$SIDE" add remote-only.txt
+git -C "$SIDE" commit -qm "remote only"
+git -C "$SIDE" push -q origin feature/7-nightcrew
+git -C "$PROJECT" worktree add -q "$TMP/local-wt" feature/7-nightcrew
+echo local > "$TMP/local-wt/local-only.txt"
+git -C "$TMP/local-wt" add local-only.txt
+git -C "$TMP/local-wt" commit -qm "local only"
+git -C "$PROJECT" worktree remove --force "$TMP/local-wt"
+rm -f "$STUB_STATE/argv"
+STUB_MODE=commit run "$PROJECT" 7
+same "diverged local and remote branches -> exit 1" "$CODE" 1
+case "$OUT" in *"have diverged"*) ok "divergence is reported before the agent runs" ;; *) bad "divergence" "$OUT" ;; esac
+same "no agent ran on a diverged branch" "$( [ -e "$STUB_STATE/argv" ] && echo ran || echo none)" none
 
 echo
 echo "maintenance"

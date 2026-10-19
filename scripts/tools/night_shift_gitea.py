@@ -9,8 +9,9 @@ Subcommands:
   issue   --repo O/R --issue N --out FILE
           write "Title: ...\\n\\n<body>" to FILE (atomic replace)
   open-pr --repo O/R --head BRANCH --base BASE --title T --body-file F
-          print {"number": N, "url": U} for the open PR from BRANCH, creating it when none
-          exists, so a rerun after a lost response does not open a second PR
+          print {"number": N, "url": U} for the open PR from BRANCH into BASE (every page of
+          open PRs is searched), creating it when none exists, so a rerun after a lost
+          response does not open a second PR
 
 Auth: GITEA_TOKEN, else NIGHT_SHIFT_GITEA_TOKEN_FILE, else ~/.config/pulse/gitea_token.
 Base URL: GITEA_BASE_URL (default http://192.168.2.48:3000), as gitea-pr.py.
@@ -28,6 +29,8 @@ from pathlib import Path
 
 BASE = os.environ.get("GITEA_BASE_URL", "http://192.168.2.48:3000").rstrip("/") + "/api/v1"
 TIMEOUT = 30
+PAGE_SIZE = 50
+MAX_PAGES = 40
 
 
 def token() -> str:
@@ -100,11 +103,18 @@ def cmd_issue(args: argparse.Namespace) -> int:
 def cmd_open_pr(args: argparse.Namespace) -> int:
     """Reuse the open PR from --head, else create one; print its number and URL."""
     base_path = repo_path(args.repo)
-    pulls = request("GET", f"{base_path}/pulls?state=open&limit=50")
-    for pull in pulls if isinstance(pulls, list) else []:
-        if isinstance(pull, dict) and (pull.get("head") or {}).get("ref") == args.head:
-            print(json.dumps({"number": pull.get("number"), "url": pull.get("html_url")}))
-            return 0
+    for page in range(1, MAX_PAGES + 1):
+        pulls = request("GET", f"{base_path}/pulls?state=open&limit={PAGE_SIZE}&page={page}")
+        if not isinstance(pulls, list) or not pulls:
+            break
+        for pull in pulls:
+            if isinstance(pull, dict) and (pull.get("head") or {}).get("ref") == args.head \
+                    and (pull.get("base") or {}).get("ref") in (None, args.base):
+                print(json.dumps({"number": pull.get("number"), "url": pull.get("html_url")}))
+                return 0
+    else:
+        print("night_shift_gitea: too many open PRs to search for an existing one", file=sys.stderr)
+        return 1
     body = Path(args.body_file).read_text(encoding="utf-8")
     created = request("POST", f"{base_path}/pulls",
                       {"head": args.head, "base": args.base, "title": args.title, "body": body})

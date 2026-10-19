@@ -3,13 +3,17 @@
 
 Usage: fake-gitea.py STATE_DIR TOKEN
 Writes STATE_DIR/port once listening. Serves GET /api/v1/repos/O/R/issues/N from
-STATE_DIR/issue.json, GET .../pulls?state=open from STATE_DIR/pulls.json (default []), and
+STATE_DIR/issue.json, GET .../pulls?state=open from STATE_DIR/pulls.json (default [], paged by
+the page and limit parameters), and
 records every POST .../pulls body to STATE_DIR/created.jsonl, answering number 99. Every
 request is appended to STATE_DIR/requests.log as "METHOD PATH authorized|unauthorized";
 a request without "Authorization: token TOKEN" gets 401.
 """
 import json
+import os
 import sys
+import tempfile
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -52,7 +56,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.endswith("/pulls"):
             pulls = STATE / "pulls.json"
-            self.reply(200, json.loads(pulls.read_text()) if pulls.exists() else [])
+            every = json.loads(pulls.read_text()) if pulls.exists() else []
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            limit = int(query.get("limit", ["30"])[0])
+            page = int(query.get("page", ["1"])[0])
+            self.reply(200, every[(page - 1) * limit:page * limit])
             return
         self.reply(404, {"message": "not found"})
 
@@ -65,6 +73,16 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(201, {"number": 99, "html_url": "http://gitea.test/owner/repo/pulls/99"})
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Publish the port so the waiting test never reads a partial file."""
+    handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    with os.fdopen(handle, "w") as output:
+        output.write(text)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+
+
 server = HTTPServer(("127.0.0.1", 0), Handler)
-(STATE / "port").write_text(str(server.server_address[1]))
+write_atomic(STATE / "port", str(server.server_address[1]))
 server.serve_forever()
