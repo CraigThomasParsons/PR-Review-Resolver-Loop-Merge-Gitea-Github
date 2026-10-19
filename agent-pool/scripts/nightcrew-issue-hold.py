@@ -27,7 +27,8 @@ Output and exit status:
   "clear", exit 0   an authenticated HTTP 200 answer for this repo with held=false
   "busy",  exit 0   the same, with held=true
   "busy",  exit 1   anything else: no token, HTTP error, any redirect, timeout,
-                    malformed JSON, wrong repo, missing or non-boolean held, a crash
+                    malformed JSON, a repeated JSON key, wrong repo, missing or
+                    non-boolean held, a crash
   nothing, exit 2   a usage error
 The caller must treat everything except exactly "clear" with exit 0 as held.
 Redirects are never followed, so the bearer token only ever goes to the configured
@@ -103,6 +104,18 @@ def checked_repo(repo: str) -> str:
     return repo
 
 
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """object_pairs_hook: refuse an object that repeats a key, at any depth.
+
+    json.loads keeps the last value of a repeated key and other parsers may keep the first, so
+    {"held": true, "held": false} would be read two ways. Such an answer is not valid.
+    """
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise CheckFailed("response repeats a JSON key")
+    return dict(pairs)
+
+
 def is_held(repo: str, timeout: float) -> bool:
     """Ask the endpoint once; True or False only for a fully valid answer."""
     url = f"{api_base()}/repos/{urllib.parse.quote(repo, safe='/')}/issue-hold"
@@ -127,7 +140,7 @@ def is_held(repo: str, timeout: float) -> bool:
     if len(body) > MAX_BODY:
         raise CheckFailed("response body too large")
     try:
-        payload = json.loads(body)
+        payload = json.loads(body, object_pairs_hook=_unique_keys)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise CheckFailed("response is not JSON") from None
     if not isinstance(payload, dict):

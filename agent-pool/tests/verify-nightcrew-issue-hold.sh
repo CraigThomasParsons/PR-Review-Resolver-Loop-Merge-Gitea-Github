@@ -140,6 +140,13 @@ check_payload "held as the string \"false\"" '{"repo": "owner/repo", "held": "fa
 check_payload "held as 0" '{"repo": "owner/repo", "held": 0}'
 check_payload "held as null" '{"repo": "owner/repo", "held": null}'
 check_payload "an error object" '{"message": "Unauthenticated."}'
+# json.loads keeps the last of a repeated key; another parser may keep the first. An answer two
+# parsers can read two ways is not an answer.
+check_payload "held repeated, false last" '{"repo": "owner/repo", "held": true, "held": false}'
+check_payload "held repeated, true last" '{"repo": "owner/repo", "held": false, "held": true}'
+check_payload "held repeated with the same value" '{"repo": "owner/repo", "held": false, "held": false}'
+check_payload "repo repeated" '{"repo": "owner/other", "repo": "owner/repo", "held": false}'
+check_payload "a key repeated in a nested object" '{"repo": "owner/repo", "held": false, "extra": {"a": 1, "a": 2}}'
 
 echo
 echo "credentials and configuration"
