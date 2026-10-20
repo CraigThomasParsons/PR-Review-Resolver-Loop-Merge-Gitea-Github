@@ -123,6 +123,12 @@ if git -C "$PROJECT_DIR" fetch -q origin "+refs/heads/${BRANCH}:refs/remotes/ori
 fi
 
 if [ -d "$WORKTREE" ]; then
+  # A directory git no longer registers (pruned metadata, interrupted add) would resolve to the
+  # project repository, whose status hides logs/; only a real worktree's status can be trusted.
+  if [ "$(git -C "$WORKTREE" rev-parse --show-toplevel 2>/dev/null || true)" != "$(cd "$WORKTREE" && pwd -P)" ]; then
+    log "ABORT — Stale worktree directory git no longer registers; a human must inspect it: ${WORKTREE}"
+    exit 1
+  fi
   if [ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null)" ]; then
     log "ABORT — Unowned worktree exists with uncommitted changes: ${WORKTREE}"
     exit 1

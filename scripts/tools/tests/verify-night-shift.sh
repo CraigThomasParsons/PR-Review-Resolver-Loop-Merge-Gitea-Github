@@ -150,6 +150,18 @@ same "no agent ran beside a leftover worktree" "$( [ -e "$STUB_STATE/argv" ] && 
 git -C "$PROJECT" worktree remove --force "$PROJECT/logs/worktrees/issue-7"
 
 echo
+echo "stale worktree directory git no longer registers"
+mkdir -p "$PROJECT/logs/worktrees/issue-7"
+echo "orphaned work" > "$PROJECT/logs/worktrees/issue-7/orphan.txt"
+run "$PROJECT" 7
+same "a stale worktree directory -> exit 1" "$CODE" 1
+case "$OUT" in *"Stale worktree directory"*) ok "the stale directory is reported for a human" ;; *) bad "stale directory report" "$OUT" ;; esac
+same "the stale directory's files survive the abort" \
+  "$(cat "$PROJECT/logs/worktrees/issue-7/orphan.txt" 2>/dev/null)" "orphaned work"
+same "no agent ran beside a stale directory" "$( [ -e "$STUB_STATE/argv" ] && echo ran || echo none)" none
+rm -rf "$PROJECT/logs/worktrees/issue-7"
+
+echo
 echo "agent exits 0 without a commit"
 STUB_MODE=nocommit run "$PROJECT" 7
 same "no commit -> exit 1" "$CODE" 1
