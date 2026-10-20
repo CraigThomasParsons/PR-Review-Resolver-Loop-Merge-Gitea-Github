@@ -8,7 +8,7 @@ of this plan's former Section 7 — see Section 9's decision on scope).
 
 ## Context and motivation
 
-Today `agent-pool/bin/prod-common.sh` models only two job kinds (`review` and `resolve`, plus `settled` which runs no provider) and hardcodes provider eligibility in `job_providers()` (`agent-pool/bin/prod-common.sh`, lines 231-240) with a single special case: `agy` is skipped for `resolve` unless `AGY_AUTO_APPROVE=1` is set. Meanwhile:
+Today `agent-pool/bin/prod-common.sh` models only two job kinds (`review` and `resolve`, plus `settled` which runs no provider) and hardcodes provider eligibility in `job_providers()` in `agent-pool/bin/prod-common.sh` with a single special case: `agy` is skipped for `resolve` unless `AGY_AUTO_APPROVE=1` is set. Meanwhile:
 
 1. `docs/plans/controller-gates.md` moves gate execution out of workers into a controller-owned bubblewrap sandbox (`agent-pool/scripts/gates.py` reading `.agent-pool/gates.toml`), strips keys and ambient credentials from workers, and removes `agy` from `resolve` permanently because `--dangerously-skip-permissions` violates the no-keys invariant.
 2. Open PR #19 adds `scripts/tools/night_shift.sh` so TheNightCrew can dispatch `cursor` on repository issues using `policy.py cursor-json --job resolve`, while noting that test execution inside the worker remains a temporary residual risk until controller-run gates land.
@@ -26,7 +26,7 @@ Every job processed by `agent-pool/bin/prod-common.sh` (and issue-dispatched job
 |---|---|---|---|---|---|
 | `plan` | Worktree files, `.agent-pool-context.md`, read-only git (`status`, `diff`, `log`, `show`) | Report file only (`$AGENT_POOL_STATE/runs/report-<tag>.md`) | No | No (worktree must remain clean) | Plan comment carrying `<!-- pulse-plan:v1 head=<sha> -->` |
 | `review` | Same as `plan` | Report file only | No (optional pre-review gate context in `.agent-pool-context.md`) | No (worktree must remain clean) | Review comment carrying `<!-- pulse-review:v1 head=<sha> findings=<n> -->` |
-| `prototype` | Same as `plan` | Worktree files (excluding protected and tool-config paths) plus report file | Optional (informational receipt only; red gate does not discard the prototype) | Commits to a local controller ref (`refs/agent-pool/prototypes/<pr>/<attempt_id>`); **never pushed** to `origin` unless promoted | Comment with diffstat, sanitized patch block, and `<!-- pulse-prototype:v1 base=<sha> commit=<proto_sha> files=<n> -->` |
+| `prototype` | Same as `plan` | Worktree files (excluding protected and tool-config paths) plus report file | Optional (informational receipt only; red gate does not discard the prototype) | Commits to a local controller ref (`refs/agent-pool/prototypes/<pr>/<attempt_id>`); **never pushed** to `origin` unless promoted | Comment with diffstat, sanitized patch block, and `<!-- pulse-prototype:v1 base=<sha> commit=<proto_sha> attempt=<attempt_id> files=<n> -->` |
 | `test-author` | Same as `plan` | Test paths only (matched against `test_paths` in `.agent-pool/gates.toml`) plus report file | Yes, mandatory (`agent-pool/scripts/gates.py run` in sandbox) | Yes: controller creates a signed commit and fast-forward pushes `refs/heads/<headref>` if gates match expectation | Comment with gate section and `<!-- pulse-test-author:v1 head=<newhead> base=<sha> tests_changed=<n> -->` |
 | `resolve` | Same as `plan` | Worktree files (excluding `.agent-pool/gates.toml`, lockfiles, `protect` list, and tool configs) plus report file | Yes, mandatory (`agent-pool/scripts/gates.py run` in sandbox) | Yes: controller creates a signed commit and fast-forward pushes `refs/heads/<headref>` only when gates pass | Comment with gate section and `<!-- pulse-resolve:v1 head=<newhead> reviewed=<rhead> fixed=<n> noted=<n> deferred=<n> -->` |
 
@@ -37,9 +37,9 @@ Every job processed by `agent-pool/bin/prod-common.sh` (and issue-dispatched job
    - If the worker modifies any tracked or untracked file inside `$JOB_WT`, the controller discards the worktree changes and fails verification if the report is missing.
 2. **`review`**:
    - Preserves the existing contract in `agent-pool/bin/prod-common.sh` and `skills/pr-loops-common/marker.py`.
-   - Reads the PR diff, commit history, comments, and unresolved review threads from `.agent-pool-context.md` (`write_context()` in `agent-pool/bin/prod-common.sh`, lines 603-615) and read-only tools, then writes the review report.
+   - Reads the PR diff, commit history, comments, and unresolved review threads from `.agent-pool-context.md` (`write_context()` in `agent-pool/bin/prod-common.sh`) and read-only tools, then writes the review report.
 3. **`prototype`**:
-   - Executes in a detached throwaway worktree created by `prepare_worktree()` (`agent-pool/bin/prod-common.sh`, lines 593-599).
+   - Executes in a detached throwaway worktree created by `prepare_worktree()` in `agent-pool/bin/prod-common.sh`.
    - Gives the worker full worktree edit capability (subject to protected-file and secret checks) to explore a spike or alternative implementation.
    - The controller never pushes a `prototype` result to `origin/<headref>`. Instead, it records a signed commit under a local controller-only ref in `$AGENT_POOL_MAIN`, posts the sanitized diff and report to Gitea, and deletes the worktree in `end_job()`. Promotion to a real branch requires an explicit human action (`agent:promote`, Section 7; signing mechanics in `docs/plans/controller-commits-everything.md`).
 4. **`test-author`**:
@@ -80,7 +80,7 @@ Capabilities are defined in a new helper `agent-pool/scripts/capabilities.py` (b
 With controller-run gates (`docs/plans/controller-gates.md`) and controller-created commits (`docs/plans/controller-commits-everything.md`), `policy.py` accepts `--job plan|review|prototype|test-author|resolve`:
 
 - **`plan` and `review`**:
-  - Allowed shell: `git status`, `git diff`, `git log`, `git show` with vetted flags in `GIT_SPECS` (`agent-pool/scripts/policy.py`, lines 95-102).
+  - Allowed shell: `git status`, `git diff`, `git log`, `git show` with vetted flags in `GIT_SPECS` (`agent-pool/scripts/policy.py`).
   - Allowed native tools: `Read`, `Grep`, `Glob` scoped to `read_roots()` (`$JOB_WT` and the per-job run directory), plus `Write(<report>)`.
   - Denied: all `Edit`/`Write` inside `$JOB_WT`, all `git add`/`git commit`/`git push`.
 - **`test-author`**:
@@ -115,7 +115,7 @@ Jobs declare what abilities they need through two composable mechanisms: Gitea `
 
 ### 3.2 Deriving `requires` for a candidate job
 
-A job's `requires` field is a sorted, deduplicated list of ability strings (`list[str]`). `derive_job()` in `agent-pool/bin/prod-common.sh` (lines 379-396) is extended to compute both `DJ` (the primary execution phase) and `DREQUIRES` (comma-separated required abilities) in priority order:
+A job's `requires` field is a sorted, deduplicated list of ability strings (`list[str]`). `derive_job()` in `agent-pool/bin/prod-common.sh` is extended to compute both `DJ` (the primary execution phase) and `DREQUIRES` (comma-separated required abilities) in priority order:
 
 1. **Settled check first**: If the PR carries no unfulfilled ability override and already has a clean `pulse-review:v1` marker at `head_sha` or a verified `pulse-resolve:v1` marker answering the latest review at `head_sha` (with a passing gate receipt per `docs/plans/controller-gates.md`), `DJ=settled` and `DREQUIRES=""` (handled by `controller` without spawning a provider).
 2. **Explicit `agent:<ability>` labels on the PR/issue**:
@@ -130,7 +130,7 @@ A job's `requires` field is a sorted, deduplicated list of ability strings (`lis
 
 ### 3.3 The `requires` field in the claim record (`agent-pool/scripts/claim-record.py`)
 
-`new_record()` in `agent-pool/scripts/claim-record.py` (lines 119-130) adds `"requires"` to the v2 claim JSON under `$AGENT_POOL_STATE/claims/<repo>__<pr>.json`:
+`new_record()` in `agent-pool/scripts/claim-record.py` adds `"requires"` to the v2 claim JSON under `$AGENT_POOL_STATE/claims/<repo>__<pr>.json`:
 
 ```json
 {
@@ -149,7 +149,7 @@ A job's `requires` field is a sorted, deduplicated list of ability strings (`lis
 }
 ```
 
-`claim-record.py claim` accepts `--requires <csv>` (defaulting to `--job` when omitted so existing callers in `agent-pool/tests/verify-lease.sh` remain compatible) and preserves `requires` across `reattempt` calls (`cmd_reattempt()`, lines 190-197).
+`claim-record.py claim` accepts `--requires <csv>` (defaulting to `--job` when omitted so existing callers in `agent-pool/tests/verify-lease.sh` remain compatible) and preserves `requires` across `reattempt` calls (`cmd_reattempt()`).
 
 ---
 
@@ -165,10 +165,10 @@ flowchart TD
     B --> C["derive_job -> DJ, DREQUIRES"]
     C --> D{"DJ == settled?"}
     D -- Yes --> E["Claim as controller & finish_job done"]
-    D -- No --> F["capabilities.py match --order PROVIDER_ORDER --requires DREQUIRES"]
+    D -- No --> F["capabilities.py match --order AGENT_POOL_ROSTER --requires DREQUIRES"]
     F --> G{"C_roster empty?<br/>(no provider in roster has abilities)"}
     G -- Yes --> H["Route to agent:needs-human<br/>(unsatisfiable requirement)"]
-    G -- No --> I["Filter by setup_faults -> C_configured"]
+    G -- No --> I["Narrow to this tick's PROVIDER_ORDER<br/>& filter by setup_faults -> C_configured"]
     I --> J{"C_configured empty?"}
     J -- Yes --> K["Keep agent:ready, log SETUP FAULT (exit 2)"]
     J -- No --> L["Filter by provider + ability cooldowns<br/>& gate infra fault -> C_eligible"]
@@ -189,7 +189,7 @@ flowchart TD
 ### 4.3 Interaction with leases, `live_refusal`, `reattempt`, and fencing
 
 1. **Pre-claim capability check**:
-   - `job_providers()` in `agent-pool/bin/prod-common.sh` (lines 231-240) is replaced by `capable_providers "$DJ" "$DREQUIRES"`.
+   - `job_providers()` in `agent-pool/bin/prod-common.sh` is replaced by `capable_providers "$DJ" "$DREQUIRES"`.
    - `capable_providers` filters `PROVIDERS` (already vetted by `select_providers()` for binary, model, and provider-level cooldown) through:
      - `capabilities.py match --provider "$p" --requires "$DREQUIRES"`
      - `cooldown.py active --provider "$p" --ability "$ab"` for each `ab` in `DREQUIRES`
@@ -197,10 +197,10 @@ flowchart TD
      - Gate infrastructure check: if `DREQUIRES` contains `resolve` or `test-author` and `$AGENT_POOL_STATE/faults/gates.json` is active (per `docs/plans/controller-gates.md` Section 3), `capable_providers` returns empty so gate-dependent jobs are not claimed while `plan`, `review`, and `prototype` jobs continue running.
 2. **Atomic claim under the job lock (`agent-pool/scripts/claim-record.py`)**:
    - `claim-record.py claim` acquires `poolstate.locked(path)` on `$AGENT_POOL_STATE/claims/<repo>__<pr>.json.lock`.
-   - `live_refusal()` (`claim-record.py`, lines 148-166) re-reads `gitea-pr.py state` live under the lock and additionally verifies `--expect-ability-labels`: if a human added or removed an `agent:<ability>` label since the candidate listing was taken at the start of the tick, `live_refusal()` returns exit 6 (`the live PR state no longer allows the claim`) so the worker never runs with a stale `requires` set.
+   - `live_refusal()` in `claim-record.py` re-reads `gitea-pr.py state` live under the lock and additionally verifies `--expect-ability-labels`: if a human added or removed an `agent:<ability>` label since the candidate listing was taken at the start of the tick, `live_refusal()` returns exit 6 (`the live PR state no longer allows the claim`) so the worker never runs with a stale `requires` set.
    - `claim-record.py claim` also validates that `--provider` satisfies `--requires` via `capabilities.py` before writing the claim file, closing any race or misconfiguration in caller scripts.
 3. **In-job provider fallback (`reattempt`) and fencing**:
-   - In `run_job()` (`agent-pool/bin/prod-common.sh`, lines 714-746), the loop iterates only over `JOB_PROVIDERS` (the providers in `C_eligible` that satisfy `DREQUIRES`).
+   - In `run_job()` in `agent-pool/bin/prod-common.sh`, the loop iterates only over `JOB_PROVIDERS` (the providers in `C_eligible` that satisfy `DREQUIRES`).
    - When the first provider hits a `limit`, `timeout`, or `setup` fault and `run_job()` falls back to the next provider `p` via `claim-record.py reattempt --attempt "$ATTEMPT" --provider "$p"`, `reattempt` checks:
      1. `$ATTEMPT` is still the current attempt on disk (exit 4 if superseded by `doctor.sh` or another tick).
      2. The new provider `p` satisfies the claim record's `requires` list.
@@ -222,7 +222,7 @@ Both `agent-pool/bin/prod-common.sh` (during normal ticks) and `agent-pool/bin/d
 
 | Condition | Meaning | Action by `prod-common.sh` / `doctor.sh` | Gitea label transition | Cooldown / fault effect |
 |---|---|---|---|---|
-| `C_roster` is empty | **Unsatisfiable by roster.** No provider in `PROVIDER_ORDER` advertises `job.requires` (e.g., job requires `resolve` when `PROVIDER_ORDER=agy`, or requires an ability combination no single provider has). | Claim briefly as `controller`, post a diagnostic comment naming `job.requires` and the capabilities of `PROVIDER_ORDER`, and release to `agent:needs-human`. | `agent:ready` -> `agent:needs-human` | None (not a provider fault). |
+| `C_roster` is empty | **Unsatisfiable by roster.** No provider in the host-wide `AGENT_POOL_ROSTER` advertises `job.requires` (e.g., job requires `resolve` when `AGENT_POOL_ROSTER=agy`, or requires an ability combination no single provider has). | Claim briefly as `controller`, post a diagnostic comment naming `job.requires` and the capabilities of the providers in `AGENT_POOL_ROSTER`, and release to `agent:needs-human`. | `agent:ready` -> `agent:needs-human` | None (not a provider fault). |
 | `C_roster` non-empty, `C_configured` is empty | **Host setup fault on all capable providers.** A capable provider is in `PROVIDER_ORDER`, but its binary is missing, its model env var is unset, or `faults/<provider>.json` is active. | Do **not** blame the PR. Leave the PR in `agent:ready`, log `SETUP FAULT`, and exit 2 so systemd / operator monitoring alerts. | Stays `agent:ready` | `cooldown.py fault` recorded per broken provider; tick exits 2. |
 | `C_configured` non-empty, `C_eligible` is empty due to `faults/gates.json` | **Gate sandbox infra broken.** Capable providers exist for `resolve`/`test-author`, but controller gate sandbox failed on an earlier tick (`docs/plans/controller-gates.md` Section 3). | Leave the PR in `agent:ready`; log that gate-dependent abilities are paused until `faults/gates.json` clears. `plan`/`review`/`prototype` jobs still run. | Stays `agent:ready` | `faults/gates.json` remains active; tick exits 2. |
 | `C_configured` non-empty, `C_eligible` is empty due to active cooldowns | **Temporary cooldown.** At least one configured provider can satisfy `job.requires`, but all such providers are currently cooling down (provider-level or ability-level). | **Wait for cooldown.** Touch nothing on Gitea; log the earliest `until` timestamp across `C_configured` (`waiting for cooldown; earliest eligible provider <p> in <Nm>`). | Stays `agent:ready` | Existing cooldowns tick down naturally. |
@@ -236,9 +236,9 @@ When `agent-pool/bin/doctor.sh` runs its 5-minute tick (`docs/plans/agent-pool-w
    - It writes the durable reassignment notice to `$AGENT_POOL_STATE/mailboxes/<worker_id>/<message_id>.json` via `mailbox.py` and stops any active `prod-<provider>.service` unit.
    - It calls `claim-record.py requeue` to flip `agent:claimed` -> `agent:ready` and delete the claim file.
 2. **Step 2 (Sweep `agent:ready` queue for unsatisfiable requirements)**:
-   - For each open `agent:ready` PR not held by a human or NightCrew, `doctor.sh` derives `requires` and runs `capabilities.py check-queue --order "$PROVIDER_ORDER" --requires "$DREQUIRES"`.
+   - For each open `agent:ready` PR not held by a human or NightCrew, `doctor.sh` derives `requires` and runs `capabilities.py check-queue --order "$AGENT_POOL_ROSTER" --roster "$AGENT_POOL_ROSTER" --requires "$DREQUIRES"` (the doctor is host-wide, so its own order is the roster).
    - If `C_roster` is empty, `doctor.sh` (when `DOCTOR_DRY_RUN=0` and the repo is in the doctor's allowlist) transitions the PR from `agent:ready` to `agent:needs-human` with the explanation:
-     `Automated pool stopped on this PR: job requires ability [<requires>], which no configured provider in PROVIDER_ORDER (<order>) advertises.`
+     `Automated pool stopped on this PR: job requires ability [<requires>], which no provider in the host-wide roster AGENT_POOL_ROSTER (<roster>) advertises.`
    - If `C_roster` is non-empty and `C_eligible` is empty because of cooldowns, `doctor.sh` logs `WAIT_COOLDOWN` with the remaining seconds until the next capable provider wakes up, and leaves `agent:ready` untouched.
 
 ---
@@ -392,7 +392,7 @@ Every step keeps all existing offline suites green (`agent-pool/tests/verify-lea
   - `C_eligible` empty -> wait for cooldown, keep `agent:ready`, exit 0.
 - Wire the same check into `agent-pool/bin/doctor.sh` alongside stale-claim reconciliation and mailbox enqueueing.
 - Add end-to-end cases in `agent-pool/tests/verify-providers.sh`:
-  - `PROVIDER_ORDER=agy` on a PR requiring `resolve` transitions immediately to `agent:needs-human`.
+  - `PROVIDER_ORDER=agy` with `AGENT_POOL_ROSTER=agy` on a PR requiring `resolve` transitions immediately to `agent:needs-human` (the converse, an `agy`-only tick whose roster also includes `claude`, stays `agent:ready`; see the Step 1 test).
   - `PROVIDER_ORDER=claude` where `claude` is on a `resolve` ability cooldown leaves a `resolve` PR in `agent:ready` (waiting for cooldown) while still claiming and completing a `review` PR in the same tick.
 
 ### Step 4: `plan`, `prototype`, and `test-author` execution, prompts, and publication
