@@ -27,8 +27,15 @@ An alternate form of this I would like to enable are long living feature branche
   address review comments or conflicts, land the fix on the PR's branch, never
   merge.
 - `agent-pool/`: the pull-based, multi-provider worker pool (in progress): the
-  controller tick `bin/prod-common.sh`, its helper scripts and offline tests. Design in
-  `docs/plans/agent-pool-worker-pool.md`.
+  controller tick `bin/prod-common.sh`; one thin entrypoint per provider,
+  `bin/prod-{claude,cursor,grok,agy,codex}.sh`, ticking each repo with the abilities
+  `~/.config/agent-pool/repos.toml` grants it (see `config/repos.example.toml`; a repo or
+  ability that is not listed means review only, and agy never resolves); the non-LLM
+  `bin/doctor.sh`, which requeues stalled claims and dead workers and sends jobs no enabled
+  provider can take to `agent:needs-human`; `bin/install-systemd-units.sh`, which copies
+  `systemd/agent-pool-*` into the user unit dir without enabling anything;
+  `scripts/agent-labels.py`, which creates the `agent:*` labels on one repo; helper scripts
+  and offline tests. Design in `docs/plans/agent-pool-worker-pool.md`.
 - `scripts/tools/`: the entry points TheNightCrew's client requires for every repository it
   serves. `night_shift.sh <project_dir> <issue> [agent]` is the issue executor, Cursor only:
   the launcher is the controller, so it prepares the worktree, runs `cursor-agent` under a
@@ -101,11 +108,17 @@ skills/pr-loops-common/tests/verify-resolve.sh
 skills/pr-loops-common/tests/verify-merge.sh
 skills/pr-loops-common/tests/verify-trigger.sh
 tests/verify-install.sh
+agent-pool/tests/verify-lease.sh
+agent-pool/tests/verify-providers.sh
+agent-pool/tests/verify-nightcrew-issue-hold.sh
+agent-pool/tests/verify-doctor.sh
+agent-pool/tests/verify-systemd-units.sh
+agent-pool/tests/verify-agent-labels.sh
 scripts/tools/tests/verify-night-shift.sh
 ```
 
-All offline: stubbed adapter and CLIs, temporary home, no systemctl.
-`verify-night-shift.sh` uses a stub `cursor-agent` and a loopback fake Gitea
+All offline: stubbed adapter and CLIs, temporary home, no systemctl. The labels test talks to
+a fake Gitea on 127.0.0.1 only. `verify-night-shift.sh` uses a stub `cursor-agent` and a loopback fake Gitea
 (`scripts/tools/tests/fake-gitea.py`).
 
 ## Not version controlled before this

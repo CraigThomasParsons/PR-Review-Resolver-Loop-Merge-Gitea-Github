@@ -1,0 +1,12 @@
+[Unit]
+# Every 15 minutes at :02/:17/:32/:47, off the merge tick's minutes.
+Description=Agent pool: doctor every 15 minutes
+
+[Timer]
+OnCalendar=*:02/15
+AccuracySec=30s
+Persistent=true
+Unit=agent-pool-doctor.service
+
+[Install]
+WantedBy=timers.target

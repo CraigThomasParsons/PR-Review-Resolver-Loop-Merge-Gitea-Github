@@ -51,10 +51,26 @@ Subcommands (all take --repo O/R --pr N):
   reconcile --adapter F --claimed L --needs-human L          print state<TAB>attempt<TAB>provider
   show                                      print the record (or {})
   hold      --labels JSON [--assignees JSON] --hold-labels CSV [--bot B] [--grace S]
+  fence     --attempt A --adapter F --claimed L --ready L [--owner-lock F] [--reason R]
+  escalate  --adapter F --from L --to L --body-file F [--expect-head SHA] [--bot B]
+
+`fence` is the doctor's requeue, which deletes nothing. It acts on attempt A if A is current
+and either past its deadline or abandoned by its tick (--owner-lock exists and nobody holds it),
+and only while the PR is still labelled --claimed. It archives the record to
+claims/fenced/<repo>__<pr>.<A>.json, writes in its place a fence record (worker "doctor", no
+provider, a fresh attempt_id, epoch + 1, already past its deadline) so A can no longer guard,
+release or keep its worker alive, then flips --claimed -> --ready. The next prod tick drops the
+fence record as already released; if the flip failed (exit 1), the fence is a stale claim and
+the next pass requeues it. Prints "<provider>\t<worker>\t<new attempt>" once the fence is
+written, before the flip.
+
+`escalate` moves a PR nobody holds a claim on from --from to --to with a comment, under the job
+lock, after re-reading the PR live: it refuses (exit 6) unless --from is still on it, it is not
+also --claimed (when --from is not), no human holds it, and the head is still --expect-head.
 
 Exit codes: 0 ok; 2 usage or unreadable record; 3 a claim already exists; 4 the attempt is
-not current (or, for requeue, not stale); 5 the claim's label flip failed and was rolled back;
-6 the live PR state no longer allows the claim.
+not current (or, for requeue and fence, not stale or abandoned); 5 the claim's label flip failed
+and was rolled back; 6 the live PR state no longer allows the claim, fence or escalation.
 """
 import argparse
 import datetime
@@ -250,6 +266,77 @@ def cmd_requeue(a: argparse.Namespace, path: Path) -> int:
     return 0
 
 
+def fenced_path(repo: str, pr: int, attempt: str) -> Path:
+    return poolstate.state_dir() / "claims" / "fenced" / f"{poolstate.slug(repo)}__{int(pr)}.{attempt}.json"
+
+
+def cmd_fence(a: argparse.Namespace, path: Path) -> int:
+    doc = current(path, a.attempt)
+    if doc is None:
+        return 4
+    now = poolstate.now()
+    abandoned = bool(a.owner_lock) and poolstate.lock_abandoned(Path(a.owner_lock))
+    if not is_stale(doc, now) and not abandoned:
+        print(f"claim: attempt {a.attempt} is not past {doc['expected_deadline_at']} and its tick is "
+              "not known to be gone", file=sys.stderr)
+        return 4
+    if a.claimed not in labels_live(a):
+        print(f"claim: {a.repo}#{a.pr} is not labelled {a.claimed}; not fenced (the prod tick drops the "
+              "record)", file=sys.stderr)
+        return 6
+    poolstate.save(fenced_path(a.repo, a.pr, a.attempt), {**doc, "fenced_at": iso(now), "fenced_reason": a.reason})
+    fence = {
+        "version": 2, "repo_slug": a.repo, "issue_number": a.pr, "provider": "", "worker_id": "doctor",
+        "attempt_id": str(uuid.uuid4()), "epoch": int(doc.get("epoch", 0)) + 1,
+        "branch": doc.get("branch"), "worktree": doc.get("worktree"), "job": doc.get("job"),
+        "fenced_attempt": doc["attempt_id"], "fenced_provider": doc.get("provider", ""),
+        "fenced_worker": doc.get("worker_id", ""), "reason": a.reason,
+        "claimed_at": iso(now), "expected_deadline_at": iso(now - 1),
+    }
+    poolstate.save(path, fence)
+    print(f"{doc.get('provider', '')}\t{doc.get('worker_id', '')}\t{fence['attempt_id']}", flush=True)
+    if relabel(a, a.claimed, a.ready) != 0:
+        print("claim: fenced, but the requeue label flip failed; the fence stays as a stale claim", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_escalate(a: argparse.Namespace, path: Path) -> int:
+    doc = poolstate.load(path)
+    if doc:
+        print(f"claim: {a.repo}#{a.pr} has a claim record; not escalating", file=sys.stderr)
+        return 3
+    out = subprocess.run([sys.executable, a.adapter, "state", "--repo", a.repo, "--pr", str(a.pr)],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        print(f"claim: could not read the live PR state: {out.stderr.strip()[:200]}", file=sys.stderr)
+        return 1
+    st = json.loads(out.stdout or "{}")
+    labels = set(st.get("labels") or [])
+    why = None
+    if a.from_label not in labels:
+        why = f"{a.from_label} is no longer on the PR"
+    elif a.from_label != a.claimed and a.claimed in labels:
+        why = f"it is now {a.claimed}"
+    elif labels & HUMAN_LABELS:
+        why = "a human already holds it (" + ",".join(sorted(labels & HUMAN_LABELS)) + ")"
+    elif [x for x in (st.get("assignees") or []) if x and x != a.bot]:
+        why = "it is assigned to a human"
+    elif a.expect_head and st.get("head_sha") != a.expect_head:
+        why = f"the head moved from {a.expect_head} to {st.get('head_sha') or 'nothing'}"
+    if why:
+        print(f"claim: {a.repo}#{a.pr} not escalated: {why}", file=sys.stderr)
+        return 6
+    if run([sys.executable, a.adapter, "comment", "--repo", a.repo, "--pr", str(a.pr),
+            "--body-file", a.body_file], quiet=True) != 0:
+        print("claim: escalation comment failed; label left as it was", file=sys.stderr)
+        return 1
+    if relabel(a, a.from_label, a.to_label) != 0:
+        print("claim: escalation label flip failed", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_reconcile(a: argparse.Namespace, path: Path) -> int:
     labels = labels_live(a)
     doc = poolstate.load(path)
@@ -321,7 +408,7 @@ def main() -> int:
         argv, command = argv[:split], argv[split + 1:]
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("action", choices=["claim", "reattempt", "check", "guard", "release", "requeue",
-                                      "reconcile", "show", "hold"])
+                                      "reconcile", "show", "hold", "fence", "escalate"])
     p.add_argument("--repo", required=True)
     p.add_argument("--pr", required=True, type=int)
     p.add_argument("--worker")
@@ -342,14 +429,21 @@ def main() -> int:
     p.add_argument("--grace", type=float)
     p.add_argument("--require-label", default="")
     p.add_argument("--expect-head", default="")
+    p.add_argument("--owner-lock", default="")
+    p.add_argument("--reason", default="")
+    p.add_argument("--from", dest="from_label", default="")
+    p.add_argument("--to", dest="to_label", default="")
+    p.add_argument("--body-file", default="")
     a = p.parse_args(argv)
     a.command = command
     if a.action == "claim" and not a.worker:
         p.error("--worker is required")
-    if a.action in ("reattempt", "check", "guard", "release", "requeue") and not a.attempt:
+    if a.action in ("reattempt", "check", "guard", "release", "requeue", "fence") and not a.attempt:
         p.error("--attempt is required")
-    if a.action in ("requeue", "reconcile") and not a.adapter:
+    if a.action in ("requeue", "reconcile", "fence", "escalate") and not a.adapter:
         p.error("--adapter is required")
+    if a.action == "escalate" and not (a.from_label and a.to_label and a.body_file):
+        p.error("escalate needs --from, --to and --body-file")
     if (a.require_label or a.expect_head) and not a.adapter:
         p.error("--require-label and --expect-head need --adapter")
     path = claim_path(a.repo, a.pr)

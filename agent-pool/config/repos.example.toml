@@ -1,0 +1,32 @@
+# Example agent-pool repo config. Copy to ~/.config/agent-pool/repos.toml (or point
+# AGENT_POOL_CONFIG at it) and edit; the real file is never committed. Read by
+# agent-pool/scripts/repoconfig.py, which documents every key.
+#
+# Abilities: plan, review, prototype, test-author, resolve. A repo that is not listed here,
+# or that has no `abilities` key, gets review only. prod-common.sh runs review and resolve
+# jobs today; the other three are accepted so this file does not change when they land.
+# agy can never resolve, whatever this file says.
+
+[pool]
+# The providers whose prods run on this host (one agent-pool-prod@<provider>.timer each).
+# The doctor only counts these when it decides whether anyone can take a queued job.
+providers = ["claude", "cursor", "grok", "agy", "codex"]
+
+[repos."craigpars/AgileMedievalPeasantBoard"]
+main = "~/Code/AgileMedievalPeasantBoard"
+# Review only for the pilot. Resolve stays off until the controller-gates follow-up lands.
+abilities = ["review"]
+
+# Narrow one provider on this repo. A provider table can only take abilities away.
+[repos."craigpars/AgileMedievalPeasantBoard".providers.codex]
+abilities = ["review"]
+
+[repos."ElasticGun/TheNightCrew"]
+main = "~/Code/TheNightCrew"
+# No abilities key: review only.
+# Shared with TheNightCrew's issue workers: ask its issue-hold endpoint before each claim.
+nightcrew_hold = true
+
+[repos."craigpars/PR-Review-Resolver-Loop-Merge-Gitea-Github"]
+main = "~/Code/PR-Review-Resolver-Loop-Merge-Gitea-Github"
+abilities = ["plan", "review", "prototype", "test-author"]
