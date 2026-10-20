@@ -94,10 +94,51 @@
 #   CLAUDE_PERMISSION_MODE=default  GROK_PERMISSION_MODE=dontAsk  CODEX_SANDBOX_MODE=workspace-write
 #   AGY_AUTO_APPROVE=1             let agy take resolve jobs (--dangerously-skip-permissions)
 #   AGY_PRINT_TIMEOUT=0            agy's own print timeout; 0 leaves WORKER_TIMEOUT as the only limit
+#   AGENT_POOL_ABILITIES           comma list of the abilities this repo grants (plan, review,
+#                                  prototype, test-author, resolve); a job kind runs only if its
+#                                  ability is listed, and agy never resolves, AGY_AUTO_APPROVE or
+#                                  not. Set by the entrypoints; unset keeps review and resolve.
+#
+# Entrypoint mode: bin/prod-<provider>.sh sets AGENT_POOL_PROVIDER and sources this file. It then
+# runs one tick per repo that repos.toml (scripts/repoconfig.py, AGENT_POOL_CONFIG) enables for
+# that provider, each with PROVIDER_ORDER=<provider>, AGENT_POOL_ABILITIES from the config,
+# AGY_AUTO_APPROVE unset, AGENT_POOL_WORKER_ID defaulting to <host>-<provider>, and
+# AGENT_POOL_NIGHTCREW_HOLD=1 where the repo sets nightcrew_hold. With AGENT_POOL_REPO set, only
+# that repo is ticked.
 #
 # Exit codes: 0 for a normal tick (including nothing to do); 2 for a setup fault.
 
 set -uo pipefail
+
+if [ -n "${AGENT_POOL_PROVIDER:-}" ]; then
+  # Sourced by an entrypoint, possibly under set -e: every command below tolerates failure.
+  entry_provider="$AGENT_POOL_PROVIDER"
+  entry_self="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+  entry_log() { printf '%s [prod-%s] %s\n' "$(date -Is)" "$entry_provider" "$*" >&2; }
+  case "$entry_provider" in claude|cursor|grok|agy|codex) ;; *) entry_log "unknown provider"; exit 2 ;; esac
+  [ "$#" -eq 0 ] || { echo "usage: prod-$entry_provider.sh (no arguments; repos come from repos.toml)" >&2; exit 2; }
+  if ! entry_ticks="$(python3 "$(dirname -- "$entry_self")/../scripts/repoconfig.py" ticks --provider "$entry_provider")"; then
+    entry_log "the repo config is unusable; ticking nothing"
+    exit 2
+  fi
+  entry_worker="${AGENT_POOL_WORKER_ID:-$(hostname -s 2>/dev/null || echo host)-$entry_provider}"
+  entry_rc=0
+  while IFS=$'\t' read -r entry_repo entry_main entry_abilities entry_hold; do
+    [ -n "$entry_repo" ] || continue
+    entry_env=(-u AGENT_POOL_PROVIDER -u AGY_AUTO_APPROVE AGENT_POOL_REPO="$entry_repo" AGENT_POOL_MAIN="$entry_main"
+      AGENT_POOL_ABILITIES="$entry_abilities" PROVIDER_ORDER="$entry_provider" AGENT_POOL_WORKER_ID="$entry_worker")
+    [ "$entry_hold" = 1 ] && entry_env+=(AGENT_POOL_NIGHTCREW_HOLD=1)
+    entry_log "$entry_repo: tick as $entry_worker with abilities $entry_abilities"
+    rc=0
+    env "${entry_env[@]}" bash "$entry_self" </dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      entry_log "$entry_repo: tick exited $rc"
+      [ "$entry_rc" -eq 2 ] || entry_rc="$rc"
+    fi
+  done <<<"$entry_ticks"
+  exit "$entry_rc"
+fi
 
 # Run from a private copy, for the reason pr-loop.sh gives: bash reads scripts by offset, and an
 # edit during a long tick would otherwise land the running tick in the middle of a function.
@@ -156,6 +197,8 @@ esac
 NIGHTCREW_TIMEOUT="${AGENT_POOL_NIGHTCREW_TIMEOUT:-10}"
 NIGHTCREW_HOLD_SCRIPT="${AGENT_POOL_NIGHTCREW_HOLD_SCRIPT:-$SCRIPTS/nightcrew-issue-hold.py}"
 PROTECTED="${AGENT_POOL_PROTECTED_BRANCHES:-develop,main,master,release}"
+ABILITIES_SET=0; ABILITIES=""
+if [ -n "${AGENT_POOL_ABILITIES+x}" ]; then ABILITIES_SET=1; ABILITIES="$AGENT_POOL_ABILITIES"; fi
 NOPUSH_URL="/nonexistent/agent-pool-workers-never-push"
 CONTEXT_FILE=".agent-pool-context.md"
 
@@ -228,13 +271,19 @@ drop_cooling_providers() {
   PROVIDERS=("${kept[@]}")
 }
 
+ability_enabled() { # job
+  [ "$ABILITIES_SET" = 0 ] || [[ ",$ABILITIES," == *",$1,"* ]]
+}
+
 # JOB_PROVIDERS := PROVIDERS that may take a job of this kind. agy has no deny list, so it only
-# resolves when the operator has opted in to running it unattended.
+# resolves when an operator running this tick directly opted in to it unattended; under an
+# entrypoint (AGENT_POOL_ABILITIES set) it never resolves.
 job_providers() { # job
   local p
   JOB_PROVIDERS=()
+  ability_enabled "$1" || return 0
   for p in "${PROVIDERS[@]}"; do
-    [ "$1" = resolve ] && [ "$p" = agy ] && [ "${AGY_AUTO_APPROVE:-0}" != 1 ] && continue
+    [ "$1" = resolve ] && [ "$p" = agy ] && { [ "${AGY_AUTO_APPROVE:-0}" != 1 ] || [ "$ABILITIES_SET" = 1 ]; } && continue
     JOB_PROVIDERS+=("$p")
   done
 }
@@ -754,6 +803,14 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
 [ -n "$MAIN" ] && [ -e "$MAIN/.git" ] || die "no checkout for $REPO: set AGENT_POOL_MAIN to its clone (got '$MAIN')"
 [ "$WORKER_TIMEOUT" -lt "$DEADLINE_SECS" ] \
   || die "WORKER_TIMEOUT ($WORKER_TIMEOUT) must be shorter than AGENT_POOL_DEADLINE_SECS ($DEADLINE_SECS)"
+if [ "$ABILITIES_SET" = 1 ]; then
+  IFS=, read -ra ability_list <<<"$ABILITIES"
+  for ability in "${ability_list[@]}"; do
+    case "$ability" in plan|review|prototype|test-author|resolve) ;;
+      *) die "unknown ability '$ability' in AGENT_POOL_ABILITIES (plan, review, prototype, test-author, resolve)" ;;
+    esac
+  done
+fi
 WT_ROOT="${AGENT_POOL_WORKTREES:-$(dirname "$MAIN")/.pool-worktrees}"
 mkdir -p "$WT_ROOT"
 
@@ -898,6 +955,10 @@ for row in "${QUEUE[@]}"; do
   fi
   [ -n "$stopped" ] && continue
   [ "$jobs_run" -ge "$MAX_JOBS" ] && continue
+  if ! ability_enabled "$job"; then
+    log "$REPO#$pr: $job is not an enabled ability for $REPO here (enabled: ${ABILITIES:-none}); skipping"
+    continue
+  fi
   job_providers "$job"
   if [ "${#JOB_PROVIDERS[@]}" -eq 0 ]; then log "$REPO#$pr: no eligible provider takes $job jobs; skipping"; continue; fi
   if [ "$DRY_RUN" = 1 ]; then

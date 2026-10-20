@@ -888,5 +888,139 @@ expect_not "installed: the Worker token never reaches the pool log" "$(cat "$TMP
 
 unset AGENT_POOL_NIGHTCREW_HOLD AGENT_POOL_NIGHTCREW_BOT AGENT_POOL_NIGHTCREW_TIMEOUT
 
+echo
+echo "entrypoints: prod-<provider>.sh ticks what repos.toml enables"
+EP="$ROOT/agent-pool/bin"
+CONF="$TMP/repos.toml"
+export AGENT_POOL_CONFIG="$CONF"
+conf() { printf '%s\n' "$@" > "$CONF"; }
+# The harness exports AGENT_POOL_REPO/MAIN/WORKER_ID for direct ticks; an entrypoint takes them
+# from the config instead.
+entry() { # provider [VAR=value...]
+  local p="$1"; shift
+  env -u AGENT_POOL_REPO -u AGENT_POOL_MAIN -u AGENT_POOL_WORKER_ID "$@" bash "$EP/prod-$p.sh" > "$TMP/out.txt" 2>&1
+  TICK_RC=$?
+}
+repoconf() { python3 "$ROOT/agent-pool/scripts/repoconfig.py" "$@" 2>&1; }
+HOST="$(hostname -s 2>/dev/null || echo host)"
+
+conf '[repos."owner/repo"]' "main = \"$TMP/main\""
+reset '["agent:ready"]'
+behave claude ok
+entry claude
+expect "a repo with no abilities key is reviewed" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
+expect "the entrypoint ticks as <host>-claude" "$(cat "$TMP/out.txt")" "claimed by $HOST-claude for review"
+expect "and says which abilities it ticks with" "$(cat "$TMP/out.txt")" "owner/repo: tick as $HOST-claude with abilities review"
+expect "the entrypoint tick is a normal exit" "$TICK_RC" "0"
+entry claude
+expect "the default is review only: the queued resolve is skipped" "$(cat "$TMP/out.txt")" \
+  "resolve is not an enabled ability for owner/repo here (enabled: review)"
+expect "claude never ran for the resolve" "$(ncalls claude)" "1"
+expect "the resolve stays queued" "$(labels)" "agent:ready"
+
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" 'abilities = ["review", "resolve"]'
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-noted
+entry claude
+expect "with resolve enabled the entrypoint resolves" "$(labels)" "agent:done"
+
+conf '[pool]' 'providers = ["claude"]'
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-noted
+AGENT_POOL_REPO="$R" AGENT_POOL_MAIN="$TMP/main" bash "$EP/prod-claude.sh" > "$TMP/out.txt" 2>&1
+expect "a repo absent from repos.toml (named by AGENT_POOL_REPO) is review only" "$(cat "$TMP/out.txt")" \
+  "resolve is not an enabled ability for owner/repo here (enabled: review)"
+expect "so nothing ran on it" "$(ncalls claude)" "0"
+
+conf '[repos."owner/repo"]' "main = \"$TMP/main\""
+for p in claude cursor grok agy codex; do
+  cli="$p"; [ "$p" = cursor ] && cli=cursor-agent
+  reset '["agent:ready"]'
+  behave "$cli" final-only
+  entry "$p" PROVIDER_ORDER=claude,cursor,grok,agy,codex AGENT_POOL_MODEL_CODEX=test-codex
+  expect "prod-$p.sh runs $p" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
+  others=0
+  for o in claude cursor-agent grok agy codex; do [ "$o" = "$cli" ] || others=$((others + $(ncalls "$o"))); done
+  expect "prod-$p.sh runs no other provider, whatever PROVIDER_ORDER says" "$others" "0"
+  expect "prod-$p.sh ticks as <host>-$p" "$(cat "$TMP/out.txt")" "claimed by $HOST-$p"
+done
+ln -s "$EP/prod-claude.sh" "$BIN/prod-claude.sh"
+reset '["agent:ready"]'
+behave claude ok
+env -u AGENT_POOL_REPO -u AGENT_POOL_MAIN bash "$BIN/prod-claude.sh" > "$TMP/out.txt" 2>&1
+expect "an entrypoint installed as a symlink still finds prod-common.sh" "$(comments)" "pulse-review:v1"
+rm -f "$BIN/prod-claude.sh"
+
+echo "  (agy never resolves)"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" 'abilities = ["plan", "review", "prototype", "test-author", "resolve"]' \
+  '[repos."owner/repo".providers.agy]' 'abilities = ["review", "resolve"]'
+expect "repoconfig caps agy below resolve" "$(repoconf abilities --repo owner/repo --provider agy)" "review"
+expect_not "even when its own table lists resolve" "$(python3 "$ROOT/agent-pool/scripts/repoconfig.py" abilities --repo owner/repo --provider agy 2>/dev/null)" "resolve"
+expect "and says it ignored that" "$(repoconf abilities --repo owner/repo --provider agy)" "agy can never take resolve; ignored"
+expect "claude keeps resolve on the same repo" "$(repoconf abilities --repo owner/repo --provider claude)" "review,prototype,test-author,resolve"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" 'abilities = ["plan", "review", "prototype", "test-author", "resolve"]'
+expect "agy gets plan, review, prototype and test-author" "$(repoconf abilities --repo owner/repo --provider agy)" \
+  "plan,review,prototype,test-author"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave agy resolve-noted
+entry agy AGY_AUTO_APPROVE=1
+expect "prod-agy.sh takes no resolve job, even with AGY_AUTO_APPROVE=1" "$(ncalls agy)" "0"
+expect "it says resolve is not enabled for agy" "$(cat "$TMP/out.txt")" "resolve is not an enabled ability"
+expect "the resolve stays queued" "$(labels)" "agent:ready"
+expect_not "and agy is never given --dangerously-skip-permissions" "$(calls agy)" "dangerously-skip-permissions"
+AGENT_POOL_ABILITIES=review,resolve AGY_AUTO_APPROVE=1 PROVIDER_ORDER=agy tick
+expect "prod-common.sh refuses agy a resolve under AGENT_POOL_ABILITIES, whatever it lists" "$(cat "$TMP/out.txt")" \
+  "no eligible provider takes resolve jobs"
+expect "so agy still never ran" "$(ncalls agy)" "0"
+reset '["agent:ready"]'
+behave agy final-only
+entry agy
+expect "prod-agy.sh reviews" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
+expect "in plan mode" "$(calls agy | tr '\n' ' ')" "ARG --mode ARG plan"
+
+echo "  (roster, config errors, per-repo settings)"
+conf '[pool]' 'providers = ["claude"]' '[repos."owner/repo"]' "main = \"$TMP/main\""
+reset '["agent:ready"]'
+behave grok ok
+entry grok
+expect "a provider outside the roster ticks nothing" "$(ncalls grok)" "0"
+expect "and says so" "$(cat "$TMP/out.txt")" "grok is not in the roster"
+expect "which is a normal exit" "$TICK_RC" "0"
+for bad in 'abilities = ["reveiw"]' 'abilites = ["review"]' 'abilities = "review"'; do
+  conf '[repos."owner/repo"]' "main = \"$TMP/main\"" "$bad"
+  reset '["agent:ready"]'
+  behave claude ok
+  entry claude
+  expect "a config with '$bad' is a setup fault (exit 2)" "$TICK_RC" "2"
+  expect "and nothing ran ($bad)" "$(ncalls claude)" "0"
+done
+conf '[repos."owner/repo"' 'main = 1'
+entry claude
+expect "an unparseable config is a setup fault" "$TICK_RC" "2"
+expect "with the reason" "$(cat "$TMP/out.txt")" "the repo config is unusable"
+reset '["agent:ready"]'
+behave claude ok
+AGENT_POOL_ABILITIES=review,bogus tick
+expect "an unknown ability in AGENT_POOL_ABILITIES is refused" "$(cat "$TMP/out.txt")" "unknown ability 'bogus'"
+expect "and nothing ran" "$(ncalls claude)" "0"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" 'nightcrew_hold = true'
+hold_reset busy
+AGENT_POOL_NIGHTCREW_HOLD_SCRIPT="$TMP/common/nightcrew-issue-hold.py" entry claude
+expect "nightcrew_hold = true turns the hold check on for that repo" "$(hold_calls)" "1"
+expect "so a held repo claims nothing" "$(ncalls claude)" "0"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" '[repos."owner/other"]' "main = \"$TMP/no-such-clone\""
+reset '["agent:ready"]'
+behave claude ok
+entry claude
+expect "each configured repo gets its own tick" "$(cat "$TMP/out.txt")" "owner/other: tick as"
+expect "a broken repo does not stop the others" "$(comments)" "pulse-review:v1"
+expect "but the run reports its setup fault" "$TICK_RC" "2"
+bash "$EP/prod-claude.sh" extra > "$TMP/out.txt" 2>&1
+expect "an entrypoint takes no arguments" "$?" "2"
+AGENT_POOL_CONFIG="$ROOT/agent-pool/config/repos.example.toml" python3 "$ROOT/agent-pool/scripts/repoconfig.py" check >/dev/null 2>&1
+expect "the shipped example config validates" "$?" "0"
+expect "a repo the config does not name is review only" "$(repoconf abilities --repo some/where --provider claude)" "review"
+unset AGENT_POOL_CONFIG
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
