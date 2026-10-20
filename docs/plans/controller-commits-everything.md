@@ -91,7 +91,7 @@ multi-commit manifest. Per-finding disposition still lives in the commit body (v
 summary) and the PR comment. Revisit a `.agent-pool-commits.json` manifest replay only if a real
 need for multiple discrete commits per run shows up in practice.
 
-## 5. Migration (prerequisite to `docs/plans/provider-capabilities.md` Step 2 onward)
+## 5. Migration (prerequisite to `docs/plans/provider-capabilities.md` Step 4)
 
 - **Files**: `agent-pool/bin/prod-common.sh`, `agent-pool/scripts/policy.py`,
   `agent-pool/scripts/report.py`, `skills/pr-loops-common/prompts/resolve.generic.txt`,
