@@ -27,8 +27,15 @@ An alternate form of this I would like to enable are long living feature branche
   address review comments or conflicts, land the fix on the PR's branch, never
   merge.
 - `agent-pool/`: the pull-based, multi-provider worker pool (in progress): the
-  controller tick `bin/prod-common.sh`, its helper scripts and offline tests. Design in
-  `docs/plans/agent-pool-worker-pool.md`.
+  controller tick `bin/prod-common.sh`; one thin entrypoint per provider,
+  `bin/prod-{claude,cursor,grok,agy,codex}.sh`, ticking each repo with the abilities
+  `~/.config/agent-pool/repos.toml` grants it (see `config/repos.example.toml`; a repo or
+  ability that is not listed means review only, and agy never resolves); the non-LLM
+  `bin/doctor.sh`, which requeues stalled claims and dead workers and sends jobs no enabled
+  provider can take to `agent:needs-human`; `bin/install-systemd-units.sh`, which copies
+  `systemd/agent-pool-*` into the user unit dir without enabling anything;
+  `scripts/agent-labels.py`, which creates the `agent:*` labels on one repo; helper scripts
+  and offline tests. Design in `docs/plans/agent-pool-worker-pool.md`.
 - `skills/pr-merge-loop/` — a **third, deliberately separate, mechanical**
   tick. No model worker at all: it merges only PRs an operator has explicitly
   labelled `review:automerge`, that also carry `review:clean`,
@@ -94,9 +101,16 @@ skills/pr-loops-common/tests/verify-resolve.sh
 skills/pr-loops-common/tests/verify-merge.sh
 skills/pr-loops-common/tests/verify-trigger.sh
 tests/verify-install.sh
+agent-pool/tests/verify-lease.sh
+agent-pool/tests/verify-providers.sh
+agent-pool/tests/verify-nightcrew-issue-hold.sh
+agent-pool/tests/verify-doctor.sh
+agent-pool/tests/verify-systemd-units.sh
+agent-pool/tests/verify-agent-labels.sh
 ```
 
-All offline: stubbed adapter and CLIs, temporary home, no systemctl.
+All offline: stubbed adapter and CLIs, temporary home, no systemctl. The labels test talks to
+a fake Gitea on 127.0.0.1 only.
 
 ## Not version controlled before this
 

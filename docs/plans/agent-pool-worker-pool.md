@@ -149,9 +149,47 @@ supersedes the earlier reset-on-read mutable prompt design.
 `scripts/report.py`, `scripts/render-prompt.py`, `scripts/poolstate.py`, and the offline tests
 `tests/verify-lease.sh` (unit) and `tests/verify-providers.sh` (end-to-end, stub CLIs).
 
-**Not built yet:** the thin `prod-<provider>.sh` entrypoints, `doctor.sh`, `mailbox.py`,
-`effort-baseline.py` (the deadline is the seed only), the cooldown recovery probe, and the
-systemd units and installer. Until the doctor exists, each tick does the reconciliation itself:
+### Built on `feature/agent-pool-pilot`
+
+- **Entrypoints and the per-repo config.** `bin/prod-{claude,cursor,grok,agy,codex}.sh` set
+  `AGENT_POOL_PROVIDER` and source `prod-common.sh`, which then runs one ordinary tick per repo
+  that `~/.config/agent-pool/repos.toml` (`AGENT_POOL_CONFIG`) enables for that provider, with
+  `PROVIDER_ORDER` pinned to it and `AGENT_POOL_ABILITIES` set to what it is granted there.
+  `scripts/repoconfig.py` parses and validates the file; `config/repos.example.toml` is the
+  only copy in the repo. Abilities are `plan`, `review`, `prototype`, `test-author` and
+  `resolve`; a repo or ability that is absent means `review` only. agy's ceiling has no
+  `resolve`: the config cannot grant it, and under an entrypoint or `AGENT_POOL_ABILITIES` the
+  tick never offers agy a resolve job even with `AGY_AUTO_APPROVE=1` (a bare `prod-common.sh`
+  run keeps the old opt-in). The tick only runs `review` and `resolve` jobs today; `plan`,
+  `prototype` and `test-author` are accepted by the config but have no job kind yet.
+- **The doctor.** `bin/doctor.sh` (a `flock` guard) runs `scripts/doctor.py`, which never
+  invokes a provider CLI. A claim past its deadline, or whose tick lock
+  (`pool-<worker>-<repo>.lock`) nobody holds, is fenced and requeued: `claim-record.py fence`
+  archives the record under `claims/fenced/`, writes a fence record with a new attempt id and
+  epoch + 1 (so the old attempt can no longer check or release), and flips `agent:claimed` to
+  `agent:ready`; the next prod tick drops the fence as orphan-dropped. A stale claim cools its
+  provider down unless its work was already published; a dead worker does not. `agent:claimed`
+  with no record, and queued jobs no enabled, installed provider can take (`not-enabled`,
+  `not-installed`), go to `agent:needs-human` with a comment saying why, through
+  `claim-record.py escalate`, which re-reads the PR first and refuses if it moved. Nothing is
+  deleted. `--dry-run` (or `DOCTOR_DRY_RUN=1`) changes nothing; the JSON report goes to stdout
+  and `$AGENT_POOL_STATE/doctor/report.json`. Repos not in `repos.toml` are reported, never
+  touched.
+- **Systemd units.** `systemd/agent-pool-prod@.{service,timer}` (one instance per provider) and
+  `systemd/agent-pool-doctor.{service,timer}`; `bin/install-systemd-units.sh [--dest DIR]
+  [--pool-root DIR] [--list]` copies them, fills in the pool root (default
+  `%h/.local/share/agent-pool`, a deployed copy) and writes a per-provider stagger drop-in. It
+  never runs `systemctl`. Departures from the sketch under Systemd units below: the doctor
+  runs every 15 minutes (`*:02/15`), not 5; a prod tick may cover several repos, so its
+  `TimeoutStartSec` is a 4h backstop; output goes to the journal.
+- **Labels.** `scripts/agent-labels.py --repo O/R [--dry-run]` creates the `agent:*` part of
+  `gitea-labels.py`'s set, idempotently, reading every page and failing closed.
+- Tests: `tests/verify-doctor.sh`, `tests/verify-systemd-units.sh`,
+  `tests/verify-agent-labels.sh`, and an entrypoint section in `tests/verify-providers.sh`.
+
+**Not built yet:** `mailbox.py`, `effort-baseline.py` (the deadline is the seed only), the
+cooldown recovery probe, job kinds for `plan`, `prototype` and `test-author`, and the doctor's
+systemd-unit check of a stale attempt. The prod tick still does its own reconciliation as well:
 a stale claim found under the job lock is requeued and its provider cooled down.
 
 **Open questions:** Agy has no deny list, so an auto-approved Agy resolve relies on the
@@ -218,9 +256,11 @@ docs/controller-gates-plan, docs/plans/controller-gates.md) lands.
 agent-pool/
   bin/
     prod-common.sh       # shared reconcile -> claim -> invoke -> publish -> verify -> release; provider-parameterized
-    prod-claude.sh       # thin entrypoint, sources prod-common.sh (not built yet)
-    prod-codex.sh        # (not built yet)
-    doctor.sh            # zero-LLM driver; uses deterministic helpers, systemctl and git/Gitea; optional retalk (not built yet)
+    prod-{claude,cursor,grok,agy,codex}.sh  # thin entrypoints, source prod-common.sh
+    doctor.sh            # zero-LLM driver (flock guard) for scripts/doctor.py
+    install-systemd-units.sh  # copies systemd/agent-pool-* to the user unit dir; enables nothing
+  config/
+    repos.example.toml   # per-repo/per-provider abilities; the live file is ~/.config/agent-pool/repos.toml
   scripts/
     claim-record.py      # atomic per-job claim file; attempt_id fencing; reconciliation (see below)
     policy.py            # the one worker permission allowlist, translated per provider CLI
@@ -231,21 +271,25 @@ agent-pool/
     poolstate.py         # atomic writes, flock, state dir, injectable clock
     mailbox.py           # atomic enqueue/pending/ack; stable worker IDs and message IDs (not built yet)
     effort-baseline.py   # parses pool.log -> rolling avg per provider; seeds at 2700s (not built yet)
+    repoconfig.py        # parses and validates repos.toml; abilities per repo and provider
+    doctor.py            # stalled/dead claims -> fence + requeue; untakeable jobs -> agent:needs-human
+    agent-labels.py      # creates the agent:* labels on one repo, idempotently
   prompts/
     claim-job.txt         # default "go claim a job" template (not built yet)
     reassigned.txt         # "your task was reassigned, go pick a new one" template (not built yet)
-  systemd/                   # (not built yet)
-    prod-claude.{timer,service}
-    prod-codex.{timer,service}
-    doctor.{timer,service}
-  install_systemd_units.sh   # same idempotent/--force/--list shape as install_skills_and_actions.sh (not built yet)
   docs/HANDOFF-agent-pool.md # state machine + decision log, mirrors HANDOFF-pr-automerge.md (not built yet)
   tests/
     verify-lease.sh          # offline unit tests: claim-record.py fencing/reconciliation/deadline
                               # boundary, holds, cooldowns, classification, prompt rendering, policy
     verify-providers.sh      # offline end-to-end ticks against stub CLIs, a stub Gitea adapter and
                               # a local bare remote: publication, fencing, reconciliation, adapters
+    verify-doctor.sh         # offline doctor scenarios: stale/dead claims, fencing, escalation, dry run
+    verify-systemd-units.sh  # the units and their installer, into a temp --dest
+    verify-agent-labels.sh   # agent-labels.py against a fake Gitea on 127.0.0.1
     inject-staleness.sh      # doctor scenarios, see Verification (not built yet)
+systemd/                     # at the repo root, beside pr-trigger-drain.*
+  agent-pool-prod@.{timer,service}   # one instance per provider; staggered by drop-ins
+  agent-pool-doctor.{timer,service}
 ```
 
 The shared prompts live in `skills/pr-loops-common/prompts/review.generic.txt` and
