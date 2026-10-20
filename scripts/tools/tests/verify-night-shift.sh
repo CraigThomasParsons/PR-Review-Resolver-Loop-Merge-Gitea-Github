@@ -162,6 +162,21 @@ same "no agent ran beside a stale directory" "$( [ -e "$STUB_STATE/argv" ] && ec
 rm -rf "$PROJECT/logs/worktrees/issue-7"
 
 echo
+echo "stale worktree whose .git file points at removed metadata"
+git -C "$PROJECT" worktree add -q --detach "$PROJECT/logs/worktrees/issue-7" origin/master
+WT_META="$(git -C "$PROJECT/logs/worktrees/issue-7" rev-parse --absolute-git-dir)"
+rm -rf "$WT_META"
+echo "dangling work" > "$PROJECT/logs/worktrees/issue-7/dangling.txt"
+run "$PROJECT" 7
+same "a worktree with removed metadata -> exit 1" "$CODE" 1
+case "$OUT" in *"Stale worktree directory"*) ok "the dangling worktree is reported for a human" ;; *) bad "dangling worktree report" "$OUT" ;; esac
+same "the dangling worktree's files survive the abort" \
+  "$(cat "$PROJECT/logs/worktrees/issue-7/dangling.txt" 2>/dev/null)" "dangling work"
+same "no agent ran beside a dangling worktree" "$( [ -e "$STUB_STATE/argv" ] && echo ran || echo none)" none
+rm -rf "$PROJECT/logs/worktrees/issue-7"
+git -C "$PROJECT" worktree prune
+
+echo
 echo "agent exits 0 without a commit"
 STUB_MODE=nocommit run "$PROJECT" 7
 same "no commit -> exit 1" "$CODE" 1
