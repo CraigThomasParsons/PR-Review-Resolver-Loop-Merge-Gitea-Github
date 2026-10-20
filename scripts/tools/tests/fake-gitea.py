@@ -5,9 +5,15 @@ Usage: fake-gitea.py STATE_DIR TOKEN
 Writes STATE_DIR/port once listening. Serves GET /api/v1/repos/O/R/issues/N from
 STATE_DIR/issue.json, GET .../pulls?state=open from STATE_DIR/pulls.json (default [], paged by
 the page and limit parameters), and
-records every POST .../pulls body to STATE_DIR/created.jsonl, answering number 99. Every
+records every POST .../pulls body to STATE_DIR/created.jsonl and adds the new PR to
+pulls.json, numbered 99 for the first, 100 for the second and so on, with head and base
+carrying the ref and the O/R repository as Gitea does. Every
 request is appended to STATE_DIR/requests.log as "METHOD PATH authorized|unauthorized";
 a request without "Authorization: token TOKEN" gets 401.
+
+Failure switches (files in STATE_DIR): post-fails answers a POST 409 and records nothing;
+post-lost records the PR and then drops the connection without a reply (a timeout that hid
+a created PR); post-mismatch records nothing and answers 201 with another head branch.
 """
 import json
 import os
@@ -71,9 +77,28 @@ class Handler(BaseHTTPRequestHandler):
         if (STATE / "post-fails").exists():
             self.reply(409, {"message": "pull request already exists"})
             return
-        with (STATE / "created.jsonl").open("a") as created:
+        repo = self.path.split("?")[0].split("/repos/", 1)[1].rsplit("/pulls", 1)[0]
+        if (STATE / "post-mismatch").exists():
+            self.reply(201, pull_request(98, repo, "feature/someone-else", body.get("base")))
+            return
+        created_log = STATE / "created.jsonl"
+        number = 99 + (len(created_log.read_text().splitlines()) if created_log.exists() else 0)
+        with created_log.open("a") as created:
             created.write(json.dumps(body) + "\n")
-        self.reply(201, {"number": 99, "html_url": "http://gitea.test/owner/repo/pulls/99"})
+        pull = pull_request(number, repo, body.get("head"), body.get("base"))
+        pulls = STATE / "pulls.json"
+        every = json.loads(pulls.read_text()) if pulls.exists() else []
+        write_atomic(pulls, json.dumps(every + [pull]))
+        if (STATE / "post-lost").exists():
+            self.close_connection = True
+            return
+        self.reply(201, pull)
+
+
+def pull_request(number: int, repo: str, head: object, base: object) -> dict:
+    """A PR as Gitea returns it, with the fields night_shift_gitea.py matches on."""
+    return {"number": number, "html_url": f"http://gitea.test/{repo}/pulls/{number}",
+            "head": {"ref": head, "repo": {"full_name": repo}}, "base": {"ref": base, "repo": {"full_name": repo}}}
 
 
 def write_atomic(path: Path, text: str) -> None:

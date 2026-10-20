@@ -36,6 +36,7 @@ TOKEN_FILE="$TMP/gitea_token"
 printf '%s\n' "$SECRET" > "$TOKEN_FILE"
 export NIGHT_SHIFT_GITEA_TOKEN_FILE="$TOKEN_FILE"
 
+REPO="craigpars/PR-Review-Resolver-Loop-Merge-Gitea-Github"
 GITEA="$TMP/gitea"
 mkdir -p "$GITEA"
 python3 "$ROOT/scripts/tools/tests/fake-gitea.py" "$GITEA" "$SECRET" &
@@ -178,10 +179,11 @@ git -C "$PROJECT" worktree prune
 
 echo
 echo "agent exits 0 without a commit"
-STUB_MODE=nocommit run "$PROJECT" 7
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/nocommit.json" STUB_MODE=nocommit run "$PROJECT" 7
 same "no commit -> exit 1" "$CODE" 1
 same "no branch pushed" "$(remote_has_branch feature/7-nightcrew)" no
 same "no PR opened" "$(created_count)" 0
+same "no receipt for a run with nothing to publish" "$( [ -e "$TMP/receipts/nocommit.json" ] && echo written || echo none)" none
 same "the worktree is removed" "$( [ -d "$PROJECT/logs/worktrees/issue-7" ] && echo present || echo gone)" gone
 
 echo
@@ -237,18 +239,6 @@ same "a rejected push -> exit 1" "$CODE" 1
 case "$OUT" in *"ERROR push of feature/7-nightcrew rejected"*) ok "a rejected push is logged" ;; *) bad "push rejected log" "$OUT" ;; esac
 same "no PR opened after a rejected push" "$(created_count)" 0
 git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
-
-echo
-echo "PR creation fails after the push"
-touch "$GITEA/post-fails"
-NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/failed-pr.json" STUB_MODE=commit run "$PROJECT" 7
-rm -f "$GITEA/post-fails"
-same "a failed PR creation -> exit 1" "$CODE" 1
-case "$OUT" in *"[night_shift] "*"ERROR line "*"failed with exit 1"*) ok "the failed step is logged by the launcher" ;; *) bad "failed step log" "$OUT" ;; esac
-same "no receipt without a PR" "$( [ -e "$TMP/receipts/failed-pr.json" ] && echo written || echo none)" none
-same "the lock file is removed after a failed step" "$( [ -e "$PROJECT/logs/night_shift.lock" ] && echo present || echo gone)" gone
-git -C "$PROJECT" branch -D feature/7-nightcrew >/dev/null 2>&1
-git -C "$TMP/origin.git" branch -D feature/7-nightcrew >/dev/null 2>&1
 
 echo
 echo "success"
@@ -311,17 +301,26 @@ same "all Gitea requests were authorized" "$(grep -c ' unauthorized$' "$GITEA/re
 
 echo
 echo "rerun reuses the open PR, found on a later page"
-python3 - "$GITEA/pulls.json" <<'PY'
+python3 - "$GITEA/pulls.json" "$REPO" <<'PY'
 import json, sys
-others = [{"number": n, "html_url": f"http://gitea.test/p/{n}", "head": {"ref": f"feature/x-{n}"},
-           "base": {"ref": "master"}} for n in range(1, 61)]
-mine = {"number": 99, "html_url": "http://gitea.test/owner/repo/pulls/99", "head": {"ref": "feature/7-nightcrew"},
-        "base": {"ref": "master"}}
+repo = {"full_name": sys.argv[2]}
+others = [{"number": n, "html_url": f"http://gitea.test/p/{n}", "head": {"ref": f"feature/x-{n}", "repo": repo},
+           "base": {"ref": "master", "repo": repo}} for n in range(1, 61)]
+mine = {"number": 99, "html_url": "http://gitea.test/owner/repo/pulls/99",
+        "head": {"ref": "feature/7-nightcrew", "repo": repo}, "base": {"ref": "master", "repo": repo}}
 json.dump(others + [mine], open(sys.argv[1], "w"))
 PY
 NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=commit run "$PROJECT" 7
 same "rerun -> exit 0" "$CODE" 0
 same "no second PR created" "$(created_count)" 1
+
+echo
+echo "a launcher step fails after the PR is open"
+touch "$TMP/receipt-blocker"
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipt-blocker/job.json" STUB_MODE=commit run "$PROJECT" 7
+same "a failed receipt write -> exit 1" "$CODE" 1
+case "$OUT" in *"[night_shift] "*"ERROR line "*"failed with exit 1"*) ok "the failed step is logged by the launcher" ;; *) bad "failed step log" "$OUT" ;; esac
+same "the lock file is removed after a failed step" "$( [ -e "$PROJECT/logs/night_shift.lock" ] && echo present || echo gone)" gone
 
 echo
 echo "remote branch moved on"
@@ -350,6 +349,85 @@ STUB_MODE=commit run "$PROJECT" 7
 same "diverged local and remote branches -> exit 1" "$CODE" 1
 case "$OUT" in *"have diverged"*) ok "divergence is reported before the agent runs" ;; *) bad "divergence" "$OUT" ;; esac
 same "no agent ran on a diverged branch" "$( [ -e "$STUB_STATE/argv" ] && echo ran || echo none)" none
+
+echo
+echo "PR creation fails after the push: the published branch is kept for a rerun"
+before="$(created_count)"
+touch "$GITEA/post-fails"
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-8.json" STUB_MODE=commit run "$PROJECT" 8
+rm -f "$GITEA/post-fails"
+same "a failed PR creation -> exit 1" "$CODE" 1
+head8="$(git -C "$PROJECT" rev-parse feature/8-nightcrew 2>/dev/null)"
+case "$OUT" in *"ERROR could not open or confirm a PR for feature/8-nightcrew at ${head8}; the pushed branch"*) ok "the failure log names the branch and its head" ;;
+  *) bad "PR failure log" "$OUT" ;; esac
+same "the pushed branch and its commit stay on the remote" \
+  "$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/8-nightcrew 2>/dev/null)" "$head8"
+same "no receipt without a verified PR" "$( [ -e "$TMP/receipts/issue-8.json" ] && echo written || echo none)" none
+same "no PR recorded" "$(created_count)" "$before"
+same "the lock file is removed after a failed PR creation" "$( [ -e "$PROJECT/logs/night_shift.lock" ] && echo present || echo gone)" gone
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-8.json" STUB_MODE=nocommit run "$PROJECT" 8
+same "the rerun reuses the published commit and opens the PR -> exit 0" "$CODE" 0
+same "one PR created by the rerun" "$(created_count)" "$((before + 1))"
+same "the rerun's PR is from the kept branch into master" \
+  "$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readlines()[-1]); print(b["head"], b["base"])' "$GITEA/created.jsonl")" \
+  "feature/8-nightcrew master"
+same "the remote branch was not rewritten" "$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/8-nightcrew)" "$head8"
+same "the receipt names the new PR, the branch and the kept head" \
+  "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["pr_number"], r["branch"], r["head"])' "$TMP/receipts/issue-8.json" 2>&1)" \
+  "$((99 + before)) feature/8-nightcrew $head8"
+
+echo
+echo "PR created but the response is lost: the rerun finds it instead of opening another"
+before="$(created_count)"
+touch "$GITEA/post-lost"
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-9.json" STUB_MODE=commit run "$PROJECT" 9
+rm -f "$GITEA/post-lost"
+same "a lost PR creation response -> exit 1" "$CODE" 1
+head9="$(git -C "$PROJECT" rev-parse feature/9-nightcrew 2>/dev/null)"
+case "$OUT" in *"ERROR could not open or confirm a PR for feature/9-nightcrew at ${head9}"*) ok "the lost response is logged with the branch and head" ;;
+  *) bad "lost response log" "$OUT" ;; esac
+same "no receipt while the PR is unconfirmed" "$( [ -e "$TMP/receipts/issue-9.json" ] && echo written || echo none)" none
+same "the branch stays on the remote" "$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/9-nightcrew 2>/dev/null)" "$head9"
+same "the server did create the PR" "$(created_count)" "$((before + 1))"
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-9.json" STUB_MODE=nocommit run "$PROJECT" 9
+same "the rerun reconciles the hidden PR -> exit 0" "$CODE" 0
+same "no second PR for the same branch" "$(created_count)" "$((before + 1))"
+same "the receipt names the PR the lost response hid" \
+  "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["pr_number"], r["branch"], r["head"])' "$TMP/receipts/issue-9.json" 2>&1)" \
+  "$((99 + before)) feature/9-nightcrew $head9"
+
+echo
+echo "only a PR from this repository's branch into the base is reused"
+before="$(created_count)"
+python3 - "$GITEA/pulls.json" "$REPO" <<'PY'
+import json, sys
+path, repo = sys.argv[1], {"full_name": sys.argv[2]}
+fork = {"full_name": "someone/fork"}
+every = json.load(open(path))
+every += [{"number": 501, "html_url": "http://gitea.test/p/501", "head": {"ref": "feature/10-nightcrew", "repo": fork},
+           "base": {"ref": "master", "repo": repo}},
+          {"number": 502, "html_url": "http://gitea.test/p/502", "head": {"ref": "feature/10-nightcrew", "repo": repo},
+           "base": {"ref": "develop", "repo": repo}},
+          {"number": 503, "html_url": "http://gitea.test/p/503", "head": {"ref": "feature/10-nightcrew", "repo": repo},
+           "base": {"ref": None, "repo": repo}}]
+json.dump(every, open(path, "w"))
+PY
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-10.json" STUB_MODE=commit run "$PROJECT" 10
+same "a fork's, another base's or a baseless PR with the same branch name is not reused -> exit 0" "$CODE" 0
+same "a PR of its own is opened" "$(created_count)" "$((before + 1))"
+same "the receipt names the new PR, not a look-alike" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pr_number"])' "$TMP/receipts/issue-10.json" 2>&1)" \
+  "$((99 + before))"
+
+echo
+echo "a created PR that does not match the branch is not trusted"
+before="$(created_count)"
+touch "$GITEA/post-mismatch"
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-11.json" STUB_MODE=commit run "$PROJECT" 11
+rm -f "$GITEA/post-mismatch"
+same "a mismatched creation answer -> exit 1" "$CODE" 1
+same "no receipt for an unverified PR" "$( [ -e "$TMP/receipts/issue-11.json" ] && echo written || echo none)" none
+same "the branch stays on the remote for the rerun" "$(remote_has_branch feature/11-nightcrew)" yes
 
 echo
 echo "maintenance"

@@ -29,6 +29,13 @@ An alternate form of this I would like to enable are long living feature branche
 - `agent-pool/`: the pull-based, multi-provider worker pool (in progress): the
   controller tick `bin/prod-common.sh`, its helper scripts and offline tests. Design in
   `docs/plans/agent-pool-worker-pool.md`.
+- `scripts/tools/`: the entry points TheNightCrew's client requires for every repository it
+  serves. `night_shift.sh <project_dir> <issue> [agent]` is the issue executor, Cursor only:
+  the launcher is the controller, so it prepares the worktree, runs `cursor-agent` under a
+  generated `.cursor/cli.json`, then pushes, opens an unmerged PR and writes the task receipt.
+  The worker never publishes. `night_shift_maintenance.sh <project_dir> quality` runs the
+  offline verify suites (closed allowlist). `night_shift_gitea.py` makes the launcher's
+  Gitea calls. See #18.
 - `skills/pr-merge-loop/` — a **third, deliberately separate, mechanical**
   tick. No model worker at all: it merges only PRs an operator has explicitly
   labelled `review:automerge`, that also carry `review:clean`,
@@ -94,9 +101,12 @@ skills/pr-loops-common/tests/verify-resolve.sh
 skills/pr-loops-common/tests/verify-merge.sh
 skills/pr-loops-common/tests/verify-trigger.sh
 tests/verify-install.sh
+scripts/tools/tests/verify-night-shift.sh
 ```
 
 All offline: stubbed adapter and CLIs, temporary home, no systemctl.
+`verify-night-shift.sh` uses a stub `cursor-agent` and a loopback fake Gitea
+(`scripts/tools/tests/fake-gitea.py`).
 
 ## Not version controlled before this
 

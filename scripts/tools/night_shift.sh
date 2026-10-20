@@ -9,8 +9,9 @@
 # test commands), then pushes the branch, opens an unmerged PR and writes the task receipt.
 # The worker never pushes, labels, comments or merges.
 #
-# Exit codes: 0 PR opened (receipt written), 1 failure, 2 bad arguments or agent,
+# Exit codes: 0 PR opened or reused (receipt written), 1 failure, 2 bad arguments or agent,
 # 3 another night shift holds this project, 75 provider limit (the client parks the job).
+# Nothing reaches the remote before the push; a branch pushed before a failed PR step is kept.
 #
 # Environment:
 #   NIGHT_SHIFT_REPO          owner/name (default craigpars/PR-Review-Resolver-Loop-Merge-Gitea-Github)
@@ -241,8 +242,10 @@ tail -n 20 "$AGENT_LOG" | cut -c1-400 || true
 VERDICT="$("$PYTHON_BIN" "$PROJECT_DIR/agent-pool/scripts/classify.py" --provider cursor --exit "$AGENT_EXIT" \
   --stdout "$AGENT_LOG" --stderr "$AGENT_ERR" | cut -f1,2)" || VERDICT="incomplete"
 log "classified — ${VERDICT}"
-# Counted against the base, not this run's start: a rerun after a provider limit publishes the
-# commits the interrupted attempt left on the local branch.
+# Counted against the base, not this run's start, on purpose (#18 step 3): a rerun of the same
+# issue may reuse commits an earlier attempt left, whether parked by a limit on the local branch
+# or already pushed when the PR step failed. Success then means the PR exists, not that this run
+# authored new work; a run with nothing beyond the base still fails without publishing.
 NEW_COMMITS="$(git -C "$WORKTREE" rev-list --count "origin/${BASE_BRANCH}..HEAD")"
 
 CLASS="${VERDICT%%$'\t'*}"
@@ -329,8 +332,13 @@ Opened by \`scripts/tools/night_shift.sh\` for TheNightCrew: Cursor (model \`${M
 
 Unreviewed. Needs an independent current-head review before the merge controller may merge it.
 EOF
-PR_JSON="$("$PYTHON_BIN" "$TOOLS/night_shift_gitea.py" open-pr --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
-  --title "#${ISSUE_NUMBER}: ${ISSUE_TITLE}" --body-file "$PR_BODY")"
+# A push and a PR creation are not one transaction, and a timeout can hide a PR Gitea did create.
+# The pushed branch is never deleted: the rerun reuses its commits, finds that PR or opens it.
+if ! PR_JSON="$("$PYTHON_BIN" "$TOOLS/night_shift_gitea.py" open-pr --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+  --title "#${ISSUE_NUMBER}: ${ISSUE_TITLE}" --body-file "$PR_BODY")"; then
+  log "ERROR could not open or confirm a PR for ${BRANCH} at ${HEAD_SHA}; the pushed branch and its commits are kept for a rerun to reconcile; no receipt written"
+  exit 1
+fi
 log "pull request — ${PR_JSON}"
 
 if [ -n "${NIGHT_CREW_TASK_RECEIPT:-}" ]; then
