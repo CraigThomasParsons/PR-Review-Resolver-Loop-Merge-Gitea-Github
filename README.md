@@ -36,6 +36,13 @@ An alternate form of this I would like to enable are long living feature branche
   `systemd/agent-pool-*` into the user unit dir without enabling anything;
   `scripts/agent-labels.py`, which creates the `agent:*` labels on one repo; helper scripts
   and offline tests. Design in `docs/plans/agent-pool-worker-pool.md`.
+- `scripts/tools/`: the entry points TheNightCrew's client requires for every repository it
+  serves. `night_shift.sh <project_dir> <issue> [agent]` is the issue executor, Cursor only:
+  the launcher is the controller, so it prepares the worktree, runs `cursor-agent` under a
+  generated `.cursor/cli.json`, then pushes, opens an unmerged PR and writes the task receipt.
+  The worker never publishes. `night_shift_maintenance.sh <project_dir> quality` runs the
+  offline verify suites (closed allowlist). `night_shift_gitea.py` makes the launcher's
+  Gitea calls. See #18.
 - `skills/pr-merge-loop/` — a **third, deliberately separate, mechanical**
   tick. No model worker at all: it merges only PRs an operator has explicitly
   labelled `review:automerge`, that also carry `review:clean`,
@@ -107,10 +114,12 @@ agent-pool/tests/verify-nightcrew-issue-hold.sh
 agent-pool/tests/verify-doctor.sh
 agent-pool/tests/verify-systemd-units.sh
 agent-pool/tests/verify-agent-labels.sh
+scripts/tools/tests/verify-night-shift.sh
 ```
 
 All offline: stubbed adapter and CLIs, temporary home, no systemctl. The labels test talks to
-a fake Gitea on 127.0.0.1 only.
+a fake Gitea on 127.0.0.1 only. `verify-night-shift.sh` uses a stub `cursor-agent` and a loopback fake Gitea
+(`scripts/tools/tests/fake-gitea.py`).
 
 ## Not version controlled before this
 
