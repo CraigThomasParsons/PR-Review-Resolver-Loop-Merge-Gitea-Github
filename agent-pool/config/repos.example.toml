@@ -14,7 +14,8 @@ providers = ["claude", "cursor", "grok", "agy", "codex"]
 
 [repos."craigpars/AgileMedievalPeasantBoard"]
 main = "~/Code/AgileMedievalPeasantBoard"
-abilities = ["review", "resolve"]
+# Review only for the pilot. Resolve stays off until the controller-gates follow-up lands.
+abilities = ["review"]
 
 # Narrow one provider on this repo. A provider table can only take abilities away.
 [repos."craigpars/AgileMedievalPeasantBoard".providers.codex]
