@@ -1,6 +1,10 @@
 # Provider capability model
 
-Status: design plan only. Written against `master` at `9a5b472` (which includes merged PRs #2, #11, #13, #15, and #17), open PR #19 (`scripts/tools/night_shift.sh`), `docs/plans/agent-pool-worker-pool.md`, and `docs/plans/controller-gates.md`.
+Status: design plan, decisions settled 2026-10-20 (see Section 9). Written against `master` at
+`9a5b472` (which includes merged PRs #2, #11, #13, #15, and #17), open PR #19
+(`scripts/tools/night_shift.sh`), `docs/plans/agent-pool-worker-pool.md`,
+`docs/plans/controller-gates.md`, and `docs/plans/controller-commits-everything.md` (split out
+of this plan's former Section 7 — see Section 9's decision on scope).
 
 ## Context and motivation
 
@@ -16,7 +20,7 @@ Borrowing the capability-and-requirement model from Atlassian Bamboo, each provi
 
 ## 1. Ability vocabulary
 
-Every job processed by `agent-pool/bin/prod-common.sh` (and issue-dispatched jobs routed through `scripts/tools/night_shift.sh`) uses a closed vocabulary of five abilities. Under the **controller-commits-everything** rule (Section 7), no worker ever runs `git add`, `git commit`, `git push`, or any gate command.
+Every job processed by `agent-pool/bin/prod-common.sh` (and issue-dispatched jobs routed through `scripts/tools/night_shift.sh`) uses a closed vocabulary of five abilities. Under the **controller-commits-everything** rule (`docs/plans/controller-commits-everything.md`, a separate prerequisite plan for `prototype` and `test-author`; `resolve` migrates onto it too but keeps today's worker-commits-locally mechanism until that plan lands), no worker ever runs `git add`, `git commit`, `git push`, or any gate command.
 
 | Ability | Worker read scope | Worker write scope | Controller gates run? | Controller commits and pushes? | Output artifact on Gitea |
 |---|---|---|---|---|---|
@@ -37,13 +41,13 @@ Every job processed by `agent-pool/bin/prod-common.sh` (and issue-dispatched job
 3. **`prototype`**:
    - Executes in a detached throwaway worktree created by `prepare_worktree()` (`agent-pool/bin/prod-common.sh`, lines 593-599).
    - Gives the worker full worktree edit capability (subject to protected-file and secret checks) to explore a spike or alternative implementation.
-   - The controller never pushes a `prototype` result to `origin/<headref>`. Instead, it records a signed commit under a local controller-only ref in `$AGENT_POOL_MAIN`, posts the sanitized diff and report to Gitea, and deletes the worktree in `end_job()`. Promotion to a real branch requires an explicit human action (`agent:promote`, Section 7).
+   - The controller never pushes a `prototype` result to `origin/<headref>`. Instead, it records a signed commit under a local controller-only ref in `$AGENT_POOL_MAIN`, posts the sanitized diff and report to Gitea, and deletes the worktree in `end_job()`. Promotion to a real branch requires an explicit human action (`agent:promote`, Section 7; signing mechanics in `docs/plans/controller-commits-everything.md`).
 4. **`test-author`**:
    - Separates test creation from implementation so one provider (including `agy`) can write unit or integration tests while the controller executes them in the bubblewrap sandbox defined in `docs/plans/controller-gates.md`.
    - The worker may only create or edit files matching the repository's `test_paths` globs (defaulting to `tests/**`, `**/tests/**`, `**/*.test.*`, `**/*.spec.*`, `*Test.cs`, `*Test.php`, and `**/verify-*.sh`, minus any path in `protect`). Touching any non-test path causes `publish()` to reject the run and transition to `agent:needs-human`.
 5. **`resolve`**:
    - Addresses findings from the latest `pulse-review:v1` marker (or implements an approved issue spec when invoked via the issue executor flow).
-   - The worker edits files in `$JOB_WT` and writes its disposition report. It does not stage, commit, run gates, or push; the controller runs gates, creates the signed commit with trailers, stamps the resulting commit SHA into the marker, and pushes through `claim-record.py guard`.
+   - The worker edits files in `$JOB_WT` and writes its disposition report. It does not stage, commit, run gates, or push; the controller runs gates, creates the signed commit with trailers, stamps the resulting commit SHA into the marker, and pushes through `claim-record.py guard`. This mechanism is `docs/plans/controller-commits-everything.md`'s; until that plan lands, `resolve` keeps today's existing worker-commits-locally/controller-pushes-only behavior unchanged.
 
 ---
 
@@ -65,7 +69,7 @@ Capabilities are defined in a new helper `agent-pool/scripts/capabilities.py` (b
 
 - **Why `resolve` is forbidden for `agy`**: In `agent-pool/bin/prod-common.sh` (lines 95, 237, 312), `agy` could previously take `resolve` jobs only when `AGY_AUTO_APPROVE=1` added `--dangerously-skip-permissions`. As Craig confirmed and `docs/plans/controller-gates.md` (Section 5) records, `--dangerously-skip-permissions` lets the worker run arbitrary shell commands without an allowlist or hook, breaking the no-keys / no-code-execution containment invariant. `AGY_AUTO_APPROVE` is retired (setting it logs a `SETUP FAULT` and exits 2), and `capabilities.py` hard-blocks `agy` from advertising `resolve`.
 - **How `agy` executes `plan` and `review`**: `agy` runs in `--mode plan`, where all command execution and file writes are denied by the CLI itself. It reads `.agent-pool-context.md` (pre-populated by `write_context()` in `agent-pool/bin/prod-common.sh`) and emits its markdown report as the JSON `response` field (`agent-pool/scripts/classify.py`, line 175), which `classify.py` writes to `--result-out` for `publish()` to validate and post.
-- **How `agy` executes `prototype` and `test-author` without `--dangerously-skip-permissions`**:
+- **How `agy` executes `prototype` and `test-author` without `--dangerously-skip-permissions`** (confirmed by direct empirical test on 2026-10-20 — `agy --mode accept-edits --sandbox` was tried first as a candidate middle ground and rejected: it ran an arbitrary shell command (`touch PWNED.txt` succeeded) despite `--sandbox`'s "terminal restrictions" claim, so `--mode plan` + controller-side patch extraction is confirmed necessary, not merely assumed):
   - `agy` still runs in `--mode plan` (so it never executes shell commands and never needs `--dangerously-skip-permissions`).
   - Its prompt template (`prompts/prototype.agy.txt` and `prompts/test-author.agy.txt`) instructs it to emit its file additions/edits inside a fenced `patch` / unified-diff block (or file-replacement blocks) in its final response alongside its report marker, using the target files pre-included in `.agent-pool-context.md`.
   - After `agy` exits, a controller helper (`report.py extract-patch`) extracts the diff from `$result` and applies it to `$JOB_WT` via `gate_git apply --recount` (checking path containment and `test_paths` for `test-author`).
@@ -73,7 +77,7 @@ Capabilities are defined in a new helper `agent-pool/scripts/capabilities.py` (b
 
 ### Per-ability permission translation in `agent-pool/scripts/policy.py`
 
-With controller-run gates (`docs/plans/controller-gates.md`) and controller-created commits (Section 7), `policy.py` accepts `--job plan|review|prototype|test-author|resolve`:
+With controller-run gates (`docs/plans/controller-gates.md`) and controller-created commits (`docs/plans/controller-commits-everything.md`), `policy.py` accepts `--job plan|review|prototype|test-author|resolve`:
 
 - **`plan` and `review`**:
   - Allowed shell: `git status`, `git diff`, `git log`, `git show` with vetted flags in `GIT_SPECS` (`agent-pool/scripts/policy.py`, lines 95-102).
@@ -208,10 +212,10 @@ flowchart TD
 
 A pull-based worker pool where workers only claim what they can satisfy introduces a classic scheduling hazard: **starvation of jobs whose requirements no available worker can meet**. If `PROVIDER_ORDER=agy` and a PR needs `resolve`, every `agy` tick will skip the PR forever unless the pool distinguishes *permanent capability mismatch* from *temporary cooldown unavailability*.
 
-Both `agent-pool/bin/prod-common.sh` (during normal ticks) and `agent-pool/bin/doctor.sh` (on its 5-minute non-LLM timer from `docs/plans/agent-pool-worker-pool.md`) evaluate unsatisfiable `agent:ready` jobs using a deterministic three-tier partition of the configured roster (`PROVIDER_ORDER`):
+Both `agent-pool/bin/prod-common.sh` (during normal ticks) and `agent-pool/bin/doctor.sh` (on its 5-minute non-LLM timer from `docs/plans/agent-pool-worker-pool.md`) evaluate unsatisfiable `agent:ready` jobs using a deterministic three-tier partition. **Decided 2026-10-20 (Section 9): `C_roster` is checked against the host-wide roster, not the current tick's own `PROVIDER_ORDER`** — otherwise an `agy`-only tick would wrongly conclude a `resolve` job is unsatisfiable by anyone, even though a separate `claude` timer runs on the same host. `C_configured`/`C_eligible` still narrow by what the CURRENT tick can actually run:
 
-- **`C_roster`**: providers listed in `PROVIDER_ORDER` whose capability manifest (`capabilities.py`) satisfies `job.requires`.
-- **`C_configured`**: providers in `C_roster` that pass binary, model, and prompt preflight without a `SETUP FAULT`.
+- **`C_roster`**: providers listed in the host-wide `AGENT_POOL_ROSTER` (every provider enabled anywhere on the host, across every per-service `PROVIDER_ORDER` — see Step 1) whose capability manifest (`capabilities.py`) satisfies `job.requires`.
+- **`C_configured`**: providers in `C_roster`, filtered to this tick's own `PROVIDER_ORDER`, that pass binary, model, and prompt preflight without a `SETUP FAULT`.
 - **`C_eligible`**: providers in `C_configured` that are not in an active provider-level cooldown, not in an active ability-level cooldown for any ability in `job.requires`, and not blocked by an active `faults/gates.json` infra fault.
 
 ### Decision table for an `agent:ready` job with `C_eligible == empty`
@@ -295,45 +299,17 @@ Subcommand behavior in `agent-pool/scripts/cooldown.py`:
 
 ---
 
-## 7. Publishing `plan`, `prototype` and `test-author` outputs under controller-commits-everything
+## 7. Publishing ability outputs
 
-### 7.1 Controller-commits-everything architecture
+The commit/signing mechanism each of these flows uses (`controller_commit()`, signed `commit-tree`,
+`Agent-Pool-*` trailers, marker `head=pending` stamping) is specified in its own plan,
+`docs/plans/controller-commits-everything.md` — split out from here on 2026-10-20 because it is
+an orthogonal worker-permission/security change, not a claim-routing one. What follows is what
+each ability publishes and when; it assumes that mechanism exists for `prototype` and
+`test-author` (which have no prior behavior to fall back to), and that `resolve` migrates onto
+it from today's worker-commits-locally mechanism once that plan lands.
 
-In `docs/plans/controller-gates.md` (Section 4 and Section 7, Question 1), workers still ran `git add <named paths>` and `git commit -m <msg>` during `resolve` so the worker knew the commit SHA for its marker. Under this capability plan, **all commits are moved to the controller**:
-
-1. **Worker permissions (`agent-pool/scripts/policy.py`)**:
-   - `COMMIT_SHELL` (`git add *`, `git commit -m *`) and the `sub in ("add", "commit")` branches in `segment_ok()` (`agent-pool/scripts/policy.py`, lines 293-300, 337) are deleted.
-   - Every provider worker has the exact same read-only git command set (`git status`, `git diff`, `git log`, `git show`), enforced by CLI rules, hooks, and the `workerbin/git` PATH shim.
-   - Workers never write to `.git` or the git index.
-2. **Creating signed commits with trailers in `agent-pool/bin/prod-common.sh`**:
-   - New controller function `controller_commit()` runs after the worker process group is killed (`kill_worker_group`) and `still_held` is verified.
-   - Using `gate_git` (the scrubbed git wrapper from `docs/plans/controller-gates.md` Section 2.2) and a temporary index file `$RUNS/index-$JOB_PR-${ATTEMPT:0:8}` initialized from `$sha`:
-     1. The controller inspects modified and untracked files inside `$JOB_WT` via `gate_git --work-tree="$JOB_WT" status --porcelain -z`, ignoring excluded tool config paths (`.cursor/`, `.grok/`, `.claude/`, `.agent-pool-context.md`, `.agent-pool/`).
-     2. It verifies no changed path matches the protected set (`gates.py protected`) or credential filename patterns (`AGENTS.md`).
-     3. For `test-author`, it verifies every changed path matches `test_paths` from `.agent-pool/gates.toml`.
-     4. It stages the validated paths into the private index (`GIT_INDEX_FILE="$idx" gate_git --work-tree="$JOB_WT" add -- <paths>`), writes a tree object (`gate_git write-tree`), and runs `report.py scan` on the unified diff between `$sha` and the new tree.
-     5. For gated abilities (`resolve` and `test-author`), it checks out the candidate tree into `$GATE_DIR` and runs `gates.py run` (`docs/plans/controller-gates.md` Section 2). If gates fail, no commit ref is updated and nothing is pushed.
-     6. It builds the commit message from the report's summary line (or `chore(<ability>): automated <ability> for #<pr>`) followed by mandatory structured trailers:
-        ```text
-        <summary line from report>
-
-        Agent-Pool-Provider: <provider>
-        Agent-Pool-Ability: <ability>
-        Agent-Pool-Worker: <worker_id>
-        Agent-Pool-Attempt: <attempt_id>
-        Agent-Pool-Model: <model_or_default>
-        ```
-     7. It creates a **signed commit** in `$MAIN` using the controller's signing configuration (`AGENT_POOL_GIT_SIGNING_KEY` / controller `~/.gitconfig` signing keys, which exist only in the controller's own environment and were stripped from `spawn_worker` and `bwrap`):
-        ```bash
-        newhead="$(gate_git_signed commit-tree "$tree_sha" -p "$sha" -S -F "$msg_file")"
-        ```
-        Because `commit-tree` operates purely on `$MAIN`'s object database and the private index, it never executes worktree hooks or reads `.git/config` inside `$JOB_WT`.
-3. **Marker head stamping (`agent-pool/scripts/report.py` and `skills/pr-loops-common/marker.py`)**:
-   - Because the worker exits before the controller creates the signed commit, the worker writes `head=pending` (or `head=<sha>` when `fixed=0`) in its `pulse-resolve:v1` or `pulse-test-author:v1` marker.
-   - `report.py` validates the marker structure (`reviewed=`, `fixed + noted + deferred == findings`, secret scan) with `head=pending` before commit creation, and a new subcommand `report.py stamp-head --file "$report" --head "$newhead"` rewrites `head=pending` to `head=$newhead` right after `controller_commit()` succeeds and before `comment_file()` posts the report.
-   - `skills/pr-loops-common/marker.py` remains unchanged: the comment posted to Gitea always carries the final 40-hex `head=<newhead>` SHA, so `verify()` in `prod-common.sh` and `skills/pr-loops-common/pr-merge.sh` work without modification.
-
-### 7.2 Publication flow per ability
+### 7.1 Publication flow per ability
 
 #### A. Publishing `plan` outputs
 1. **Worktree check**: `publish()` checks that `$JOB_WT` has no tracked edits (`gate_git --work-tree="$JOB_WT" diff --quiet "$sha"`). Any stray edits are discarded and not committed.
@@ -382,29 +358,24 @@ In `docs/plans/controller-gates.md` (Section 4 and Section 7, Question 1), worke
 
 Every step keeps all existing offline suites green (`agent-pool/tests/verify-lease.sh`, `agent-pool/tests/verify-providers.sh`, `agent-pool/tests/verify-nightcrew-issue-hold.sh`, `skills/pr-loops-common/tests/verify-merge.sh`, `skills/pr-loops-common/tests/verify-resolve.sh`, `skills/pr-loops-common/tests/verify-trigger.sh`, and `tests/verify-install.sh`).
 
-### Step 0: Land PR #19 and the `controller-gates` follow-up first
+### Step 0: Land prerequisite plans first
 1. Review and merge open PR #19 (`scripts/tools/night_shift.sh`, `scripts/tools/night_shift_maintenance.sh`, `scripts/tools/night_shift_gitea.py`, `scripts/tools/tests/verify-night-shift.sh`) via `skills/pr-loops-common/pr-merge.sh`.
 2. Land the `controller-gates` PR (`docs/plans/controller-gates.md` Steps 1-10): `agent-pool/scripts/gates.py`, `.agent-pool/gates.toml`, `gate_git`, bubblewrap gate runner, shrunk `agent-pool/scripts/policy.py`, `workerbin/git` PATH shim, `agy` removed from `resolve`, and `AGY_AUTO_APPROVE` retired.
 3. Update `scripts/tools/night_shift.sh` (from PR #19) to drop the temporary `python3 -m unittest`, `python3 -m behave`, and `bash <dir>/verify-*.sh` allowances from Cursor's `.cursor/cli.json` and run `agent-pool/scripts/gates.py run` from the launcher after `cursor-agent` exits (closing PR #19's documented residual risk).
+4. Land `docs/plans/controller-commits-everything.md` (its own migration, Section 5 there) before Step 4 below, since `prototype` and `test-author` have no fallback mechanism without it.
 
-### Step 1: Controller-commits-everything and signed commit trailers
-- **Files**: `agent-pool/bin/prod-common.sh`, `agent-pool/scripts/policy.py`, `agent-pool/scripts/report.py`, `skills/pr-loops-common/prompts/resolve.generic.txt`, `scripts/tools/night_shift.sh`.
-- Add `controller_commit()` in `agent-pool/bin/prod-common.sh` using a private index, `commit-tree -S`, and the `Agent-Pool-Provider`, `Agent-Pool-Ability`, `Agent-Pool-Worker`, `Agent-Pool-Attempt`, and `Agent-Pool-Model` trailers.
-- Add `report.py stamp-head` and allow `head=pending` in pre-commit worker reports.
-- Remove `git add` and `git commit` (`COMMIT_SHELL` and the `add`/`commit` branches of `segment_ok`) from `agent-pool/scripts/policy.py`.
-- Invert the `git add` and `git commit` allow tests in `agent-pool/tests/verify-lease.sh` and `agent-pool/tests/verify-providers.sh` so worker-side `git add` and `git commit` are asserted as `deny`, and verify that `prod-common.sh` produces signed commits with trailers on `resolve`.
-
-### Step 2: Capability manifest and requirement parser
+### Step 1: Capability manifest, requirement parser, and the host-wide roster
 - **Files**: new `agent-pool/scripts/capabilities.py`, `skills/pr-loops-common/gitea-labels.py`, `skills/pr-loops-common/pr-merge.sh`, `skills/pr-loops-common/marker.py`.
 - Implement `agent-pool/scripts/capabilities.py` with subcommands:
   - `abilities --provider P`: prints the effective abilities for `P` (baseline manifest intersected with `AGENT_POOL_ABILITIES_<P>`, never widening past the baseline ceiling).
   - `match --order CSV --requires CSV`: prints providers in `order` whose abilities are a superset of `requires`.
   - `parse-requires --labels JSON [--body FILE] --default-job J`: outputs the canonical `requires` CSV.
+  - `check-queue --order CSV --requires CSV --roster CSV`: the `C_roster`/`C_configured`/`C_eligible` partition (Section 5) — takes the **host-wide roster** (every provider enabled anywhere on the host, across every per-service `PROVIDER_ORDER`, read from `AGENT_POOL_ROSTER`) as `--roster`, separately from the calling tick's own narrower `--order`, so an `agy`-only tick never wrongly concludes a `resolve` job is unsatisfiable just because `agy` itself can't do it. This is resolved here, in Step 1, specifically because Step 3's `doctor.sh` escalation logic depends on getting it right from the start rather than being rebuilt once decided.
 - Add `agent:plan`, `agent:review`, `agent:prototype`, `agent:test-author`, `agent:resolve`, and `agent:promote` to `LABELS` in `skills/pr-loops-common/gitea-labels.py` and update the blocking/cleanup label sets in `skills/pr-loops-common/pr-merge.sh`.
 - Add `pulse-plan:v1`, `pulse-prototype:v1`, and `pulse-test-author:v1` marker parsers in `skills/pr-loops-common/marker.py` and `agent-pool/scripts/report.py`.
-- Add unit tests in `agent-pool/tests/verify-lease.sh` and `skills/pr-loops-common/tests/verify-merge.sh`.
+- Add unit tests in `agent-pool/tests/verify-lease.sh` and `skills/pr-loops-common/tests/verify-merge.sh`, including: an `agy`-only `PROVIDER_ORDER` with a host-wide roster that also includes `claude` does NOT escalate a `resolve` job to `agent:needs-human`.
 
-### Step 3: Ability-level cooldowns in `agent-pool/scripts/cooldown.py`
+### Step 2: Ability-level cooldowns in `agent-pool/scripts/cooldown.py`
 - **Files**: `agent-pool/scripts/cooldown.py`, `agent-pool/tests/verify-lease.sh`.
 - Add `--ability` support to `record`, `clear`, `active`, `eligible`, `fault`, and `show` in `agent-pool/scripts/cooldown.py`.
 - Assert in `agent-pool/tests/verify-lease.sh` that:
@@ -412,7 +383,7 @@ Every step keeps all existing offline suites green (`agent-pool/tests/verify-lea
   - A provider-level cooldown on `claude` blocks all abilities.
   - `clear --provider claude --ability resolve` clears both the `resolve` ability cooldown and any top-level provider strikes.
 
-### Step 4: Claim filtering by ability and unsatisfiable-job handling in `prod-common.sh` and `doctor.sh`
+### Step 3: Claim filtering by ability and unsatisfiable-job handling in `prod-common.sh` and `doctor.sh`
 - **Files**: `agent-pool/scripts/claim-record.py`, `agent-pool/bin/prod-common.sh`, new `agent-pool/bin/doctor.sh`, `agent-pool/tests/verify-providers.sh`, new `agent-pool/tests/inject-staleness.sh`.
 - Add `--requires` and `--expect-ability-labels` to `agent-pool/scripts/claim-record.py`.
 - Replace `job_providers()` in `agent-pool/bin/prod-common.sh` with `capable_providers()`, implementing the `C_roster` / `C_configured` / `C_eligible` partition:
@@ -424,7 +395,8 @@ Every step keeps all existing offline suites green (`agent-pool/tests/verify-lea
   - `PROVIDER_ORDER=agy` on a PR requiring `resolve` transitions immediately to `agent:needs-human`.
   - `PROVIDER_ORDER=claude` where `claude` is on a `resolve` ability cooldown leaves a `resolve` PR in `agent:ready` (waiting for cooldown) while still claiming and completing a `review` PR in the same tick.
 
-### Step 5: `plan`, `prototype`, and `test-author` execution, prompts, and publication
+### Step 4: `plan`, `prototype`, and `test-author` execution, prompts, and publication
+- **Prerequisite**: `docs/plans/controller-commits-everything.md` must be merged before this step — `prototype` and `test-author` have no mechanism to publish without `controller_commit()`.
 - **Files**: `agent-pool/bin/prod-common.sh`, `agent-pool/scripts/policy.py`, `agent-pool/scripts/report.py`, `agent-pool/scripts/gates.py`, `skills/pr-loops-common/prompts/`.
 - Add prompt templates `plan.generic.txt`, `prototype.generic.txt`, `prototype.agy.txt`, `test-author.generic.txt`, and `test-author.agy.txt` under `skills/pr-loops-common/prompts/`.
 - Add `test_paths` validation to `agent-pool/scripts/gates.py` and `agent-pool/scripts/policy.py`.
@@ -434,12 +406,57 @@ Every step keeps all existing offline suites green (`agent-pool/tests/verify-lea
 
 ---
 
-## 9. Open questions for Craig
+## 9. Decisions (settled 2026-10-20)
 
-1. **How should `agy` produce file edits in `prototype` and `test-author` without `--dangerously-skip-permissions`?** This plan runs `agy` in `--mode plan` (where `agy` cannot execute shell commands or write files directly) and has the controller extract unified diffs from `agy`'s JSON response and apply them with `gate_git apply`. Does `agy` have a native flags-based write-only-to-workspace mode with shell execution disabled that you prefer over controller-applied patch extraction, or is `--mode plan` + controller `git apply` the right shape?
-2. **In `test-author`, should a newly authored test be required to pass (`result=pass`) or fail (`expect_fail` red-first TDD) before the controller pushes it?** When `test-author` writes regression coverage for already-merged or already-fixed code, gates should pass. When `test-author` runs *before* `resolve` to reproduce a bug or review finding, a true reproducer test will fail until `resolve` fixes the production code. Should `agent:test-author` default to requiring green gates, with an optional directive `<!-- agent-pool-job: requires=test-author test-mode=red -->` that requires the new test to fail cleanly at the current head before handing off to `resolve`?
-3. **Should composite requirements (`requires=test-author,resolve`) run as two separate controller-committed stages or one single-worker attempt?** Running them as two stages (Worker 1 claims `test-author`, controller runs gates and commits the tests; Worker 2 claims `resolve`, sees the committed tests, edits production code, and controller runs gates and commits the fix) lets `agy` take Stage 1 (`test-author`) and `claude`/`cursor`/`grok` take Stage 2 (`resolve`), and prevents the resolver from weakening the test it just wrote because `protect` can lock the test files during Stage 2. Do you want two-stage chaining as the default whenever both `agent:test-author` and `agent:resolve` labels are present?
-4. **How should the controller sign commits (`controller_commit()`)?** Should `gate_git_signed` use an SSH signing key (`gpg.format=ssh` with a dedicated controller-only key file outside `$SSH_AUTH_SOCK`), a GPG key in a controller-only keyring (`GNUPGHOME`), or unsigned commits with the `Agent-Pool-*` trailers when no signing key is configured (`AGENT_POOL_GIT_SIGN=optional` vs `required`)?
-5. **Single-commit vs per-finding commits under controller-commits-everything:** Once `git add` and `git commit` are removed from worker permissions, the controller commits the worker's final worktree tree as one signed commit per ability run (carrying the `Agent-Pool-*` trailers and per-finding dispositions in the commit body and PR comment). Is one controller-signed commit per run acceptable, or do you want workers to leave a structured `.agent-pool-commits.json` manifest of path-groups and messages for the controller to replay as multiple signed commits?
-6. **Prototype retention and garbage collection:** `prototype` runs store their signed commits under `refs/agent-pool/prototypes/<pr>/<attempt_id>` in `$AGENT_POOL_MAIN` without pushing to `origin`. Should `agent-pool/bin/doctor.sh` prune unpromoted prototype refs once a PR is closed/merged or after a fixed TTL (for example 14 days)?
-7. **Timeout before escalating an unsatisfiable `C_roster == empty` job to `agent:needs-human`:** If each provider has its own systemd timer (`prod-claude.timer`, `prod-agy.timer`) and its own per-service `PROVIDER_ORDER` override (for example `prod-agy.service` sets `PROVIDER_ORDER=agy` while `prod-claude.service` sets `PROVIDER_ORDER=claude`), an `agy` tick seeing a `resolve` job would think `C_roster` is empty if it only looked at its own `PROVIDER_ORDER`. Should `capabilities.py` check a host-wide `AGENT_POOL_ROSTER` (all providers enabled on the host across timers) before declaring a job unsatisfiable and moving it to `agent:needs-human`, while each individual timer still filters claims by its own `PROVIDER_ORDER`?
+All nine open questions from the first draft were settled in one review/grilling session with
+Craig. Recorded here with rationale so the "why" survives past the conversation that produced
+it.
+
+1. **`agy`'s write mechanism for `prototype`/`test-author`: `--mode plan` + controller-side
+   patch extraction — confirmed by direct test, not assumed.** The candidate middle ground
+   (`--mode accept-edits --sandbox`) was empirically tested in a disposable directory on
+   2026-10-20 and rejected: it ran an arbitrary shell command (`touch PWNED.txt` succeeded)
+   despite `--sandbox`'s "terminal restrictions" claim. The plan's original design (Section 2,
+   "How `agy` executes `prototype` and `test-author`") stands, for a proven reason.
+2. **Relationship to "Conduits" (issue #6): a stepping stone, not a replacement — see Section 10.**
+3. **Section 7 split into its own plan**, `docs/plans/controller-commits-everything.md` — done as
+   part of this update. Ability-routing (this plan) and commit-authority (that plan) are
+   orthogonal; bundling them grew the review surface and rollback blast radius for no benefit,
+   on top of already depending on two other unmerged plans (`controller-gates.md`, PR #19).
+4. **Host-wide roster, resolved before Step 3 builds on it** — see Section 5 and Step 1. Without
+   it, a single-provider tick (e.g. `PROVIDER_ORDER=agy`) would wrongly conclude a job no other
+   provider on the host can do, even when a separate timer for that provider exists right next
+   to it.
+5. **`test-author` gate mode: green by default, red opt-in.** `<!-- agent-pool-job:
+   requires=test-author test-mode=red -->` opts into requiring the new test to fail cleanly
+   before handoff to `resolve`. A silently-failing default gate would be a confusing, risky
+   standard behavior.
+6. **Composite `test-author`+`resolve`: two-stage by default.** This is what lets `agy` take
+   `test-author` while staying excluded from `resolve`, and lets `protect` lock the just-written
+   test files during the resolve stage so the resolver can't weaken its own test.
+7. **Commit signing: SSH key, controller-only, required — see
+   `docs/plans/controller-commits-everything.md` Section 4.**
+8. **Commit granularity: one signed commit per run — see
+   `docs/plans/controller-commits-everything.md` Section 4.**
+9. **Prototype retention: TTL-based GC (14 days, as originally suggested), plus durability is a
+   real decision, not an afterthought of garbage collection.** Chosen: lean on the controller
+   host's existing backup routine rather than building new push-to-a-durable-branch
+   infrastructure. If the controller host's backup coverage changes later, revisit whether
+   unpromoted prototype refs need their own explicit backup path.
+
+## 10. Relationship to "Conduits" (issue #6)
+
+Issue #6 (`PR-Review-Resolver-Loop-Merge-Gitea-Github#6` on GitHub) envisions named, database-
+configured agent personas (e.g. two differently-configured Claude-backed identities) — richer
+than anything in this plan. Decided: **this plan is a stepping stone, not a replacement.**
+`capabilities.py`'s static per-provider manifest stays the hard ceiling (Section 2: "can never
+widen a provider beyond its hard ceiling"). If Conduits is built later, named personas narrow
+within that ceiling, the same pattern this plan already uses for
+`AGENT_POOL_ABILITIES_<PROVIDER>` — rather than this plan being redesigned around a database that
+does not exist yet.
+
+Refined during the same session: a **conduit is a template** — one per provider, each living in
+its own repo (one repo per provider: Claude, Codex, Grok, Agy, Cursor). The tunable settings
+(personality, model, and other per-conduit knobs) are externalized to a database or TOML file,
+editable through a UI, rather than hardcoded into the template repo itself. This refinement is
+not designed further here; it belongs in issue #6, not in this plan.
