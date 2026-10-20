@@ -1017,6 +1017,25 @@ expect "a broken repo does not stop the others" "$(comments)" "pulse-review:v1"
 expect "but the run reports its setup fault" "$TICK_RC" "2"
 bash "$EP/prod-claude.sh" extra > "$TMP/out.txt" 2>&1
 expect "an entrypoint takes no arguments" "$?" "2"
+
+echo "  (a stop that signals only the entrypoint, as systemd's KillMode=mixed does)"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" '[repos."owner/other"]' "main = \"$TMP/main\""
+reset '["agent:ready"]'
+behave claude hang
+env -u AGENT_POOL_REPO -u AGENT_POOL_MAIN -u AGENT_POOL_WORKER_ID bash "$EP/prod-claude.sh" > "$TMP/out.txt" 2>&1 &
+ep=$!
+for _ in $(seq 150); do [ "$(ncalls claude)" -ge 1 ] && break; sleep 0.1; done
+sleep 1
+hung="$(tail -n 1 "$STUB_PIDS")"
+t0=$(date +%s); kill -TERM "$ep"; wait "$ep"; rc=$?; took=$(( $(date +%s) - t0 ))
+expect "TERM to the entrypoint alone stops the run (exit 143)" "$rc" "143"
+expect "without waiting out the worker" "$([ "$took" -lt 30 ] && echo fast || echo "slow ${took}s")" "fast"
+expect "the TERM reached the tick, whose exit trap requeued the job" "$(labels)" "agent:ready"
+expect "and released its claim" "$(record)" "{}"
+expect "the tick says why" "$(cat "$TMP/out.txt")" "exited unexpectedly (exit 143)"
+expect "the hung worker was stopped with its group" "$(kill -0 "$hung" 2>/dev/null && echo alive || echo dead)" "dead"
+expect "and no further repo was ticked" "$(cat "$TMP/out.txt")" "stopped; ticking no further repos"
+expect_not "owner/other never started" "$(cat "$TMP/out.txt")" "owner/other: tick as"
 AGENT_POOL_CONFIG="$ROOT/agent-pool/config/repos.example.toml" python3 "$ROOT/agent-pool/scripts/repoconfig.py" check >/dev/null 2>&1
 expect "the shipped example config validates" "$?" "0"
 expect "a repo the config does not name is review only" "$(repoconf abilities --repo some/where --provider claude)" "review"

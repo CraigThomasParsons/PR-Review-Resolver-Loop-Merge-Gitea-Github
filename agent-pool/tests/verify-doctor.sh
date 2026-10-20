@@ -22,7 +22,7 @@ SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 # ---------------------------------------------------------------- stubs
 cat > "$TMP/common/gitea-pr.py" <<'PY'
-import json, os, sys
+import json, os, subprocess, sys
 path = os.environ["STUB_GITEA"]
 st = json.load(open(path))
 a = sys.argv[1:]
@@ -35,6 +35,9 @@ cmd = a[0]
 if os.path.exists(path + ".fail-" + cmd):
     sys.exit(f"stub adapter: {cmd} failed")
 if cmd == "list":
+    if os.path.exists(path + ".on-list"):
+        # Something a tick does between the doctor's read of the claim records and its listing.
+        subprocess.run(["bash", path + ".on-list"], check=False); os.remove(path + ".on-list")
     print(json.dumps([{"number": int(n), "title": p.get("title", "t"), "draft": p.get("draft", False),
                        "head_sha": p["head_sha"], "head_ref": "feature/x", "base_ref": "master", "author": "human",
                        "is_bot": False, "labels": p["labels"], "assignees": p.get("assignees", []), "url": ""}
@@ -105,6 +108,11 @@ PY
 }
 review_marker() { # head findings
   printf '[{"id":1,"user":"bot","created_at":"","body":"## Automated review\\n<!-- pulse-review:v1 head=%s findings=%s -->"}]' "$1" "$2"
+}
+resolve_thread() { # review-head findings resolve-head fixed noted deferred
+  printf '[{"id":1,"user":"bot","created_at":"","body":"<!-- pulse-review:v1 head=%s findings=%s -->"},' "$1" "$2"
+  printf '{"id":2,"user":"bot","created_at":"","body":"<!-- pulse-resolve:v1 head=%s reviewed=%s fixed=%s noted=%s deferred=%s -->"}]' \
+    "$3" "$1" "$4" "$5" "$6"
 }
 claim() { # pr provider worker [seconds-ago] [deadline-secs] -> attempt id
   local now; now="$(date +%s)"
@@ -197,6 +205,15 @@ expect "under a fence" "$(record 7)" "\"fenced_attempt\": \"$old\""
 expect "with no cooldown: the tick died, not the provider" "$(cooldown_doc claude)" "none"
 reset
 addpr 7 '["agent:claimed"]'
+old="$(claim 7 grok w1 10000 100)"
+: > "$(lockfile w1)"
+doctor
+expect "a crashed tick past its deadline is still a dead worker, not stale" "$(rq 'r["claims"][0]["state"]')" "dead-worker"
+expect "it is requeued" "$(labels 7)" "agent:ready"
+expect "under a fence" "$(record 7)" "\"fenced_attempt\": \"$old\""
+expect "and its provider takes no strike for the crash" "$(cooldown_doc grok)" "none"
+reset
+addpr 7 '["agent:claimed"]'
 old="$(claim 7 claude w1)"
 exec 8>"$(lockfile w1)"; flock -x 8
 doctor
@@ -254,6 +271,16 @@ doctor
 expect "agent:claimed with no record goes to agent:needs-human" "$(labels 7)" "agent:needs-human"
 expect "with a comment saying why" "$(comments 7)" "no claim record backs it"
 expect "reported as no-record" "$(rq 'r["claims"][0]["state"]')" "no-record"
+reset
+addpr 7 '["agent:claimed"]'
+cat > "$STUB_GITEA.on-list" <<SH
+python3 "$CLAIMREC" claim --repo $R --pr 7 --worker w2 --provider claude --job review --deadline-secs 2700 >/dev/null
+SH
+doctor
+expect "a claim made after the doctor read the records is re-read, not no-record" "$(rq 'r["claims"][0]["state"]')" "live"
+expect "and is left alone" "$(labels 7)" "agent:claimed"
+expect "with no comment" "$(comments 7)" "[]"
+expect "and no escalation attempted" "$(rq 'r["claims"][0]["action"]')" "none"
 reset
 addpr 7 '["agent:done"]'
 claim 7 claude w1 10000 100 >/dev/null
@@ -318,6 +345,31 @@ expect "and reported held" "$(rq '[q["state"] for q in r["queue"] if q["pr"] == 
 expect "a clean review at the head is settled, not escalated" "$(rq '[q["state"] for q in r["queue"] if q["pr"] == 8]')" "settled"
 expect "a review of an older head means a review job" "$(rq '[q["job"] for q in r["queue"] if q["pr"] == 9]')" "review"
 expect "so it is not escalated" "$(labels 9)" "agent:ready"
+reset
+addpr 7 '["agent:ready"]' "$(resolve_thread "$SHA_A" 2 "$SHA_B" 1 1 0)" '[]' "$SHA_B"
+addpr 8 '["agent:ready"]' "$(resolve_thread "$SHA_A" 2 "$SHA_B" 1 0 1)" '[]' "$SHA_B"
+addpr 9 '["agent:ready"]' "$(resolve_thread "$SHA_A" 2 "$SHA_B" 1 0 0)" '[]' "$SHA_B"
+addpr 10 '["agent:ready"]' "$(resolve_thread "$SHA_A" 2 "$SHA_B" 0 2 0)" '[]' "$SHA_B"
+doctor
+q() { rq "[q['$2'] for q in r['queue'] if q['pr'] == $1][0]"; }
+expect "a resolve that answers every finding at the head is settled" "$(q 7 state)" "settled"
+expect "a resolve that deferred a finding is not settled" "$(q 8 state)" "claimable"
+expect "but a review job, as prod-common.sh derives it" "$(q 8 job)" "review"
+expect "a resolve that accounts for 1 of 2 findings is not settled" "$(q 9 job)" "review"
+expect "a resolve claiming no fixes while the head moved is not settled" "$(q 10 job)" "review"
+expect "the review jobs stay queued for the pool" "$(labels 8),$(labels 9),$(labels 10)" "agent:ready,agent:ready,agent:ready"
+for c in "$SHA_A 2|$SHA_B $SHA_A 1 0 1|$SHA_A|$SHA_B|ok" \
+         "$SHA_A 2|$SHA_B $SHA_A 1 0 0|$SHA_A|$SHA_B|fail:the review raised 2 finding(s) but the resolver accounted for 1" \
+         "$SHA_A 2|$SHA_B $SHA_A 1 1 0|$SHA_A|$SHA_B|fail:1 of 2 finding(s) are blocking and need a human decision; 1 fixed, 0 noted" \
+         "$SHA_A 1|$SHA_A $SHA_A 1 0 0|$SHA_A|$SHA_A|fail:the resolver claims 1 fix(es) but the PR head never moved" \
+         "$SHA_A 1|$SHA_B $SHA_B 1 0 0|$SHA_A|$SHA_B|fail:the resolver answered a review of $SHA_B but the findings on this PR are from $SHA_A"; do
+  IFS='|' read -r review resolve base head want <<<"$c"
+  expect "marker.py check-resolve: ${want%%;*}" \
+    "$(python3 "$ROOT/agent-pool/scripts/marker.py" check-resolve --review "$review" --resolve "$resolve" --base "$base" --head "$head")" "$want"
+done
+expect "marker.py check-resolve: a non-fast-forward fix fails" \
+  "$(python3 "$ROOT/agent-pool/scripts/marker.py" check-resolve --review "$SHA_A 1" --resolve "$SHA_B $SHA_A 1 0 0" --base "$SHA_A" --head "$SHA_B" --fast-forward no)" \
+  "fail:the PR head moved to $SHA_B but not as a fast-forward of $SHA_A"
 reset
 addpr 8 '["agent:ready"]' "$(review_marker "$SHA_A" 2)"
 claim 8 claude w1 >/dev/null

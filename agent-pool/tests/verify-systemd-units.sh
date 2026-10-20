@@ -117,8 +117,11 @@ expect "the doctor runs every 15 minutes off the merge tick" "$(key "$D/agent-po
 for unit in agent-pool-prod@.service agent-pool-doctor.service; do
   expect "$unit is a oneshot" "$(key "$D/$unit" Type)" "oneshot"
   expect "$unit's env file is optional" "$(key "$D/$unit" EnvironmentFile)" "-%h/.config/agent-pool/env"
-  expect "$unit sets an explicit PATH" "$(key "$D/$unit" Environment)" "PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin"
+  expect "$unit sets exactly the explicit PATH" "[$(grep -E '^Environment=PATH=' "$D/$unit")]" \
+    "[Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin:%h/.npm-global/bin]"
 done
+expect "a stopped prod signals only its entrypoint, which forwards to the tick" "[$(key "$D/agent-pool-prod@.service" KillMode)]" "[mixed]"
+expect "and its exit trap gets a bounded time to release the claim" "[$(key "$D/agent-pool-prod@.service" TimeoutStopSec)]" "[2min]"
 expect_not "no unit starts anything by itself" "$(cat "$D"/agent-pool-*.service "$D"/agent-pool-*.timer)" "systemctl"
 
 echo

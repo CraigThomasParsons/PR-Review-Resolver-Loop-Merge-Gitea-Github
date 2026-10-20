@@ -7,12 +7,15 @@ only through claim-record.py under the job lock. It must not itself be rate-limi
 
 1. Claims: every claim record under $AGENT_POOL_STATE/claims, and every open PR labelled
    agent:claimed in a configured repo.
+     claimed + record whose tick is gone          dead-worker: fence and requeue, no cooldown
+                                                   (the tick died, not the provider), whatever
+                                                   the deadline
      claimed + record past expected_deadline_at  stale: fence and requeue; the provider cools
                                                    down unless its work was already published
-     claimed + record whose tick is gone          dead-worker: fence and requeue, no cooldown
-                                                   (the tick died, not the provider)
      claimed + live record                        left alone
-     claimed + no record                          agent:needs-human with a comment
+     claimed + no record                          agent:needs-human with a comment (after
+                                                   re-reading the record: a tick may have
+                                                   claimed it since the records were read)
      record, PR not claimed                       left for the prod tick, which drops it
    A tick holds $AGENT_POOL_STATE/pool-<worker>-<repo>.lock for its whole run (its workers
    inherit it), so a lock file that exists with nobody holding it means the tick that wrote the
@@ -63,6 +66,7 @@ from pathlib import Path
 from typing import Any
 
 import cooldown
+import marker as pool_marker
 import poolstate
 import repoconfig
 
@@ -147,8 +151,9 @@ def derive_job(marker: types.ModuleType, comments: list[dict], head: str) -> tup
             return "resolve", ""
         return "settled", "the review of its head is already posted and clean"
     resolves = [r for c in comments for r in [marker.parse_resolve(c.get("body") or "")] if r]
-    if latest and resolves and resolves[-1][0] == head and resolves[-1][1] == latest[0]:
-        return "settled", "a resolve at its head already answers the latest review"
+    if latest and resolves and resolves[-1][0] == head and resolves[-1][1] == latest[0] \
+            and pool_marker.check_resolve(latest, resolves[-1], latest[0], head) == "ok":
+        return "settled", "a resolve at its head already answers the latest review and verifies"
     return "review", ""
 
 
@@ -217,6 +222,11 @@ class Doctor:
     def claim(self, repo: str, pr: int, doc: dict | None, info: dict | None, allowed: bool) -> None:
         entry: dict[str, Any] = {"repo": repo, "pr": pr, "state": "", "action": "none", "reason": ""}
         self.claims.append(entry)
+        if doc is None:
+            # The records were read before the listing; a tick may have claimed it since.
+            fresh = poolstate.load(self.state / "claims" / f"{poolstate.slug(repo)}__{pr}.json")
+            if isinstance(fresh, dict) and fresh:
+                doc = fresh
         if doc is not None:
             entry.update(attempt=doc.get("attempt_id", ""), provider=doc.get("provider", ""),
                          worker_id=doc.get("worker_id", ""), deadline=doc.get("expected_deadline_at", ""))
@@ -239,11 +249,12 @@ class Doctor:
             return
         worker = doc.get("worker_id", "")
         lock = self.state / f"pool-{poolstate.slug(worker)}-{poolstate.slug(repo)}.lock"
-        if self.now > epoch(doc["expected_deadline_at"]):
-            entry.update(state="stale", reason=f"past its deadline {doc['expected_deadline_at']}")
-        elif poolstate.lock_abandoned(lock):
+        # A gone tick is a crash, not a slow provider, even past the deadline: no cooldown strike.
+        if poolstate.lock_abandoned(lock):
             entry.update(state="dead-worker", reason=f"the tick of {worker} that holds it is gone "
                                                      f"(its lock {lock.name} is free)")
+        elif self.now > epoch(doc["expected_deadline_at"]):
+            entry.update(state="stale", reason=f"past its deadline {doc['expected_deadline_at']}")
         else:
             entry.update(state="live")
             return

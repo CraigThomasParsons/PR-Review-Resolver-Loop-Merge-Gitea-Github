@@ -18,3 +18,8 @@ ExecStart=@POOL_ROOT@/agent-pool/bin/prod-%i.sh
 # Backstop only: every worker is already bounded by WORKER_TIMEOUT. A tick killed here leaves
 # its claim behind with its tick lock free, which agent-pool-doctor requeues as a dead worker.
 TimeoutStartSec=4h
+# On a stop or timeout, TERM only the entrypoint: it forwards TERM to the tick, whose exit trap
+# stops the worker group and releases the claim (claim-record.py, the adapter) undisturbed.
+# Whatever is still running after TimeoutStopSec is killed.
+KillMode=mixed
+TimeoutStopSec=2min

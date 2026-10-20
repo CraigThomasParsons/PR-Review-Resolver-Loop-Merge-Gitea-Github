@@ -110,6 +110,23 @@
 
 set -uo pipefail
 
+# forward_signals cmd...: run cmd as a child and pass TERM (and INT, as TERM: a non-interactive
+# shell's background child ignores INT) on to it. systemd's KillMode=mixed signals only the main
+# process, which is a wrapper here; the tick below it must still get TERM and run its exit trap.
+fwd_stopped=0
+forward_signals() {
+  local fwd_rc
+  "$@" &
+  fwd_child=$!
+  trap 'fwd_stopped=1; kill -TERM "$fwd_child" 2>/dev/null' TERM INT
+  while :; do
+    wait "$fwd_child"; fwd_rc=$?
+    kill -0 "$fwd_child" 2>/dev/null || break
+  done
+  trap - TERM INT
+  return "$fwd_rc"
+}
+
 if [ -n "${AGENT_POOL_PROVIDER:-}" ]; then
   # Sourced by an entrypoint, possibly under set -e: every command below tolerates failure.
   entry_provider="$AGENT_POOL_PROVIDER"
@@ -131,11 +148,12 @@ if [ -n "${AGENT_POOL_PROVIDER:-}" ]; then
     [ "$entry_hold" = 1 ] && entry_env+=(AGENT_POOL_NIGHTCREW_HOLD=1)
     entry_log "$entry_repo: tick as $entry_worker with abilities $entry_abilities"
     rc=0
-    env "${entry_env[@]}" bash "$entry_self" </dev/null || rc=$?
+    forward_signals env "${entry_env[@]}" bash "$entry_self" </dev/null || rc=$?
     if [ "$rc" -ne 0 ]; then
       entry_log "$entry_repo: tick exited $rc"
       [ "$entry_rc" -eq 2 ] || entry_rc="$rc"
     fi
+    if [ "$fwd_stopped" = 1 ]; then entry_log "stopped; ticking no further repos"; exit 143; fi
   done <<<"$entry_ticks"
   exit "$entry_rc"
 fi
@@ -148,8 +166,8 @@ if [ -z "${AGENT_POOL_PINNED:-}" ]; then
   pinned="$(mktemp -t prod-common.XXXXXX.sh)"
   cat "${BASH_SOURCE[0]}" > "$pinned"
   export AGENT_POOL_PINNED="$pinned"
-  bash "$pinned" "$@"
-  rc=$?
+  rc=0
+  forward_signals bash "$pinned" "$@" || rc=$?
   rm -f "$pinned"
   exit $rc
 fi
@@ -396,30 +414,12 @@ verify() { # job pr base-sha headref [pushed-sha] -> ok | clean | fail-nomarker:
   git -C "$MAIN" fetch origin --quiet "refs/heads/$headref" 2>/dev/null
   local rm; rm="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
   if [ -z "$rm" ]; then echo "fail-nomarker:the resolver left no disposition marker, so what it did to each finding is unknown"; return; fi
-  local r_head r_reviewed r_fixed r_deferred r_noted
-  read -r r_head r_reviewed r_fixed r_deferred r_noted <<<"$rm"
-  r_noted="${r_noted:-0}"
   local review; review="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
-  local review_head="${review%% *}" review_count="${review##* }"
-  if [ "$r_reviewed" != "$review_head" ]; then
-    echo "fail:the resolver answered a review of $r_reviewed but the findings on this PR are from $review_head"; return
-  fi
-  if [ "$((r_fixed + r_noted + r_deferred))" -ne "${review_count:-0}" ]; then
-    echo "fail:the review raised $review_count finding(s) but the resolver accounted for $((r_fixed + r_noted + r_deferred))"; return
-  fi
-  if [ "$r_fixed" -gt 0 ]; then
-    if [ "$newsha" = "$sha" ]; then echo "fail:the resolver claims $r_fixed fix(es) but the PR head never moved"; return; fi
-    if [ "$r_head" != "$newsha" ]; then echo "fail:the resolver named head $r_head but the PR is at $newsha"; return; fi
-    if ! git -C "$MAIN" merge-base --is-ancestor "$sha" "$newsha"; then
-      echo "fail:the PR head moved to $newsha but not as a fast-forward of $sha"; return
-    fi
-  elif [ "$newsha" != "$sha" ]; then
-    echo "fail:the resolver claims no fixes yet the PR head moved to $newsha"; return
-  fi
-  if [ "$r_deferred" -gt 0 ]; then
-    echo "fail:$r_deferred of $review_count finding(s) are blocking and need a human decision; $r_fixed fixed, $r_noted noted"; return
-  fi
-  echo ok
+  local ff=yes
+  if [ "$newsha" != "$sha" ] && ! git -C "$MAIN" merge-base --is-ancestor "$sha" "$newsha" 2>/dev/null; then ff=no; fi
+  # The same check the doctor applies before it calls a PR settled (scripts/marker.py).
+  python3 "$SCRIPTS/marker.py" check-resolve --review "$review" --resolve "$rm" --base "$sha" --head "$newsha" \
+    --fast-forward "$ff" 2>/dev/null || echo "fail:the resolver's disposition marker could not be checked"
 }
 
 # derive_job pr sha headref -> DJ (review|resolve|settled), DBASE (the head verify measures from),
