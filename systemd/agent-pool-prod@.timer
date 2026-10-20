@@ -1,0 +1,15 @@
+[Unit]
+# Hourly. install-systemd-units.sh drops agent-pool-prod@<provider>.timer.d/stagger.conf next to
+# this, moving each provider to its own minute so the instances never tick together and stay
+# clear of pr-merge-tick (:08/:23/:38/:53) and pr-pipeline (:37).
+Description=Agent pool: hourly %i prod tick
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+FixedRandomDelay=true
+Unit=agent-pool-prod@%i.service
+
+[Install]
+WantedBy=timers.target

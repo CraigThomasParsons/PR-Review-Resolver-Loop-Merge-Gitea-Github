@@ -1,0 +1,17 @@
+[Unit]
+# Non-LLM sweep: requeues stalled claims and dead workers, sends jobs no enabled provider can
+# take to agent:needs-human. See agent-pool/scripts/doctor.py. Installed by
+# agent-pool/bin/install-systemd-units.sh, which fills in @POOL_ROOT@.
+Description=Agent pool: doctor
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin:%h/.npm-global/bin
+EnvironmentFile=-%h/.config/agent-pool/env
+ExecStart=@POOL_ROOT@/agent-pool/bin/doctor.sh
+# The JSON report is also saved to $AGENT_POOL_STATE/doctor/report.json; the journal keeps the
+# log lines (stderr) only.
+StandardOutput=null
+TimeoutStartSec=15min
