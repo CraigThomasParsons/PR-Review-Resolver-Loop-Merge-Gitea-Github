@@ -3,6 +3,13 @@
 Status: plan only. Nothing here is built. Written 2026-10-17 against `feature/agent-pool-core` at
 `90d9fbf` (PR #2), after review rounds 10491, 10507, 10510 and 10511.
 
+**Superseded in part by `docs/plans/controller-commits-everything.md`.** That later plan moves
+`git add` and `git commit` out of the worker as well: the controller creates every commit. Where
+this plan keeps worker commits as an exception (Section 4), sets `user.name` and `user.email` so
+worker commits keep an author (Section 5), or recommends "no" to controller commits (open question
+Q1), the newer plan takes precedence once it lands. The `:NNN` line references below follow
+`90d9fbf` and may have drifted since.
+
 ## Decisions this plan implements
 
 - **D1 (Craig, 2026-10-17): "Plan out the move of these commands to the controller."** This is
