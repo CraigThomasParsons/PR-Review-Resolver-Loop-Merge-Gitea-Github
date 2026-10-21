@@ -359,6 +359,8 @@ for fam in glob prefix; do
   expect "$fam/review: a commit --trailer -m is denied" "$(pol $fam review "git commit $T -m 'fix: x'")" deny
   expect "$fam/review: a commit -m --trailer is denied" "$(pol $fam review "git commit -m x $T")" deny
   expect "$fam/resolve: --trailer without -m is denied" "$(pol $fam resolve "git commit $T")" deny
+  expect "$fam/resolve: --trailer=VALUE is allowed like --message=" "$(pol $fam resolve 'git commit -m x --trailer=Made-with:Cursor')" allow
+  expect "$fam/resolve: --trailer= naming a credential is denied" "$(pol $fam resolve 'git commit -m x --trailer=~/.ssh/id_rsa')" deny
   expect "$fam/resolve: --trailer without a value is denied" "$(pol $fam resolve 'git commit -m x --trailer')" deny
   expect "$fam/resolve: --trailer with -a is denied" "$(pol $fam resolve "git commit $T -a -m x")" deny
   expect "$fam/resolve: --trailer with --all is denied" "$(pol $fam resolve "git commit $T --all -m x")" deny
@@ -622,11 +624,24 @@ expect "cursor resolve still allows git commit -m" "$(rules_of cursor resolve)" 
 expect_not "cursor review does not allow git commit --trailer" "$(rules_of cursor review | grep '^allow')" 'git commit'
 expect "cursor review denies git commit" "$(rules_of cursor review)" $'deny\tShell(git commit)'
 for prov in claude grok; do
-  expect "$prov resolve allows git commit --trailer" "$(rules_of $prov resolve)" $'allow\tBash(git commit --trailer *)'
+  expect "$prov resolve allows git commit --trailer" "$(rules_of $prov resolve)" $'allow\tBash(git commit --trailer * -m *)'
   expect "$prov resolve still allows git commit -m" "$(rules_of $prov resolve)" $'allow\tBash(git commit -m *)'
   expect_not "$prov review does not allow git commit --trailer" "$(rules_of $prov review | grep '^allow')" 'git commit'
   expect "$prov review denies git commit" "$(rules_of $prov review)" $'deny\tBash(git commit*)'
 done
+# Grok gets only the emitted globs (no argument check), so the globs alone must require -m.
+glob_only() { # job command: allow or deny by the emitted grok Bash globs alone
+  rules_of grok "$1" | python3 -c '
+import fnmatch, sys
+cmd, rules = sys.argv[1], [l.rstrip("\n").split("\t", 1) for l in sys.stdin]
+globs = lambda k: [r[5:-1] for kind, r in rules if kind == k and r.startswith("Bash(")]
+ok = any(fnmatch.fnmatchcase(cmd, g) for g in globs("allow")) and not any(fnmatch.fnmatchcase(cmd, g) for g in globs("deny"))
+print("allow" if ok else "deny")' "$2"
+}
+expect "grok globs: a commit --trailer -m is allowed" "$(glob_only resolve 'git commit --trailer Made-with:Cursor -m x')" allow
+expect "grok globs: a commit -m --trailer is allowed" "$(glob_only resolve 'git commit -m x --trailer Made-with:Cursor')" allow
+expect "grok globs: a commit --trailer with no -m is denied" "$(glob_only resolve 'git commit --trailer Made-with:Cursor')" deny
+expect "grok globs: review commit --trailer -m is denied" "$(glob_only review 'git commit --trailer T -m x')" deny
 for prov in claude grok cursor; do
   for job in review resolve; do
     r="$(rules_of $prov $job)"

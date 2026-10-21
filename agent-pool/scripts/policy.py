@@ -39,8 +39,10 @@ The emitted rules follow the same policy as far as each CLI's syntax allows:
           particular a prefix cannot deny an option at an arbitrary position (`git log -p -n 3
           --output=/tmp/x` starts with the allowed `git log`; only the common leading options
           are spelled out), cannot see redirection (`cat a > /tmp/x`), and cannot see through a
-          symlink or a brace. `check` denies all of these; Cursor's own CLI does not. Cursor is
-          not contained by cli.json alone and must not run unattended on an untrusted repo.
+          symlink or a brace, and the allowed `git commit -m` and `git commit --trailer`
+          prefixes admit a later --amend/-a/-F or a path (only leading ones are denied). `check`
+          denies all of these; Cursor's own CLI does not. Cursor is not contained by cli.json
+          alone and must not run unattended on an untrusted repo.
 Writes: review may write only its report; resolve may write the worktree and its report.
 `.git` (the worktree's pointer file and any .git directory) is never writable.
 
@@ -294,7 +296,8 @@ def segment_ok(seg: list[str], a: argparse.Namespace) -> bool:
             none = dict(flags=set(), eq=set(), valued=set(), attached=[])
             return bool(args) and options_ok(args, none, lambda t, n: add_positional(t, a), lambda v: False)
         if a.job == "resolve" and sub == "commit":
-            spec = dict(flags={"-q", "--quiet", "-s", "--signoff"}, eq={"--message"}, valued={"-m", "--trailer"},
+            spec = dict(flags={"-q", "--quiet", "-s", "--signoff"}, eq={"--message", "--trailer"},
+                        valued={"-m", "--trailer"},
                         attached=[])
             has_message = any(t == "-m" or t.startswith("--message=") for t in args)
             return has_message and options_ok(args, spec, lambda t, n: False, lambda v: not sensitive(v, a))
@@ -335,7 +338,9 @@ GATE_SHELL = ["npm run *", "npm test", "npm test *", "dotnet build", "dotnet bui
               "composer lint *", "php artisan test", "php artisan test *", "vendor/bin/pint", "vendor/bin/pint *",
               "vendor/bin/phpunit", "vendor/bin/phpunit *", "./vendor/bin/pint", "./vendor/bin/pint *",
               "./vendor/bin/phpunit", "./vendor/bin/phpunit *"]
-COMMIT_SHELL = ["git add *", "git commit -m *", "git commit --trailer *"]
+# A glob-only provider (grok) has no argument check, so the trailer glob must itself require -m:
+# a commit with no message would open an editor in an unattended pane.
+COMMIT_SHELL = ["git add *", "git commit -m *", "git commit --trailer * -m *"]
 DENY_SHELL = [
     "git push*", "*git push*", "git push --force*", "git reset --hard*", "git merge*", "git rebase*",
     "git difftool*", "*--output*", "*>*", "*<*", "*--ext-diff*", "*--textconv*", "* -x *",
@@ -426,7 +431,7 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
         denies += [f"Read({p})" for p in credential_globs()]
         return tools + [f"Bash({r})" for r in allow], denies
     if a.provider == "cursor":
-        prefixes = [r[:-2] if r.endswith(" *") else r.rstrip("*").rstrip() for r in allow]
+        prefixes = [prefix_of(r) for r in allow]
         allow_rules = [f"Read({r}/**)" for r in read_roots(a)] + [f"Write({a.report})"] + ([f"Write({wt}/**)"] if a.job == "resolve" else [])
         deny_rules = CURSOR_DENY + (CURSOR_REVIEW_DENY if a.job == "review" else [])
         deny_rules += [f"python3 {a.adapter} {sub}" for sub in ("comment", "label", "merge")]
@@ -436,6 +441,12 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
     raise SystemExit(f"policy: no rule translation for provider {a.provider}")
 
 
+def prefix_of(rule: str) -> str:
+    """A glob's literal lead as a Cursor command prefix: `git commit --trailer * -m *` becomes
+    `git commit --trailer`."""
+    return rule.split(" *", 1)[0].rstrip("*").rstrip()
+
+
 def prefix_match(command: str, prefix: str) -> bool:
     return command == prefix or command.startswith(prefix + " ")
 
@@ -443,7 +454,7 @@ def prefix_match(command: str, prefix: str) -> bool:
 def family_allows(segment: str, a: argparse.Namespace) -> bool:
     allow, deny = shell_rules(a)
     if a.family == "prefix":
-        allow = [r[:-2] if r.endswith(" *") else r.rstrip("*").rstrip() for r in allow]
+        allow = [prefix_of(r) for r in allow]
         deny = CURSOR_DENY + (CURSOR_REVIEW_DENY if a.job == "review" else []) \
             + [f"python3 {a.adapter} {sub}" for sub in ("comment", "label", "merge")]
         return any(prefix_match(segment, p) for p in allow) and not any(prefix_match(segment, p) for p in deny)

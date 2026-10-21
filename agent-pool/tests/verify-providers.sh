@@ -479,7 +479,7 @@ expect "and the resolve is done" "$(labels)" "agent:done"
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave claude resolve-trailer
 tick
-expect "claude resolve allows git commit --trailer" "$(claude_allows)" "ARG Bash(git commit --trailer *)"
+expect "claude resolve allows git commit --trailer" "$(claude_allows)" "ARG Bash(git commit --trailer * -m *)"
 expect "claude resolve still allows git commit -m" "$(claude_allows)" "ARG Bash(git commit -m *)"
 expect_not "claude resolve allows no push" "$(claude_allows)" "git push"
 for rule in 'git push*' 'git push --force*' 'git commit -a*' 'git commit --amend*' 'git commit -F*' 'git commit *--file*'; do
