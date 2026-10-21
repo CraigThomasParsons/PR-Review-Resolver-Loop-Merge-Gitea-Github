@@ -54,17 +54,17 @@ Every job processed by `agent-pool/bin/prod-common.sh` (and issue-dispatched job
 
 ## 2. Per-provider capability manifest
 
-Capabilities are defined in a new helper `agent-pool/scripts/capabilities.py` (backed by static defaults and optional per-host narrowing via `AGENT_POOL_CEILING_<PROVIDER>`, named apart from `repos.toml`'s existing per-repo `AGENT_POOL_ABILITIES` — see "Relationship to `repos.toml`" below). An operator env var can **narrow** a provider's advertised abilities (for example `AGENT_POOL_CEILING_GROK=review,plan`), but can never **widen** a provider beyond its hard ceiling in `capabilities.py` (in particular, `agy` can never be granted `resolve`).
+Capabilities are defined in a new helper `agent-pool/scripts/capabilities.py`, which becomes the single owner of the per-provider ceiling (static defaults, `agy` minus `resolve`) plus new optional per-host narrowing via `AGENT_POOL_CEILING_<PROVIDER>` (named apart from `repos.toml`'s existing per-repo `AGENT_POOL_ABILITIES` — see "Relationship to `repos.toml`" below). An operator env var can **narrow** a provider's advertised abilities (for example `AGENT_POOL_CEILING_GROK=review,plan`), but can never **widen** a provider beyond its hard ceiling in `capabilities.py` (in particular, `agy` can never be granted `resolve`).
 
-### Relationship to `repos.toml`'s existing `AGENT_POOL_ABILITIES` (extends, does not replace)
+### Relationship to `repos.toml`'s existing `AGENT_POOL_ABILITIES` and `CEILING` (extends, does not replace)
 
 `repos.toml` and `capabilities.py` answer different questions and both must pass for a claim:
 
 - **`repos.toml`'s `AGENT_POOL_ABILITIES`** (existing, unchanged by this plan): per-**repo**, per-provider authorization — which of the five ability names a given repo's operator has chosen to let a given provider run there at all. Read by `agent-pool/scripts/repoconfig.py`, set into the tick's environment by `prod-<provider>.sh`. This stays the first gate; this plan does not touch it.
-- **`capabilities.py`'s manifest + `AGENT_POOL_CEILING_<PROVIDER>`** (new, this plan): per-**provider**, host-wide safety ceiling — what a provider is permitted to do on *any* repo, independent of which repo granted it. `agy` lacking `resolve` here holds everywhere, even if some future `repos.toml` entry mistakenly granted `agy` resolve on a specific repo.
+- **The per-provider ceiling** (existing on master as `repoconfig.CEILING`, a static `{provider: set(abilities)}` dict with no operator narrowing — `agy` already drops `resolve` there today): this plan does not duplicate it as a second hardcoded table. `capabilities.py` becomes its one owner; `repoconfig.py`'s local `CEILING` dict and its two use sites (`abilities()`'s `granted &= CEILING[provider]`, and the config-load warning when a repo table over-grants a provider) are replaced with a call to `capabilities.py abilities --provider P` (or an imported `capabilities.ceiling(provider)` if staying in-process is cheaper than shelling out). `capabilities.py`'s only addition over today's `repoconfig.CEILING` is the optional `AGENT_POOL_CEILING_<PROVIDER>` operator narrowing — the hard floor (`agy` never `resolve`) is unchanged, just read from one place instead of two that could silently drift apart.
 - **`capabilities.py`'s `requires`/`match`** (new, this plan): per-**job** routing — which specific provider among those already authorized by both layers above should claim *this* job, based on what the job itself declares it needs.
 
-A provider claims a job only when all three pass: the repo's `AGENT_POOL_ABILITIES` includes the job's ability, the provider's host-wide ceiling includes it too, and `set(job.requires) <= set(capabilities.py abilities(provider))`. `capable_providers()` (Step 3) checks all three; it does not shadow or duplicate `repos.toml`'s existing per-repo check, it runs after it.
+A provider claims a job only when all three pass: the repo's `AGENT_POOL_ABILITIES` includes the job's ability, the provider's host-wide ceiling (now sourced from `capabilities.py` alone) includes it too, and `set(job.requires) <= set(capabilities.py abilities(provider))`. `capable_providers()` (Step 3) checks all three; it does not shadow or duplicate `repos.toml`'s existing per-repo check, it runs after it.
 
 ### Capability matrix
 
@@ -381,6 +381,7 @@ Every step keeps all existing offline suites green (`agent-pool/tests/verify-lea
   - `match --order CSV --requires CSV`: prints providers in `order` whose abilities are a superset of `requires`.
   - `parse-requires --labels JSON [--body FILE] --default-job J`: outputs the canonical `requires` CSV.
   - `check-queue --order CSV --requires CSV --roster CSV`: the `C_roster`/`C_configured`/`C_eligible` partition (Section 5). It takes the job's **repo-narrowed host roster** (`REPO_ROSTER`) as `--roster`, separately from the calling tick's own narrower `--order`, so an `agy`-only tick never wrongly concludes a `resolve` job is unsatisfiable just because `agy` itself can't do it. The caller (`prod-common.sh` or `doctor.sh`), not `capabilities.py`, computes `--roster`'s value per job as `REPO_ROSTER` by calling a new `repoconfig.py` helper (for example `roster --repo R --ability A`) that returns the providers in `[pool].providers` (`AGENT_POOL_ROSTER`) whose `repoconfig.abilities(cfg, R, p)` includes `A`, the same intersection `doctor.py` performs today, so `capabilities.py` stays free of `repos.toml`. This is resolved here, in Step 1, specifically because Step 3's `doctor.sh` escalation logic depends on getting it right from the start rather than being rebuilt once decided.
+- Retire `repoconfig.py`'s local `CEILING` dict: replace its two use sites (`abilities()`'s `granted &= CEILING[provider]`, and the config-load warning when a provider table over-grants an ability) with a call into `capabilities.py`, so the hard ceiling has exactly one definition. `repoconfig.py`'s own tests (`agent-pool/tests/verify-doctor.sh`'s config-validation cases) must stay green unchanged, since the ceiling values themselves do not move, only their owner.
 - Add `agent:plan`, `agent:review`, `agent:prototype`, `agent:test-author`, `agent:resolve`, and `agent:promote` to `LABELS` in `skills/pr-loops-common/gitea-labels.py` and update the blocking/cleanup label sets in `skills/pr-loops-common/pr-merge.sh`.
 - Add `pulse-plan:v1`, `pulse-prototype:v1`, and `pulse-test-author:v1` marker parsers in `skills/pr-loops-common/marker.py` and `agent-pool/scripts/report.py`.
 - Add unit tests in `agent-pool/tests/verify-lease.sh` and `skills/pr-loops-common/tests/verify-merge.sh`, including: an `agy`-only `PROVIDER_ORDER` with a host-wide roster that also includes `claude`, on a repo that grants `claude` `resolve`, does NOT escalate a `resolve` job to `agent:needs-human`; and a `resolve` job on repo A that grants nobody `resolve` DOES escalate even when repo B grants `claude` `resolve`.
@@ -465,7 +466,12 @@ it.
     `doctor.py` already uses as its roster. The `C_roster` check then narrows it per job to
     the providers the job's own repo grants the job's ability (`REPO_ROSTER`), exactly as
     `doctor.py` does today, before applying the ceiling and `requires`. `agent-pool/bin/doctor.sh` itself is
-    existing (PR #21), extended here with capability-awareness, not built fresh.
+    existing (PR #21), extended here with capability-awareness, not built fresh. The
+    per-provider ceiling itself (`agy` minus `resolve`) already exists too, as `repoconfig.CEILING`
+    — a second, static copy of the same fact. Decided: `capabilities.py` becomes its one owner;
+    `repoconfig.py` is changed to call it instead of keeping its own table (Section 2, Step 1),
+    so the ceiling has exactly one definition and `AGENT_POOL_CEILING_<PROVIDER>` is the only
+    way to narrow it further, never a second place to edit it.
 
 ## 10. Relationship to "Conduits" (issue #6)
 
