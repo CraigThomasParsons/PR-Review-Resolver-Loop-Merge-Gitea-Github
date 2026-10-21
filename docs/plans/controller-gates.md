@@ -71,6 +71,12 @@ new `agent-pool/scripts/gates.py`. Commands are argv lists and never shell strin
 ```toml
 version = 1
 
+# Paths whose change by the WORKER sends the job to needs-human instead of running gates:
+# anything that redefines what a gate does. A top-level key, so it must come before the
+# first [table]; after the [[gate]] blocks TOML would attach it to the last gate.
+protect = ["clientv2/package.json", "justfile", "composer.json", "phpunit.xml*",
+           "Directory.Build.*", "*.sln"]
+
 [defaults]
 timeout   = 600        # seconds per gate
 memory    = "4G"       # cgroup MemoryMax
@@ -98,11 +104,6 @@ timeout = 900
 name  = "net"
 argv  = ["dotnet", "build", "Pulse.sln", "-c", "Release", "--no-restore"]
 paths = ["net/**", "*.sln", "Directory.Build.*"]
-
-# Paths whose change by the WORKER sends the job to needs-human instead of running gates:
-# anything that redefines what a gate does.
-protect = ["clientv2/package.json", "justfile", "composer.json", "phpunit.xml*",
-           "Directory.Build.*", "*.sln"]
 ```
 
 `gates.py validate` rejects a manifest that has any of these:
