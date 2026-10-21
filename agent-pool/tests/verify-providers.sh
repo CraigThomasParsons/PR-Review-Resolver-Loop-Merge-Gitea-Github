@@ -763,6 +763,7 @@ expect "codex adapter shape" "$(calls codex | tr '\n' ' ')" "ARG exec ARG --ephe
 echo
 echo "prompts"
 expect "the generic resolve prompt names files to stage" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "git add path/to/first/file"
+expect "the generic resolve prompt puts Refs: #N in the -m message, not a --trailer" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "end the -m message with a Refs: #N line"
 expect "G5: the resolve prompt has the final-response fallback" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "If you cannot write files, make the complete report your final response instead"
 expect "L3: the resolve count covers only the review's numbered findings" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "thread replies are never counted"
 expect "L3: thread replies are listed separately" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "list Thread replies"

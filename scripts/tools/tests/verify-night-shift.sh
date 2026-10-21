@@ -453,7 +453,7 @@ before="$(created_count)"
 start12="$(git -C "$TMP/origin.git" rev-parse refs/heads/master)"
 NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-12.json" STUB_MODE=stageonly run "$PROJECT" 12
 same "staged work with a rejected commit and a clean exit -> exit 0" "$CODE" 0
-case "$OUT" in *"committing the worker's staged changes"*) ok "the launcher's commit is logged" ;; *) bad "launcher commit log" "$OUT" ;; esac
+case "$OUT" in *"committing the index the worker left staged"*) ok "the launcher's commit is logged" ;; *) bad "launcher commit log" "$OUT" ;; esac
 same "the branch is pushed" "$(remote_has_branch feature/12-nightcrew)" yes
 same "one PR opened" "$(created_count)" "$((before + 1))"
 head12="$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/12-nightcrew 2>/dev/null)"
@@ -465,7 +465,7 @@ case "$(git -C "$TMP/origin.git" log -1 --format=%s "$head12" 2>/dev/null)" in
   *"#12"*) ok "the commit message names the issue" ;; *) bad "commit message" "$(git -C "$TMP/origin.git" log -1 --format=%s "$head12" 2>&1)" ;; esac
 same "the launcher's commit carries no trailer" "$(git -C "$TMP/origin.git" log -1 --format='%(trailers)' "$head12" 2>/dev/null)" ""
 same "the PR body says the launcher made the commit" \
-  "$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readlines()[-1]); print("launcher committed the changes it left staged" in b["body"])' "$GITEA/created.jsonl" 2>&1)" True
+  "$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readlines()[-1]); print("the launcher committed that index" in b["body"])' "$GITEA/created.jsonl" 2>&1)" True
 same "the receipt names the PR, the branch and the pushed head" \
   "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["pr_number"], r["branch"], r["head"])' "$TMP/receipts/issue-12.json" 2>&1)" \
   "$((99 + before)) feature/12-nightcrew $head12"
@@ -507,17 +507,26 @@ same "the worktree with staged work is kept" "$( [ -d "$WT14" ] && echo present 
 same "the staged file is still in its index" "$(git -C "$WT14" diff --cached --name-only 2>/dev/null)" staged.txt
 case "$OUT" in *"kept"*"$WT14"*) ok "the kept worktree's path is logged" ;; *) bad "kept worktree log" "$OUT" ;; esac
 same "the lock file is removed" "$( [ -e "$PROJECT/logs/night_shift.lock" ] && echo present || echo gone)" gone
+before="$(created_count)"
 STUB_MODE=stagelimit run "$PROJECT" 15
-WT15="$PROJECT/logs/worktrees/issue-15"
 same "staged work then a provider limit -> exit 75" "$CODE" 75
 same "nothing pushed for a limit" "$(remote_has_branch feature/15-nightcrew)" no
-same "the parked run's staged work is kept" "$(git -C "$WT15" diff --cached --name-only 2>/dev/null)" staged.txt
+same "the parked run's staged work is committed on the local branch" \
+  "$(git -C "$PROJECT" diff-tree --no-commit-id --name-only -r feature/15-nightcrew 2>/dev/null)" staged.txt
+same "so its worktree is clean and removed" "$( [ -d "$PROJECT/logs/worktrees/issue-15" ] && echo present || echo gone)" gone
+NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-15.json" STUB_MODE=nocommit run "$PROJECT" 15
+same "the requeued run starts and publishes the parked work -> exit 0" "$CODE" 0
+same "the parked work reaches the remote" \
+  "$(git -C "$TMP/origin.git" diff-tree --no-commit-id --name-only -r refs/heads/feature/15-nightcrew 2>/dev/null)" staged.txt
+same "one PR opened for it" "$(created_count)" "$((before + 1))"
 
 echo
 echo "#29: the launcher's commit still passes the publication gates"
 before="$(created_count)"
 STUB_MODE=stagesecret run "$PROJECT" 16
 same "a staged credential-shaped filename -> exit 1" "$CODE" 1
+case "$OUT" in *"committing the index the worker left staged"*"credential-shaped filename"*) ok "the launcher committed and the filename gate refused that commit" ;;
+  *) bad "launcher commit then filename gate" "$OUT" ;; esac
 same "nothing pushed for it" "$(remote_has_branch feature/16-nightcrew)" no
 same "no PR opened for it" "$(created_count)" "$before"
 

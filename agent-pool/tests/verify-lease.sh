@@ -621,7 +621,8 @@ expect "claude r4#2: git commit -F is denied in the emitted globs" "$(rules_of c
 expect_not "claude r4#2: git commit -F is no longer allowed" "$(rules_of claude resolve | grep '^allow')" 'git commit -F'
 expect "cursor r4#2: git commit -F is a deny prefix" "$(rules_of cursor resolve)" 'Shell(git commit -F)'
 expect_not "cursor resolve does not allow git commit --trailer" "$(rules_of cursor resolve | grep '^allow')" 'git commit --trailer'
-expect "cursor resolve's only commit prefix is git commit -m" "$(rules_of cursor resolve | grep '^allow' | grep 'git commit')" $'allow\tShell(git commit -m)'
+commit_allows="$(rules_of cursor resolve | grep '^allow' | grep 'git commit')"
+expect_rc "cursor resolve's only commit prefix is git commit -m" "$([ "$commit_allows" = $'allow\tShell(git commit -m)' ]; echo $?)" 0
 expect "cursor resolve still allows git commit -m" "$(rules_of cursor resolve)" $'allow\tShell(git commit -m)'
 expect_not "cursor review does not allow git commit --trailer" "$(rules_of cursor review | grep '^allow')" 'git commit'
 expect "cursor review denies git commit" "$(rules_of cursor review)" $'deny\tShell(git commit)'

@@ -6,7 +6,7 @@
 # The launcher is the controller, as in agent-pool: it fetches the issue, prepares a fresh
 # worktree on feature/<issue>-nightcrew from origin/<base>, runs cursor-agent there under a
 # generated .cursor/cli.json (policy.py's resolve rules plus this repository's offline Python
-# test commands), then commits what a clean run left staged, pushes the branch, opens an unmerged
+# test commands), then commits what the worker left staged, pushes the branch, opens an unmerged
 # PR and writes the task receipt. The worker never pushes, labels, comments or merges.
 #
 # Exit codes: 0 PR opened or reused (receipt written), 1 failure, 2 bad arguments or agent,
@@ -104,7 +104,7 @@ cleanup() {
     local status
     if ! status="$(git -C "$WORKTREE" status --porcelain 2>/dev/null)" || [ -n "$status" ] \
       || ! git -C "$PROJECT_DIR" worktree remove "$WORKTREE" >/dev/null 2>&1; then
-      log "WARN worktree kept with uncommitted work for a rerun or a human to recover: ${WORKTREE}"
+      log "WARN worktree kept (uncommitted work, or git would not remove it) for a rerun or a human to recover: ${WORKTREE}"
     fi
   fi
   [ -n "$CONTEXT_FILE" ] && rm -f "$CONTEXT_FILE"
@@ -286,9 +286,25 @@ PY
   CLASS="${VERDICT%%$'\t'*}"
 fi
 
+# Cursor rewrites every commit the model issues to carry its attribution trailer, which the
+# generated cli.json rejects, so a run can end with its work only staged. The launcher commits
+# exactly that index, as the worker's own `git commit -m` would have, on the local branch only.
+LAUNCHER_COMMIT=0
+commit_staged() {
+  if [ "$(git -C "$WORKTREE" rev-parse HEAD)" != "$START_SHA" ] || git -C "$WORKTREE" diff --cached --quiet; then
+    return 0
+  fi
+  log "committing the index the worker left staged on ${BRANCH}: $(git -C "$WORKTREE" diff --cached --name-only | wc -l | tr -d ' ') file(s)"
+  git -C "$WORKTREE" commit -q -m "night-shift: commit the worker's staged changes for #${ISSUE_NUMBER}" \
+    -m "scripts/tools/night_shift.sh committed the index the worker left staged on ${BRANCH}." || return 1
+  LAUNCHER_COMMIT=1
+}
+
 # Any limit parks, even with commits: they stay on the local branch and the rerun after the
-# reset publishes them with whatever the agent still had to do.
+# reset publishes them with whatever the agent still had to do. Staged work is committed first,
+# or its kept worktree would make the requeued run refuse to start.
 if [ "$CLASS" = "limit" ]; then
+  commit_staged || log "WARN could not commit the worker's staged changes before parking"
   log "PARK: provider limit reached; exiting 75 so this issue is requeued, not failed"
   exit 75
 fi
@@ -301,19 +317,10 @@ if [ "$CLASS" != "ok" ]; then
   log "ERROR agent run classified ${CLASS}; nothing published"
   exit 1
 fi
-# Cursor rewrites every commit the model issues to carry its attribution trailer, which the
-# generated cli.json rejects, so a clean run can end with its work only staged. The launcher
-# commits exactly that index, as the worker's own `git commit -m` would have; every check below
-# still applies to the result.
-LAUNCHER_COMMIT=0
-if [ "$(git -C "$WORKTREE" rev-parse HEAD)" = "$START_SHA" ] && ! git -C "$WORKTREE" diff --cached --quiet; then
-  log "committing the worker's staged changes on ${BRANCH}: $(git -C "$WORKTREE" diff --cached --name-only | wc -l | tr -d ' ') file(s)"
-  if ! git -C "$WORKTREE" commit -q -m "night-shift: commit the worker's staged changes for #${ISSUE_NUMBER}" \
-    -m "Cursor's own git commit was rejected; scripts/tools/night_shift.sh committed the index it left on ${BRANCH} after a clean run."; then
-    log "ERROR could not commit the worker's staged changes; nothing published"
-    exit 1
-  fi
-  LAUNCHER_COMMIT=1
+# Every check below applies to the launcher's commit as to the worker's own.
+if ! commit_staged; then
+  log "ERROR could not commit the worker's staged changes; nothing published"
+  exit 1
 fi
 # Counted against the base, not this run's start, on purpose (#18 step 3): a rerun of the same
 # issue may reuse commits an earlier attempt left, whether parked by a limit on the local branch
@@ -352,7 +359,7 @@ Opened by \`scripts/tools/night_shift.sh\` for TheNightCrew: Cursor (model \`${M
 Unreviewed. Needs an independent current-head review before the merge controller may merge it.
 EOF
 if [ "$LAUNCHER_COMMIT" = 1 ]; then
-  printf '\n%s\n' "Cursor's own \`git commit\` was rejected, so the launcher committed the changes it left staged." >> "$PR_BODY"
+  printf '\n%s\n' "The worker left its changes staged without a commit, so the launcher committed that index." >> "$PR_BODY"
 fi
 # A push and a PR creation are not one transaction, and a timeout can hide a PR Gitea did create.
 # The pushed branch is never deleted: the rerun reuses its commits, finds that PR or opens it.
