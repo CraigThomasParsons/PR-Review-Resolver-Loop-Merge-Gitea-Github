@@ -1,7 +1,7 @@
 # Provider capability model
 
-Status: design plan, decisions settled 2026-10-20 (see Section 9), rebased on master 2026-10-21
-to reconcile with the per-repo abilities model and `doctor.sh` that PR #19 and PR #21 already
+Status: design plan, decisions settled 2026-10-20 (see Section 9), reconciled against master on 2026-10-21
+(not rebased) for the per-repo abilities model and `doctor.sh` that PR #19 and PR #21 already
 merged (Section 9, decision 10). Written against `master` at `e92b7c8` (which includes merged
 PRs #2, #11, #13, #15, #17, #19, and #21), `docs/plans/agent-pool-worker-pool.md`,
 `docs/plans/controller-gates.md`, and `docs/plans/controller-commits-everything.md` (split out
