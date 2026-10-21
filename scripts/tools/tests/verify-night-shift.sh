@@ -519,6 +519,9 @@ same "the requeued run starts and publishes the parked work -> exit 0" "$CODE" 0
 same "the parked work reaches the remote" \
   "$(git -C "$TMP/origin.git" diff-tree --no-commit-id --name-only -r refs/heads/feature/15-nightcrew 2>/dev/null)" staged.txt
 same "one PR opened for it" "$(created_count)" "$((before + 1))"
+same "the requeued run's PR body names the launcher's park commit" \
+  "$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readlines()[-1]); print(("the launcher committed that index: " + sys.argv[2]) in b["body"])' \
+    "$GITEA/created.jsonl" "$(git -C "$TMP/origin.git" rev-parse --short refs/heads/feature/15-nightcrew)" 2>&1)" True
 
 echo
 echo "#29: the launcher's commit still passes the publication gates"
