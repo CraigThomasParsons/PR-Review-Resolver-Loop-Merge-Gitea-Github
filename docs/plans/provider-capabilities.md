@@ -176,7 +176,7 @@ flowchart TD
     B --> C["derive_job -> DJ, DREQUIRES"]
     C --> D{"DJ == settled?"}
     D -- Yes --> E["Claim as controller & finish_job done"]
-    D -- No --> F["capabilities.py match --order AGENT_POOL_ROSTER --requires DREQUIRES"]
+    D -- No --> F["capabilities.py match --order REPO_ROSTER --requires DREQUIRES"]
     F --> G{"C_roster empty?<br/>(no provider in roster has abilities)"}
     G -- Yes --> H["Route to agent:needs-human<br/>(unsatisfiable requirement)"]
     G -- No --> I["Narrow to this tick's PROVIDER_ORDER<br/>& filter by setup_faults -> C_configured"]
@@ -225,7 +225,7 @@ A pull-based worker pool where workers only claim what they can satisfy introduc
 
 Both `agent-pool/bin/prod-common.sh` (during normal ticks) and `agent-pool/bin/doctor.sh` (on its 5-minute non-LLM timer from `docs/plans/agent-pool-worker-pool.md`) evaluate unsatisfiable `agent:ready` jobs using a deterministic three-tier partition. **Decided 2026-10-20 (Section 9): `C_roster` is checked against the host-wide roster, not the current tick's own `PROVIDER_ORDER`** — otherwise an `agy`-only tick would wrongly conclude a `resolve` job is unsatisfiable by anyone, even though a separate `claude` timer runs on the same host. `C_configured`/`C_eligible` still narrow by what the CURRENT tick can actually run:
 
-- **`C_roster`**: providers in the host-wide `AGENT_POOL_ROSTER` whose capability manifest (`capabilities.py`) satisfies `job.requires`. `AGENT_POOL_ROSTER` is not a separately maintained list: `doctor.py` already reads `repos.toml` repo-by-repo for exactly this purpose (its own docstring calls it "the roster in repos.toml"), so Step 1 generalizes that existing read into a host-wide union — every provider `repos.toml` enables, for any ability, on any repo this host's doctor is configured to cover — computed by `repoconfig.py`, not hand-set by an operator alongside it.
+- **`C_roster`**: providers in `REPO_ROSTER` whose capability manifest (`capabilities.py`) satisfies `job.requires`. `REPO_ROSTER` is not a separately maintained list. It is computed exactly the way `agent-pool/scripts/doctor.py` already computes its per-repo check on master: start from the host-wide roster `AGENT_POOL_ROSTER`, which is `repos.toml`'s existing `[pool].providers` (`roster = self.cfg["providers"]` in `doctor.py`), and keep each provider `p` for which `repoconfig.abilities(cfg, repo, p)` includes the job's ability on *the job's own repo*. A grant on some other repo never counts, so a `resolve` job on a repo that grants nobody `resolve` still escalates (the case `agent-pool/tests/verify-doctor.sh` already covers).
 - **`C_configured`**: providers in `C_roster`, filtered to this tick's own `PROVIDER_ORDER`, that pass binary, model, and prompt preflight without a `SETUP FAULT`.
 - **`C_eligible`**: providers in `C_configured` that are not in an active provider-level cooldown, not in an active ability-level cooldown for any ability in `job.requires`, and not blocked by an active `faults/gates.json` infra fault.
 
@@ -233,7 +233,7 @@ Both `agent-pool/bin/prod-common.sh` (during normal ticks) and `agent-pool/bin/d
 
 | Condition | Meaning | Action by `prod-common.sh` / `doctor.sh` | Gitea label transition | Cooldown / fault effect |
 |---|---|---|---|---|
-| `C_roster` is empty | **Unsatisfiable by roster.** No provider in the host-wide `AGENT_POOL_ROSTER` advertises `job.requires` (e.g., job requires `resolve` when `AGENT_POOL_ROSTER=agy`, or requires an ability combination no single provider has). | Claim briefly as `controller`, post a diagnostic comment naming `job.requires` and the capabilities of the providers in `AGENT_POOL_ROSTER`, and release to `agent:needs-human`. | `agent:ready` -> `agent:needs-human` | None (not a provider fault). |
+| `C_roster` is empty | **Unsatisfiable by roster.** No provider in the host-wide `AGENT_POOL_ROSTER` that the job's repo grants the job's ability advertises `job.requires` (e.g., job requires `resolve` when `AGENT_POOL_ROSTER=agy`, or requires an ability combination no single provider has). | Claim briefly as `controller`, post a diagnostic comment naming `job.requires` and the capabilities of the providers in `AGENT_POOL_ROSTER`, and release to `agent:needs-human`. | `agent:ready` -> `agent:needs-human` | None (not a provider fault). |
 | `C_roster` non-empty, `C_configured` is empty | **Host setup fault on all capable providers.** A capable provider is in `PROVIDER_ORDER`, but its binary is missing, its model env var is unset, or `faults/<provider>.json` is active. | Do **not** blame the PR. Leave the PR in `agent:ready`, log `SETUP FAULT`, and exit 2 so systemd / operator monitoring alerts. | Stays `agent:ready` | `cooldown.py fault` recorded per broken provider; tick exits 2. |
 | `C_configured` non-empty, `C_eligible` is empty due to `faults/gates.json` | **Gate sandbox infra broken.** Capable providers exist for `resolve`/`test-author`, but controller gate sandbox failed on an earlier tick (`docs/plans/controller-gates.md` Section 3). | Leave the PR in `agent:ready`; log that gate-dependent abilities are paused until `faults/gates.json` clears. `plan`/`review`/`prototype` jobs still run. | Stays `agent:ready` | `faults/gates.json` remains active; tick exits 2. |
 | `C_configured` non-empty, `C_eligible` is empty due to active cooldowns | **Temporary cooldown.** At least one configured provider can satisfy `job.requires`, but all such providers are currently cooling down (provider-level or ability-level). | **Wait for cooldown.** Touch nothing on Gitea; log the earliest `until` timestamp across `C_configured` (`waiting for cooldown; earliest eligible provider <p> in <Nm>`). | Stays `agent:ready` | Existing cooldowns tick down naturally. |
@@ -247,9 +247,9 @@ When `agent-pool/bin/doctor.sh` runs its 5-minute tick (`docs/plans/agent-pool-w
    - It writes the durable reassignment notice to `$AGENT_POOL_STATE/mailboxes/<worker_id>/<message_id>.json` via `mailbox.py` and stops any active `prod-<provider>.service` unit.
    - It calls `claim-record.py requeue` to flip `agent:claimed` -> `agent:ready` and delete the claim file.
 2. **Step 2 (Sweep `agent:ready` queue for unsatisfiable requirements)**:
-   - For each open `agent:ready` PR not held by a human or NightCrew, `doctor.sh` derives `requires` and runs `capabilities.py check-queue --order "$AGENT_POOL_ROSTER" --roster "$AGENT_POOL_ROSTER" --requires "$DREQUIRES"` (the doctor is host-wide, so its own order is the roster).
+   - For each open `agent:ready` PR not held by a human or NightCrew, `doctor.sh` derives `requires` and computes that PR's `REPO_ROSTER` (Section 5, `C_roster`) and runs `capabilities.py check-queue --order "$REPO_ROSTER" --roster "$REPO_ROSTER" --requires "$DREQUIRES"` (the doctor is host-wide, so its own order is the roster, narrowed per repo as `doctor.py` does today).
    - If `C_roster` is empty, `doctor.sh` (when `DOCTOR_DRY_RUN=0` and the repo is in the doctor's allowlist) transitions the PR from `agent:ready` to `agent:needs-human` with the explanation:
-     `Automated pool stopped on this PR: job requires ability [<requires>], which no provider in the host-wide roster AGENT_POOL_ROSTER (<roster>) advertises.`
+     `Automated pool stopped on this PR: job requires ability [<requires>], which no provider in the host-wide roster AGENT_POOL_ROSTER (<roster>) that this repo grants <ability> advertises.`
    - If `C_roster` is non-empty and `C_eligible` is empty because of cooldowns, `doctor.sh` logs `WAIT_COOLDOWN` with the remaining seconds until the next capable provider wakes up, and leaves `agent:ready` untouched.
 
 ---
@@ -375,15 +375,15 @@ Every step keeps all existing offline suites green (`agent-pool/tests/verify-lea
 3. Land `docs/plans/controller-commits-everything.md` (its own migration, Section 5 there) before Step 4 below, since `prototype` and `test-author` have no fallback mechanism without it.
 
 ### Step 1: Capability manifest, requirement parser, and the host-wide roster
-- **Files**: new `agent-pool/scripts/capabilities.py`; `agent-pool/scripts/repoconfig.py` gains a roster-union helper; `skills/pr-loops-common/gitea-labels.py`, `skills/pr-loops-common/pr-merge.sh`, `skills/pr-loops-common/marker.py`.
+- **Files**: new `agent-pool/scripts/capabilities.py`; `agent-pool/scripts/repoconfig.py` gains a per-repo roster helper; `skills/pr-loops-common/gitea-labels.py`, `skills/pr-loops-common/pr-merge.sh`, `skills/pr-loops-common/marker.py`.
 - Implement `agent-pool/scripts/capabilities.py` as a pure matcher with no knowledge of `repos.toml` (that stays `repoconfig.py`'s job — see "Relationship to `repos.toml`" in Section 2):
   - `abilities --provider P`: prints the effective abilities for `P` (baseline manifest intersected with `AGENT_POOL_CEILING_<P>`, never widening past the baseline ceiling).
   - `match --order CSV --requires CSV`: prints providers in `order` whose abilities are a superset of `requires`.
   - `parse-requires --labels JSON [--body FILE] --default-job J`: outputs the canonical `requires` CSV.
-  - `check-queue --order CSV --requires CSV --roster CSV`: the `C_roster`/`C_configured`/`C_eligible` partition (Section 5) — takes the **host-wide roster** as `--roster`, separately from the calling tick's own narrower `--order`, so an `agy`-only tick never wrongly concludes a `resolve` job is unsatisfiable just because `agy` itself can't do it. The caller (`prod-common.sh` or `doctor.sh`), not `capabilities.py`, computes `--roster`'s value by calling a new `repoconfig.py` helper that unions every repo's `AGENT_POOL_ABILITIES` grants across whatever repos that host's doctor is configured to cover, then exports it as `AGENT_POOL_ROSTER` for the tick. This is resolved here, in Step 1, specifically because Step 3's `doctor.sh` escalation logic depends on getting it right from the start rather than being rebuilt once decided.
+  - `check-queue --order CSV --requires CSV --roster CSV`: the `C_roster`/`C_configured`/`C_eligible` partition (Section 5). It takes the job's **repo-narrowed host roster** (`REPO_ROSTER`) as `--roster`, separately from the calling tick's own narrower `--order`, so an `agy`-only tick never wrongly concludes a `resolve` job is unsatisfiable just because `agy` itself can't do it. The caller (`prod-common.sh` or `doctor.sh`), not `capabilities.py`, computes `--roster`'s value per job as `REPO_ROSTER` by calling a new `repoconfig.py` helper (for example `roster --repo R --ability A`) that returns the providers in `[pool].providers` (`AGENT_POOL_ROSTER`) whose `repoconfig.abilities(cfg, R, p)` includes `A`, the same intersection `doctor.py` performs today, so `capabilities.py` stays free of `repos.toml`. This is resolved here, in Step 1, specifically because Step 3's `doctor.sh` escalation logic depends on getting it right from the start rather than being rebuilt once decided.
 - Add `agent:plan`, `agent:review`, `agent:prototype`, `agent:test-author`, `agent:resolve`, and `agent:promote` to `LABELS` in `skills/pr-loops-common/gitea-labels.py` and update the blocking/cleanup label sets in `skills/pr-loops-common/pr-merge.sh`.
 - Add `pulse-plan:v1`, `pulse-prototype:v1`, and `pulse-test-author:v1` marker parsers in `skills/pr-loops-common/marker.py` and `agent-pool/scripts/report.py`.
-- Add unit tests in `agent-pool/tests/verify-lease.sh` and `skills/pr-loops-common/tests/verify-merge.sh`, including: an `agy`-only `PROVIDER_ORDER` with a host-wide roster that also includes `claude` does NOT escalate a `resolve` job to `agent:needs-human`.
+- Add unit tests in `agent-pool/tests/verify-lease.sh` and `skills/pr-loops-common/tests/verify-merge.sh`, including: an `agy`-only `PROVIDER_ORDER` with a host-wide roster that also includes `claude`, on a repo that grants `claude` `resolve`, does NOT escalate a `resolve` job to `agent:needs-human`; and a `resolve` job on repo A that grants nobody `resolve` DOES escalate even when repo B grants `claude` `resolve`.
 
 ### Step 2: Ability-level cooldowns in `agent-pool/scripts/cooldown.py`
 - **Files**: `agent-pool/scripts/cooldown.py`, `agent-pool/tests/verify-lease.sh`.
@@ -402,7 +402,7 @@ Every step keeps all existing offline suites green (`agent-pool/tests/verify-lea
   - `C_eligible` empty -> wait for cooldown, keep `agent:ready`, exit 0.
 - Wire the same check into `agent-pool/bin/doctor.sh` alongside stale-claim reconciliation and mailbox enqueueing.
 - Add end-to-end cases in `agent-pool/tests/verify-providers.sh`:
-  - `PROVIDER_ORDER=agy` with `AGENT_POOL_ROSTER=agy` on a PR requiring `resolve` transitions immediately to `agent:needs-human` (the converse, an `agy`-only tick whose roster also includes `claude`, stays `agent:ready`; see the Step 1 test).
+  - `PROVIDER_ORDER=agy` with `AGENT_POOL_ROSTER=agy` on a PR requiring `resolve` transitions immediately to `agent:needs-human` (the converse, an `agy`-only tick whose roster also includes `claude` with `resolve` granted on that repo, stays `agent:ready`; see the Step 1 test). A `resolve` PR on a repo that grants nobody `resolve` transitions to `agent:needs-human` even when another repo grants `claude` `resolve`, keeping `agent-pool/tests/verify-doctor.sh`'s per-repo case green.
   - `PROVIDER_ORDER=claude` where `claude` is on a `resolve` ability cooldown leaves a `resolve` PR in `agent:ready` (waiting for cooldown) while still claiming and completing a `review` PR in the same tick.
 
 ### Step 4: `plan`, `prototype`, and `test-author` execution, prompts, and publication
@@ -461,9 +461,10 @@ it.
     `AGENT_POOL_CEILING_<PROVIDER>` (was `AGENT_POOL_ABILITIES_<PROVIDER>`) to stop it colliding
     in name, though not in meaning, with `repos.toml`'s per-repo `AGENT_POOL_ABILITIES`. The
     host-wide `AGENT_POOL_ROSTER` (Section 5, Step 1) is likewise not a second config an
-    operator maintains by hand: it is computed from `repos.toml` via a new `repoconfig.py`
-    helper, since `doctor.py` already reads `repos.toml` for the same purpose per repo and
-    calls that list "the roster" in its own docstring. `agent-pool/bin/doctor.sh` itself is
+    operator maintains by hand: it is `repos.toml`'s existing `[pool].providers`, which
+    `doctor.py` already uses as its roster. The `C_roster` check then narrows it per job to
+    the providers the job's own repo grants the job's ability (`REPO_ROSTER`), exactly as
+    `doctor.py` does today, before applying the ceiling and `requires`. `agent-pool/bin/doctor.sh` itself is
     existing (PR #21), extended here with capability-awareness, not built fresh.
 
 ## 10. Relationship to "Conduits" (issue #6)
