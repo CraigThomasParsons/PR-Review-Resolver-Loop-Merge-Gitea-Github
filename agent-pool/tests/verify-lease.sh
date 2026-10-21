@@ -321,7 +321,7 @@ pol() { # family job command
   python3 "$SCRIPTS/policy.py" check --family "$1" --job "$2" --adapter "$AD_ABS" --worktree /wt --report /runs/r.md -- "$3"
 }
 for fam in glob prefix; do
-  for job in review resolve; do
+  for job in review resolve edit; do
     expect "$fam/$job: git push HEAD:main is denied" "$(pol $fam $job 'git push origin HEAD:main')" deny
     expect "$fam/$job: a + refspec push is denied" "$(pol $fam $job 'git push origin +HEAD:refs/heads/feature/x')" deny
     expect "$fam/$job: a trailing -f push is denied" "$(pol $fam $job 'git push origin feature/x -f')" deny
@@ -352,7 +352,7 @@ for fam in glob prefix; do
   expect "$fam/resolve: git commit --amend is denied" "$(pol $fam resolve 'git commit --amend -m x')" deny
   expect "$fam/resolve: git commit -a is denied" "$(pol $fam resolve 'git commit -a -m x')" deny
   # #29: no --trailer form is allowed. Cursor matches by prefix, so a `git commit --trailer`
-  # prefix would admit a later --amend/-a/-F; the night-shift launcher commits staged work instead.
+  # prefix would admit a later --amend/-a/-F; the night-shift worker is edit-only (--job edit).
   T='--trailer "Made-with: Cursor"'
   expect "$fam/resolve: a commit --trailer -m is denied" "$(pol $fam resolve "git commit $T -m 'fix: x'")" deny
   expect "$fam/resolve: repeated --trailer is denied" "$(pol $fam resolve "git commit $T --trailer 'Co-authored-by: A' -m x")" deny
@@ -370,14 +370,14 @@ for fam in glob prefix; do
   expect "$fam/resolve: --trailer with --file= is denied" "$(pol $fam resolve "git commit $T --file=msg.txt")" deny
   expect "$fam/resolve: --trailer with paths is denied" "$(pol $fam resolve "git commit $T -m x src/a.php")" deny
   expect "$fam/resolve: a --trailer naming a credential is denied" "$(pol $fam resolve 'git commit --trailer ~/.ssh/id_rsa -m x')" deny
-  for job in review resolve; do
+  for job in review resolve edit; do
     expect "$fam/$job: a trailer commit then a push is denied" "$(pol $fam $job "git commit $T -m x && git push origin HEAD")" deny
     expect "$fam/$job: git push is denied" "$(pol $fam $job 'git push')" deny
     expect "$fam/$job: git push --force is denied" "$(pol $fam $job 'git push --force origin HEAD:refs/heads/feature/x')" deny
   done
 done
 for fam in glob prefix; do
-  for job in review resolve; do
+  for job in review resolve edit; do
     # Review G1: argument-level bypasses of the old globs.
     expect "$fam/$job: git difftool -x is denied" "$(pol $fam $job "git difftool -y -x 'touch /tmp/pwned'")" deny
     expect "$fam/$job: git difftool --extcmd is denied" "$(pol $fam $job "git difftool --extcmd=sh HEAD")" deny
@@ -428,7 +428,7 @@ for fam in glob prefix; do
   expect "$fam/resolve: npm test 2>&1 is denied (redirection is its own segment)" "$(pol $fam resolve 'npm test 2>&1')" deny
   expect "$fam/resolve: a gate piped into tail is allowed" "$(pol $fam resolve 'npm test | tail -50')" allow
   # Review r4 #1: brace expansion.
-  for job in review resolve; do
+  for job in review resolve edit; do
     expect "$fam/$job: r4#1 rg {-,}-pre=sh is denied" "$(pol $fam $job 'rg {-,}-pre=sh foo')" deny
     expect "$fam/$job: r4#1 git log {-,}-output= is denied" "$(pol $fam $job 'git log {-,}-output=/tmp/pwned HEAD')" deny
     expect "$fam/$job: r4#1 git grep {-,}-open-files-in-pager= is denied" "$(pol $fam $job 'git grep {-,}-open-files-in-pager=sh foo')" deny
@@ -478,7 +478,7 @@ ln -s "$FH/.ssh/id_ed25519" "$BWT/notes.txt"; ln -s "$FH/.ssh" "$BWT/keydir"
 bpol() { HOME="$FH" python3 "$SCRIPTS/policy.py" check --family "$1" --job "$2" --adapter "$AD_ABS" --worktree "$BWT" --report "$TMP/b1runs/r.md" -- "$3"; }
 bhk() { printf '%s' "$2" | HOME="$FH" python3 "$SCRIPTS/policy.py" hook --job "$1" --adapter "$AD_ABS" --worktree "$BWT" --report "$TMP/b1runs/r.md" 2>/dev/null; }
 for fam in glob prefix; do
-  for job in review resolve; do
+  for job in review resolve edit; do
     expect "$fam/$job: B1 cat of a symlink to a credential is denied" "$(bpol $fam $job 'cat notes.txt')" deny
     expect "$fam/$job: B1 head of a symlink to a credential is denied" "$(bpol $fam $job 'head -n 1 notes.txt')" deny
     expect "$fam/$job: B1 rg of a symlink to a credential is denied" "$(bpol $fam $job 'rg BEGIN notes.txt')" deny
@@ -646,7 +646,7 @@ expect "grok globs: a commit --trailer -m is denied" "$(glob_only resolve 'git c
 expect "grok globs: a commit --trailer with no -m is denied" "$(glob_only resolve 'git commit --trailer Made-with:Cursor')" deny
 expect "grok globs: review commit --trailer -m is denied" "$(glob_only review 'git commit --trailer T -m x')" deny
 for prov in claude grok cursor; do
-  for job in review resolve; do
+  for job in review resolve edit; do
     r="$(rules_of $prov $job)"
     expect_not "$prov/$job allows no git push" "$(printf '%s\n' "$r" | grep '^allow')" 'git push'
     expect "$prov/$job denies git push" "$r" "$([ $prov = cursor ] && echo $'deny\tShell(git push)' || echo $'deny\tBash(git push*)')"
@@ -660,6 +660,65 @@ expect "claude B5: --output anywhere is a deny glob" "$(rules_of claude review)"
 hs="$(python3 "$SCRIPTS/policy.py" hook-settings --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)"
 expect "hook-settings wires a PreToolUse hook" "$hs" '"PreToolUse"'
 expect "that runs policy.py hook for this job" "$hs" "policy.py hook --job review"
+
+echo
+echo "edit-only worker policy (night shift: the launcher commits)"
+for fam in glob prefix; do
+  expect "$fam/edit: staging a named path is denied" "$(pol $fam edit 'git add src/a.php')" deny
+  expect "$fam/edit: a commit -m is denied" "$(pol $fam edit 'git commit -m "fix: x"')" deny
+  expect "$fam/edit: a commit --trailer -m is denied" "$(pol $fam edit "git commit --trailer 'Made-with: Cursor' -m x")" deny
+  expect "$fam/edit: git commit-tree is denied" "$(pol $fam edit 'git commit-tree 4b825dc -p HEAD -m x')" deny
+  expect "$fam/edit: git push is denied" "$(pol $fam edit 'git push origin HEAD')" deny
+  for cmd in 'git stash' 'git cherry-pick abc' 'git revert HEAD' 'git am x.patch' 'git tag v1' \
+             'git notes add -m x' 'git apply --index x.patch' 'git checkout -b other' 'git switch other' \
+             'git restore --staged a.php' 'git rm a.php' 'git mv a.php b.php' 'git update-ref refs/heads/x HEAD'; do
+    expect "$fam/edit: '$cmd' is denied" "$(pol $fam edit "$cmd")" deny
+  done
+  expect "$fam/edit: the gate is allowed" "$(pol $fam edit 'npm run test')" allow
+  expect "$fam/edit: npm test is allowed" "$(pol $fam edit 'npm test')" allow
+  expect "$fam/edit: git diff is allowed" "$(pol $fam edit 'git diff')" allow
+  expect "$fam/edit: git status is allowed" "$(pol $fam edit 'git status --porcelain')" allow
+done
+for prov in claude grok cursor; do
+  r="$(rules_of $prov edit)"
+  allows="$(printf '%s\n' "$r" | grep '^allow')"
+  expect_not "$prov/edit allows no git commit" "$allows" 'git commit'
+  expect_not "$prov/edit allows no git add" "$allows" 'git add'
+  expect_not "$prov/edit allows no git push" "$allows" 'git push'
+  if [ $prov = cursor ]; then
+    for d in 'git commit' 'git add' 'git push' 'git commit-tree' 'git stash' 'git cherry-pick'; do
+      expect "cursor/edit denies $d explicitly" "$r" $'deny\tShell('"$d"')'
+    done
+    expect "cursor/edit may write the worktree" "$r" $'allow\tWrite(/wt/**)'
+    expect "cursor/edit may run the gates" "$r" $'allow\tShell(npm test)'
+  else
+    for d in 'git commit*' 'git add*' 'git push*' 'git stash*'; do
+      expect "$prov/edit denies $d explicitly" "$r" $'deny\tBash('"$d"')'
+    done
+    expect "$prov/edit may edit the worktree" "$r" $'allow\tEdit('
+    expect "$prov/edit may run the gates" "$r" $'allow\tBash(npm test)'
+  fi
+done
+cj="$(python3 "$SCRIPTS/policy.py" cursor-json --job edit --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)"
+edit_json="$(printf '%s' "$cj" | python3 -c '
+import json, re, sys
+p = json.load(sys.stdin)["permissions"]
+grants = [r for r in p["allow"] if re.match(r"Shell\(git (add|commit|push)\b", r)]
+print(len(grants), all(f"Shell(git {s})" in p["deny"] for s in ("add", "commit", "push")))')"
+expect "cursor-json --job edit grants no stage/commit/push and denies all three" "$edit_json" "0 True"
+expect "cursor resolve still allows git commit -m (agent-pool workers unchanged)" "$(rules_of cursor resolve)" $'allow\tShell(git commit -m)'
+hk edit '{"tool_name":"Edit","tool_input":{"file_path":"/wt/src/a.php"}}'
+expect_rc "claude hook: edit may edit the worktree" "$?" 0
+hk edit '{"tool_name":"Edit","tool_input":{"file_path":"/wt/.cursor/cli.json"}}'
+expect_rc "claude hook: edit may not edit tool configuration" "$?" 2
+hk edit '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}'
+expect_rc "claude hook: edit may not commit" "$?" 2
+hk edit '{"tool_name":"Bash","tool_input":{"command":"git add src/a.php"}}'
+expect_rc "claude hook: edit may not stage" "$?" 2
+hk edit '{"tool_name":"Bash","tool_input":{"command":"npm test"}}'
+expect_rc "claude hook: edit may run the gate" "$?" 0
+expect "hook-settings carries the edit job" \
+  "$(python3 "$SCRIPTS/policy.py" hook-settings --job edit --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)" "policy.py hook --job edit"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
