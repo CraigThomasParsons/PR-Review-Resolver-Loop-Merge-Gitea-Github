@@ -183,9 +183,6 @@ case "$behave" in
   resolve-noted)    resolve_text 0 1 0 > "$report"; success ;;
   resolve-deferred) resolve_text 0 0 1 > "$report"; success ;;
   resolve-fix)      commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
-  resolve-trailer)
-    echo "fix $RANDOM" >> f.txt; git add f.txt; git commit -q --trailer "Made-with: Cursor" -m "fix: something"
-    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-repoint)
     # Commit, then point the worktree's .git at a gitdir of the worker's choosing.
     commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"
@@ -462,30 +459,30 @@ expect "and the controller pushes to exactly that branch" "$(git --git-dir "$ORI
 expect "and the job is done" "$(labels)" "agent:done"
 
 echo
-echo "commit trailers: resolve may commit with --trailer, review may not commit at all"
+echo "commit rules: resolve may commit only with git commit -m (no --trailer, #29), review may not commit at all"
 claude_allows() { calls claude | sed -n '/^ARG --allowedTools$/,/^ARG --disallowedTools$/p'; }
 claude_denies() { calls claude | sed -n '/^ARG --disallowedTools$/,/^[^A]/p'; }
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
-behave cursor-agent resolve-trailer
+behave cursor-agent resolve-fix
 PROVIDER_ORDER=cursor tick
-expect "cursor resolve cli.json allows git commit --trailer" "$(calls cursor-agent)" "CURSOR_ALLOW Shell(git commit --trailer)"
+expect_not "cursor resolve cli.json does not allow git commit --trailer" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git commit --trailer"
 expect "cursor resolve cli.json still allows git commit -m" "$(calls cursor-agent)" "CURSOR_ALLOW Shell(git commit -m)"
 for rule in 'git push' 'git push --force' 'git commit -a' 'git commit --all' 'git commit --amend' 'git commit -F' 'git commit --file'; do
   expect "cursor resolve cli.json still denies $rule" "$(calls cursor-agent)" "CURSOR_DENY Shell($rule)"
 done
 expect_not "cursor resolve cli.json allows no push" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git push"
-expect "a trailer commit from cursor is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%B feature/x)" "Made-with: Cursor"
+expect "a commit from cursor is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
 expect "and the resolve is done" "$(labels)" "agent:done"
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
-behave claude resolve-trailer
+behave claude resolve-fix
 tick
-expect "claude resolve allows git commit --trailer" "$(claude_allows)" "ARG Bash(git commit --trailer * -m *)"
+expect_not "claude resolve does not allow git commit --trailer" "$(claude_allows)" "git commit --trailer"
 expect "claude resolve still allows git commit -m" "$(claude_allows)" "ARG Bash(git commit -m *)"
 expect_not "claude resolve allows no push" "$(claude_allows)" "git push"
 for rule in 'git push*' 'git push --force*' 'git commit -a*' 'git commit --amend*' 'git commit -F*' 'git commit *--file*'; do
   expect "claude resolve still denies $rule" "$(claude_denies)" "ARG Bash($rule)"
 done
-expect "a trailer commit from claude is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%B feature/x)" "Made-with: Cursor"
+expect "a commit from claude is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
 reset '["agent:ready"]'
 behave cursor-agent ok
 PROVIDER_ORDER=cursor tick
