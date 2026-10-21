@@ -16,7 +16,7 @@ denied segment. Every remaining command must be one of:
         difftool, no --output, no --ext-diff/--textconv, no global options such as -C/-c)
   cat ls head tail wc grep rg                              with vetted options only
   python3 <adapter> head|comments|threads --repo R --pr N  the adapter's reads, absolute path
-  git add <named paths> / git commit -m                    resolve only; no -A/-u/-f/., no
+  git add <named paths> / git commit -m [--trailer T]      resolve only; no -A/-u/-f/., no
         tool configuration paths, no --amend/-a, no -F (a file would become the message)
   the named gate commands                                  resolve only (their arguments are
         not vetted; the controller will run gates itself from a pinned list, see D1)
@@ -294,7 +294,8 @@ def segment_ok(seg: list[str], a: argparse.Namespace) -> bool:
             none = dict(flags=set(), eq=set(), valued=set(), attached=[])
             return bool(args) and options_ok(args, none, lambda t, n: add_positional(t, a), lambda v: False)
         if a.job == "resolve" and sub == "commit":
-            spec = dict(flags={"-q", "--quiet", "-s", "--signoff"}, eq={"--message"}, valued={"-m"}, attached=[])
+            spec = dict(flags={"-q", "--quiet", "-s", "--signoff"}, eq={"--message"}, valued={"-m", "--trailer"},
+                        attached=[])
             has_message = any(t == "-m" or t.startswith("--message=") for t in args)
             return has_message and options_ok(args, spec, lambda t, n: False, lambda v: not sensitive(v, a))
         return False
@@ -334,7 +335,7 @@ GATE_SHELL = ["npm run *", "npm test", "npm test *", "dotnet build", "dotnet bui
               "composer lint *", "php artisan test", "php artisan test *", "vendor/bin/pint", "vendor/bin/pint *",
               "vendor/bin/phpunit", "vendor/bin/phpunit *", "./vendor/bin/pint", "./vendor/bin/pint *",
               "./vendor/bin/phpunit", "./vendor/bin/phpunit *"]
-COMMIT_SHELL = ["git add *", "git commit -m *"]
+COMMIT_SHELL = ["git add *", "git commit -m *", "git commit --trailer *"]
 DENY_SHELL = [
     "git push*", "*git push*", "git push --force*", "git reset --hard*", "git merge*", "git rebase*",
     "git difftool*", "*--output*", "*>*", "*<*", "*--ext-diff*", "*--textconv*", "* -x *",
