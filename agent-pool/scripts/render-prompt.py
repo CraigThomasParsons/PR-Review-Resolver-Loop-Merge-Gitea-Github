@@ -7,7 +7,7 @@ and paths may contain |, &, \\ or anything else a sed replacement would interpre
 import sys
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     template, out = sys.argv[1], sys.argv[2]

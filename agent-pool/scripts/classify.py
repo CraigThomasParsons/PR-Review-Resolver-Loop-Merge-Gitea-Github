@@ -24,8 +24,10 @@ Setup faults are found by JSON key, never by prose: cursor tool events carrying 
 or `permissionDenied`, agy's `denied_actions`, claude's `permission_denials`. A run can exit
 0 and report SUCCESS and still be a setup fault.
 
-Order: exit 124/137 is a timeout before anything else is read. Setup signatures (SETUP) are
-checked before limit signatures, so a login prompt or a bad model never reads as a limit.
+Order: denials first (a denied run that then hangs is still a setup fault), then exit 124/137
+is a timeout before any wording is read. Setup signatures (SETUP) are checked before limit
+signatures, so a login prompt or a bad model never reads as a limit. On a run that reports
+success, only the product's own login prompt (LOGIN_PROMPT) counts as setup.
 
 Setup and limit signatures are read from the provider's own messages only when it reports
 failure: stderr plus the final result (for cursor, result/error events and non-JSON lines,
@@ -39,6 +41,8 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Iterator
+from typing import Any
 
 ANY_LIMIT = re.compile(
     r"\b429\b|too many requests|rate[ _-]?limit|quota[ _-]?exceeded|exceeded (?:your |the )?quota"
@@ -51,6 +55,9 @@ SETUP = re.compile(
     r"(?:unknown|invalid|unsupported) model|model[ _-]not[ _-]found|not_found_error"
     r"|invalid[ _-]?(?:x-)?api[ _-]?key|authentication_error|login required|not logged in"
     r"|Select login method|log in to continue|please (?:log|sign) in", re.I)
+# On a run that reports success only the product's own login prompt counts: a summary may well
+# mention "not logged in" or authentication_error when that is what the code under review handles.
+LOGIN_PROMPT = re.compile(r"Select login method|log in to continue|Please run /login", re.I)
 # On a run that reports success only wording a review would not use in passing counts: a bare
 # "429" or "rate limit" in a final summary is usually about the code under review.
 RESULT_LIMIT = re.compile(
@@ -61,7 +68,7 @@ SESSION_KEYS = ("conversation_id", "session_id", "sessionId")
 SHORT_RESULT = 400
 
 
-def read(path):
+def read(path: str | None) -> str:
     if not path:
         return ""
     try:
@@ -71,7 +78,7 @@ def read(path):
         return ""
 
 
-def parse_object(text):
+def parse_object(text: str) -> dict | None:
     try:
         doc = json.loads(text)
         return doc if isinstance(doc, dict) else None
@@ -87,7 +94,7 @@ def parse_object(text):
     return None
 
 
-def parse_events(text):
+def parse_events(text: str) -> list[dict]:
     events = []
     for line in text.splitlines():
         try:
@@ -99,7 +106,7 @@ def parse_events(text):
     return events
 
 
-def denials(node, path=""):
+def denials(node: Any, path: str = "") -> Iterator[tuple[str, Any]]:
     """Yield (path, value) for every non-empty denial key anywhere in a JSON document."""
     if isinstance(node, dict):
         for key, value in node.items():
@@ -113,7 +120,7 @@ def denials(node, path=""):
             yield from denials(value, f"{path}[{i}]")
 
 
-def session_of(docs):
+def session_of(docs: list[dict]) -> str:
     for doc in docs:
         for key in SESSION_KEYS:
             if doc.get(key):
@@ -121,25 +128,23 @@ def session_of(docs):
     return ""
 
 
-def describe(found):
+def describe(found: list[tuple[str, Any]]) -> str:
     where, value = found[0]
     more = f" (+{len(found) - 1} more)" if len(found) > 1 else ""
     return f"{where}={json.dumps(value)[:160]}{more}"
 
 
-def limit_in(text):
+def limit_in(text: str) -> re.Match[str] | None:
     return ANY_LIMIT.search(text) or PRODUCT_LIMIT.search(text)
 
 
-def classify(provider, rc, out, err):
+def classify(provider: str, rc: int, out: str, err: str) -> tuple[str, str, str, str]:
     """Return (verdict, reason, session, result_text)."""
     if rc == 127:
         return "setup", f"{provider} binary missing (exit 127)", "", ""
     if rc == 126:
         why = "argument list too long" if "argument list too long" in err.lower() else "permission or exec format"
         return "setup", f"{provider} could not be executed (exit 126: {why})", "", ""
-    if rc in (124, 137):
-        return "timeout", f"{provider} hit the worker timeout (exit {rc})", "", ""
 
     docs, failed, result_text, why, own = [], rc != 0, "", f"exit {rc}", out
     if provider == "cursor":
@@ -179,6 +184,8 @@ def classify(provider, rc, out, err):
     found = [d for doc in docs for d in denials(doc)]
     if found:
         return "setup", f"{provider} denied a tool call the worker needed: {describe(found)}", session, result_text
+    if rc in (124, 137):
+        return "timeout", f"{provider} hit the worker timeout (exit {rc})", session, result_text
 
     if failed:
         text = err + "\n" + own
@@ -191,16 +198,16 @@ def classify(provider, rc, out, err):
         return "incomplete", f"{provider} ended without a usable result ({why})", session, result_text
 
     if len(result_text.strip()) < SHORT_RESULT:
-        m = SETUP.search(result_text)
+        m = LOGIN_PROMPT.search(result_text)
         if m:
-            return "setup", f"{provider} setup signature '{m.group(0)}' in its short result", session, result_text
+            return "setup", f"{provider} login prompt '{m.group(0)}' in its short result", session, result_text
         m = RESULT_LIMIT.search(result_text) or PRODUCT_LIMIT.search(result_text)
         if m:
             return "limit", f"{provider} limit signature '{m.group(0)}' in its short result", session, result_text
     return "ok", f"{provider} reported completion", session, result_text
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--provider", required=True)
     p.add_argument("--exit", required=True, type=int)

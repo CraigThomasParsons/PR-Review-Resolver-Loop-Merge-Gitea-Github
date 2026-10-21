@@ -236,7 +236,17 @@ expect "S4: an invalid API key is a setup fault" "$(classify claude 0 '{"subtype
 expect "S4: 'Select login method' is setup, not a limit" "$(classify claude 1 '' 'Select login method:')" "setup"
 expect "S4: 'log in to continue' is setup, not a limit" "$(classify grok 1 '' 'Please log in to continue')" "setup"
 expect "S4: setup wins over limit wording in the same output" "$(classify agy 1 '{"status":"ERROR","error":"invalid model; quota exceeded"}')" "setup"
-expect "S4: a short successful result asking for login is setup" "$(classify cursor 0 '{"type":"result","subtype":"success","is_error":false,"result":"Not logged in. Run cursor-agent login."}')" "setup"
+expect "S4: a short successful result that is the login prompt is setup" "$(classify cursor 0 '{"type":"result","subtype":"success","is_error":false,"result":"Select login method:"}')" "setup"
+expect "r4#3: a short successful summary mentioning 'not logged in' is ok" \
+  "$(classify claude 0 '{"subtype":"success","is_error":false,"result":"Fixed the redirect shown when the user is not logged in."}')" "ok"
+expect "r4#3: a short successful summary mentioning authentication_error is ok" \
+  "$(classify cursor 0 '{"type":"result","subtype":"success","is_error":false,"result":"The handler now maps authentication_error to a 401."}')" "ok"
+expect "r4#3: a failed run saying 'not logged in' is still setup" "$(classify grok 1 '' 'Error: not logged in')" "setup"
+expect "r4#4: a denied run that then hangs is a setup fault, not a timeout" \
+  "$(classify cursor 124 "$CURSOR_DENIED")" "setup"
+expect "r4#4: an agy denial before the timeout is a setup fault" \
+  "$(classify agy 137 '{"status":"ERROR","denied_actions":[{"tool":"run_command"}]}')" "setup"
+expect "r4#4: a plain timeout is still a timeout" "$(classify claude 124 '{"subtype":"error","is_error":true,"result":"x"}')" "timeout"
 expect "G3: exit 126 is a setup fault" "$(classify agy 126 '' 'agy: Argument list too long')" "setup"
 expect_not "G3: exit 126 is not reported as a missing binary" "$(classify agy 126 '' 'agy: Argument list too long')" "missing"
 expect "G3: exit 126 names E2BIG" "$(classify agy 126 '' 'agy: Argument list too long')" "argument list too long"
@@ -292,6 +302,17 @@ expect "a GitHub token shape is refused" "$(rep 'ghp_abcdefghijklmnopqrstuvwxyz0
 expect "an Anthropic key shape is refused" "$(rep 'sk-ant-api03-abcdefghijklmnopqrstuvwx')" "invalid"
 expect "an AWS key id is refused" "$(rep 'AKIAABCDEFGHIJKLMNOP')" "invalid"
 expect "'token <40 hex>' is refused" "$(rep "Authorization: token $SHA40")" "invalid"
+expect "r4#2: a YAML 'token: <hex>' line is refused" "$(rep "    token: $SHA40")" "invalid"
+expect "r4#2: a key=value token is refused" "$(rep "GITEA_TOKEN=3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6")" "invalid"
+expect "r4#2: a JSON password is refused" "$(rep '{"password": "Zx81kd9w0qPl3mNb7"}')" "invalid"
+expect "r4#2: a code identifier after token: is not a secret" "$(rep 'The token: getTokenFromEnvironment is read once.')" "ok"
+expect "r4#2: a SHA in prose is not a secret" "$(rep "Fixed in $SHA40.")" "ok"
+printf 'fix: x\n\napi_key = "AbC123dEf456GhI789jK"\n' > "$TMP/scan.txt"
+python3 "$SCRIPTS/report.py" scan --file "$TMP/scan.txt" >/dev/null
+expect_rc "r4#2: report.py scan flags a credential in commit text" "$?" 1
+printf 'fix: x\n+def token_for(user):\n' > "$TMP/scan.txt"
+python3 "$SCRIPTS/report.py" scan --file "$TMP/scan.txt" >/dev/null
+expect_rc "r4#2: report.py scan passes clean commit text" "$?" 0
 
 echo
 echo "worker permission policy"
@@ -330,6 +351,29 @@ for fam in glob prefix; do
   expect "$fam/resolve: the gate is allowed" "$(pol $fam resolve 'npm run test')" allow
   expect "$fam/resolve: git commit --amend is denied" "$(pol $fam resolve 'git commit --amend -m x')" deny
   expect "$fam/resolve: git commit -a is denied" "$(pol $fam resolve 'git commit -a -m x')" deny
+  # Cursor commits as `git commit --trailer ... -m ...`.
+  T='--trailer "Made-with: Cursor"'
+  expect "$fam/resolve: a commit --trailer -m is allowed" "$(pol $fam resolve "git commit $T -m 'fix: x'")" allow
+  expect "$fam/resolve: repeated --trailer is allowed" "$(pol $fam resolve "git commit $T --trailer 'Co-authored-by: A' -m x")" allow
+  expect "$fam/resolve: a --trailer after -m is allowed" "$(pol $fam resolve "git commit -m x $T")" allow
+  expect "$fam/review: a commit --trailer -m is denied" "$(pol $fam review "git commit $T -m 'fix: x'")" deny
+  expect "$fam/review: a commit -m --trailer is denied" "$(pol $fam review "git commit -m x $T")" deny
+  expect "$fam/resolve: --trailer without -m is denied" "$(pol $fam resolve "git commit $T")" deny
+  expect "$fam/resolve: --trailer=VALUE is allowed like --message=" "$(pol $fam resolve 'git commit -m x --trailer=Made-with:Cursor')" allow
+  expect "$fam/resolve: --trailer= naming a credential is denied" "$(pol $fam resolve 'git commit -m x --trailer=~/.ssh/id_rsa')" deny
+  expect "$fam/resolve: --trailer without a value is denied" "$(pol $fam resolve 'git commit -m x --trailer')" deny
+  expect "$fam/resolve: --trailer with -a is denied" "$(pol $fam resolve "git commit $T -a -m x")" deny
+  expect "$fam/resolve: --trailer with --all is denied" "$(pol $fam resolve "git commit $T --all -m x")" deny
+  expect "$fam/resolve: --trailer with --amend is denied" "$(pol $fam resolve "git commit $T --amend -m x")" deny
+  expect "$fam/resolve: --trailer with -F is denied" "$(pol $fam resolve "git commit $T -F msg.txt")" deny
+  expect "$fam/resolve: --trailer with --file= is denied" "$(pol $fam resolve "git commit $T --file=msg.txt")" deny
+  expect "$fam/resolve: --trailer with paths is denied" "$(pol $fam resolve "git commit $T -m x src/a.php")" deny
+  expect "$fam/resolve: a --trailer naming a credential is denied" "$(pol $fam resolve 'git commit --trailer ~/.ssh/id_rsa -m x')" deny
+  for job in review resolve; do
+    expect "$fam/$job: a trailer commit then a push is denied" "$(pol $fam $job "git commit $T -m x && git push origin HEAD")" deny
+    expect "$fam/$job: git push is denied" "$(pol $fam $job 'git push')" deny
+    expect "$fam/$job: git push --force is denied" "$(pol $fam $job 'git push --force origin HEAD:refs/heads/feature/x')" deny
+  done
 done
 for fam in glob prefix; do
   for job in review resolve; do
@@ -382,7 +426,94 @@ for fam in glob prefix; do
   expect "$fam/resolve: git commit with paths is denied" "$(pol $fam resolve 'git commit -m x src/a.php')" deny
   expect "$fam/resolve: npm test 2>&1 is denied (redirection is its own segment)" "$(pol $fam resolve 'npm test 2>&1')" deny
   expect "$fam/resolve: a gate piped into tail is allowed" "$(pol $fam resolve 'npm test | tail -50')" allow
+  # Review r4 #1: brace expansion.
+  for job in review resolve; do
+    expect "$fam/$job: r4#1 rg {-,}-pre=sh is denied" "$(pol $fam $job 'rg {-,}-pre=sh foo')" deny
+    expect "$fam/$job: r4#1 git log {-,}-output= is denied" "$(pol $fam $job 'git log {-,}-output=/tmp/pwned HEAD')" deny
+    expect "$fam/$job: r4#1 git grep {-,}-open-files-in-pager= is denied" "$(pol $fam $job 'git grep {-,}-open-files-in-pager=sh foo')" deny
+    expect "$fam/$job: r4#1 a brace sequence is denied" "$(pol $fam $job 'cat src/{a..z}.php')" deny
+    expect "$fam/$job: r4#1 an escaped brace is denied" "$(pol $fam $job 'rg \{-,\}-pre=sh foo')" deny
+    expect "$fam/$job: r4#1 a token starting with { is denied" "$(pol $fam $job 'cat {a,b}')" deny
+    expect "$fam/$job: r4#1 a quoted brace is only text" "$(pol $fam $job "git log --format='%H {x}' -n 1")" allow
+    # Review r4 #2: credential paths.
+    expect "$fam/$job: r4#2 recursive grep of ~/.config is denied" "$(pol $fam $job 'grep -r token ~/.config')" deny
+    expect "$fam/$job: r4#2 rg of ~ is denied" "$(pol $fam $job 'rg --hidden --no-ignore BEGIN ~')" deny
+    expect "$fam/$job: r4#2 a // path is normalised" "$(pol $fam $job 'cat ~/.config//tea/config.yml')" deny
+    expect "$fam/$job: r4#2 a /./ path is normalised" "$(pol $fam $job "cat $HOME/./.ssh/id_rsa")" deny
+    expect "$fam/$job: r4#2 a .. path out of the worktree is denied" "$(pol $fam $job 'cat ../../etc/passwd')" deny
+    expect "$fam/$job: r4#2 a wildcard outside the worktree is denied" "$(pol $fam $job 'cat ~/.s*/config')" deny
+    expect "$fam/$job: r4#2 any read outside the worktree is denied" "$(pol $fam $job 'cat /etc/hostname')" deny
+    expect "$fam/$job: r4#2 git diff of an outside path (implicit --no-index) is denied" "$(pol $fam $job 'git diff ~/.netrc README')" deny
+    expect "$fam/$job: r4#2 an option value naming a credential is denied" "$(pol $fam $job 'git log --grep=~/.config//tea')" deny
+    expect "$fam/$job: r4#2 rg -g value naming a credential is denied" "$(pol $fam $job 'rg -g ~/.ssh/id_rsa foo')" deny
+    expect "$fam/$job: r4#2 a pattern that looks like a path is still a pattern" "$(pol $fam $job 'rg /api/v1 src')" allow
+    expect "$fam/$job: r4#2 grep -e then paths checks every path" "$(pol $fam $job 'grep -r -e token ~/.config')" deny
+    expect "$fam/$job: r4#2 a wildcard inside the worktree is allowed" "$(pol $fam $job 'cat src/*.php')" allow
+    expect "$fam/$job: r4#2 reading the runs folder is allowed" "$(pol $fam $job 'cat /runs/r.md')" allow
+    expect "$fam/$job: r4#2 a recursive grep inside the worktree is allowed" "$(pol $fam $job 'grep -rn foo src')" allow
+  done
+  expect "$fam/resolve: r4#2 a gate argument naming a // credential path is denied" "$(pol $fam resolve 'npm test -- ~/.config//tea/config.yml')" deny
+  expect "$fam/resolve: r4#2 git commit -F is denied" "$(pol $fam resolve 'git commit -F ~/.config//tea/config.yml')" deny
+  expect "$fam/resolve: r4#2 git commit -F of a worktree file is denied too" "$(pol $fam resolve 'git commit -F msg.txt')" deny
+  expect "$fam/resolve: r4#2 git commit --file= is denied" "$(pol $fam resolve 'git commit --file=msg.txt')" deny
+  expect "$fam/resolve: r4#2 git add ././ is denied" "$(pol $fam resolve 'git add ././')" deny
+  expect "$fam/resolve: r4#2 git add of a tool config through .. is denied" "$(pol $fam resolve 'git add src/../.cursor/cli.json')" deny
+  expect "$fam/resolve: r4#2 git add ./.claude/ is denied" "$(pol $fam resolve 'git add ./.claude/settings.json')" deny
+  expect "$fam/resolve: r4#2 git add of a path outside the worktree is denied" "$(pol $fam resolve 'git add ../other/x')" deny
+  expect "$fam/resolve: r4#2 git add of .git is denied" "$(pol $fam resolve 'git add .git/config')" deny
+  expect "$fam/resolve: r4#5 staging the context file is denied" "$(pol $fam resolve 'git add ./.agent-pool-context.md')" deny
 done
+# Symlinks are resolved: a link in the PR cannot point a read or a write outside the worktree.
+mkdir -p "$TMP/swt/src"; ln -s /etc "$TMP/swt/etclink"; echo x > "$TMP/swt/src/a.txt"
+spol() { python3 "$SCRIPTS/policy.py" check --family glob --job "$1" --adapter "$AD_ABS" --worktree "$TMP/swt" --report /runs/r.md -- "$2"; }
+expect "r4#2 a read through a symlink out of the worktree is denied" "$(spol review 'cat etclink/hostname')" deny
+expect "r4#2 a wildcard that matches a symlink out of the worktree is denied" "$(spol review 'cat etc*/hostname')" deny
+expect "r4#2 a read of a real worktree file is allowed" "$(spol review 'cat src/a.txt')" allow
+expect "r4#2 git add through a symlink out of the worktree is denied" "$(spol resolve 'git add etclink/hostname')" deny
+# Charlie B1: a symlink committed in the PR pointing at a credential (a fake ~/.ssh under a temp HOME).
+FH="$TMP/fakehome"; BWT="$TMP/b1wt"
+mkdir -p "$FH/.ssh" "$BWT/src"; echo 'fake key' > "$FH/.ssh/id_ed25519"; echo x > "$BWT/src/a.txt"
+ln -s "$FH/.ssh/id_ed25519" "$BWT/notes.txt"; ln -s "$FH/.ssh" "$BWT/keydir"
+bpol() { HOME="$FH" python3 "$SCRIPTS/policy.py" check --family "$1" --job "$2" --adapter "$AD_ABS" --worktree "$BWT" --report "$TMP/b1runs/r.md" -- "$3"; }
+bhk() { printf '%s' "$2" | HOME="$FH" python3 "$SCRIPTS/policy.py" hook --job "$1" --adapter "$AD_ABS" --worktree "$BWT" --report "$TMP/b1runs/r.md" 2>/dev/null; }
+for fam in glob prefix; do
+  for job in review resolve; do
+    expect "$fam/$job: B1 cat of a symlink to a credential is denied" "$(bpol $fam $job 'cat notes.txt')" deny
+    expect "$fam/$job: B1 head of a symlink to a credential is denied" "$(bpol $fam $job 'head -n 1 notes.txt')" deny
+    expect "$fam/$job: B1 rg of a symlink to a credential is denied" "$(bpol $fam $job 'rg BEGIN notes.txt')" deny
+    expect "$fam/$job: B1 rg of a symlinked credential directory is denied" "$(bpol $fam $job 'rg -n BEGIN keydir')" deny
+    expect "$fam/$job: B1 a wildcard matching the symlink is denied" "$(bpol $fam $job 'cat note*')" deny
+    expect "$fam/$job: B1 a real worktree file is still readable" "$(bpol $fam $job 'cat src/a.txt')" allow
+    # Charlie B4: consumed option values get the same credential and symlink check.
+    expect "$fam/$job: B4 git log -S <credential path> is denied" "$(bpol $fam $job 'git log -S ~/.ssh/id_ed25519')" deny
+    expect "$fam/$job: B4 git log -G <credential path> is denied" "$(bpol $fam $job 'git log -G ~/.config/tea/config.yml')" deny
+    expect "$fam/$job: B4 an attached -S<credential path> is denied" "$(bpol $fam $job 'git log -S~/.ssh/id_ed25519')" deny
+    expect "$fam/$job: B4 git grep -e <credential path> is denied" "$(bpol $fam $job 'git grep -e ~/.config/pulse/gitea_token')" deny
+    expect "$fam/$job: B4 an option value that is a symlink to a credential is denied" "$(bpol $fam $job 'git log -S notes.txt')" deny
+    expect "$fam/$job: B4 git blame -L <credential path> is denied" "$(bpol $fam $job 'git blame -L 1,2 ~/.ssh/id_ed25519')" deny
+    expect "$fam/$job: B4 an ordinary -S search is allowed" "$(bpol $fam $job 'git log -S parseConfig --oneline')" allow
+    # Charlie B5: --output anywhere in the command.
+    expect "$fam/$job: B5 git log -p --output= is denied" "$(bpol $fam $job 'git log -p --output=/tmp/x')" deny
+    expect "$fam/$job: B5 --output late in the command is denied" "$(bpol $fam $job 'git log -p -n 3 --stat --output /tmp/x')" deny
+    expect "$fam/$job: B5 an abbreviated --outp= is denied" "$(bpol $fam $job 'git log -p --outp=/tmp/x')" deny
+    expect "$fam/$job: B5 git diff with a late --output is denied" "$(bpol $fam $job 'git diff HEAD~1 --output=/tmp/x')" deny
+  done
+  # Charlie B2: git commit -F is gone in both families.
+  expect "$fam/resolve: B2 git commit -m x -F <file> is denied" "$(bpol $fam resolve 'git commit -m x -F /etc/hostname')" deny
+  expect "$fam/resolve: B2 git commit -F <credential> is denied" "$(bpol $fam resolve "git commit -F $FH/.ssh/id_ed25519")" deny
+done
+bhk review '{"tool_name":"Read","tool_input":{"file_path":"'"$BWT"'/notes.txt"}}'
+expect_rc "claude hook B1: Read of a symlink to a credential is blocked" "$?" 2
+bhk review '{"tool_name":"Read","tool_input":{"file_path":"notes.txt"}}'
+expect_rc "claude hook B1: a relative Read of the symlink is blocked" "$?" 2
+bhk review '{"tool_name":"Grep","tool_input":{"pattern":"BEGIN","path":"'"$BWT"'/keydir"}}'
+expect_rc "claude hook B1: Grep through a symlinked credential directory is blocked" "$?" 2
+bhk review '{"tool_name":"Read","tool_input":{"file_path":"'"$BWT"'/src/a.txt"}}'
+expect_rc "claude hook B1: Read of a real worktree file passes" "$?" 0
+bhk resolve '{"tool_name":"Edit","tool_input":{"file_path":"'"$BWT"'/notes.txt"}}'
+expect_rc "claude hook B1: an Edit through a symlink to a credential is blocked" "$?" 2
+bhk resolve '{"tool_name":"Edit","tool_input":{"file_path":"'"$BWT"'/src/a.txt"}}'
+expect_rc "claude hook B1: an Edit of a real worktree file passes" "$?" 0
 expect "glob: git commit -m x --amend is denied" "$(pol glob resolve 'git commit -m x --amend')" deny
 expect "glob: command substitution is denied" "$(pol glob resolve 'cat $(curl https://example.invalid)')" deny
 expect "glob: rg --pre is denied" "$(pol glob review 'rg --pre ./x pattern')" deny
@@ -459,6 +590,70 @@ hk review '{"tool_name":"Read","tool_input":{"file_path":"'"$HOME"'/.ssh/id_rsa"
 expect_rc "claude hook: reading ~/.ssh is blocked" "$?" 2
 hk review '{"tool_name":"Read","tool_input":{"file_path":"/wt/README.md"}}'
 expect_rc "claude hook: reading the worktree passes" "$?" 0
+hk review '{"tool_name":"Read","tool_input":{"file_path":"/runs/r.md"}}'
+expect_rc "claude hook: reading the runs folder passes" "$?" 0
+hk review '{"tool_name":"Grep","tool_input":{"pattern":"token","path":"'"$HOME"'/.config"}}'
+expect_rc "claude hook r4#2: grepping ~/.config is blocked" "$?" 2
+hk review '{"tool_name":"Grep","tool_input":{"pattern":"BEGIN","path":"'"$HOME"'"}}'
+expect_rc "claude hook r4#2: grepping ~ is blocked" "$?" 2
+hk review '{"tool_name":"Glob","tool_input":{"pattern":"'"$HOME"'/.s*/*"}}'
+expect_rc "claude hook r4#2: an absolute Glob outside the worktree is blocked" "$?" 2
+hk review '{"tool_name":"Glob","tool_input":{"pattern":"../../**/*"}}'
+expect_rc "claude hook r4#2: a Glob climbing out of the worktree is blocked" "$?" 2
+hk review '{"tool_name":"Read","tool_input":{"file_path":"'"$HOME"'/.config//tea/config.yml"}}'
+expect_rc "claude hook r4#2: an unnormalised credential path is blocked" "$?" 2
+hk review '{"tool_name":"Read","tool_input":{"file_path":"/wt/../etc/passwd"}}'
+expect_rc "claude hook r4#2: a .. read out of the worktree is blocked" "$?" 2
+hk review '{"tool_name":"Glob","tool_input":{"pattern":"**/*.php"}}'
+expect_rc "claude hook: a relative Glob in the worktree passes" "$?" 0
+hk resolve '{"tool_name":"Write","tool_input":{"file_path":"/wt/.agent-pool-context.md"}}'
+expect_rc "claude hook r4#5: the context file is not writable" "$?" 2
+r="$(rules_of claude review)"
+expect "claude r4#2: Read is scoped to the worktree" "$r" $'allow\tRead(//wt/**)'
+expect "claude r4#2: and the runs folder" "$r" $'allow\tRead(//runs/**)'
+expect_not "claude r4#2: no bare Read" "$r" $'allow\tRead\n'
+expect "grok r4#2: Read is scoped" "$(rules_of grok review)" $'allow\tRead(/wt/**)'
+expect "cursor r4#2: Read is scoped" "$(rules_of cursor review)" $'allow\tRead(/wt/**)'
+expect_not "cursor r4#2: no Read(**)" "$(rules_of cursor review)" $'allow\tRead(**)'
+expect "claude r4#1: brace expansion is denied in the emitted globs" "$r" 'Bash(*{*,*}*)'
+expect "claude r4#2: git commit -F is denied in the emitted globs" "$(rules_of claude resolve)" 'Bash(git commit -F*)'
+expect_not "claude r4#2: git commit -F is no longer allowed" "$(rules_of claude resolve | grep '^allow')" 'git commit -F'
+expect "cursor r4#2: git commit -F is a deny prefix" "$(rules_of cursor resolve)" 'Shell(git commit -F)'
+expect "cursor resolve allows git commit --trailer" "$(rules_of cursor resolve)" $'allow\tShell(git commit --trailer)'
+expect "cursor resolve still allows git commit -m" "$(rules_of cursor resolve)" $'allow\tShell(git commit -m)'
+expect_not "cursor review does not allow git commit --trailer" "$(rules_of cursor review | grep '^allow')" 'git commit'
+expect "cursor review denies git commit" "$(rules_of cursor review)" $'deny\tShell(git commit)'
+for prov in claude grok; do
+  expect "$prov resolve allows git commit --trailer" "$(rules_of $prov resolve)" $'allow\tBash(git commit --trailer * -m *)'
+  expect "$prov resolve still allows git commit -m" "$(rules_of $prov resolve)" $'allow\tBash(git commit -m *)'
+  expect_not "$prov review does not allow git commit --trailer" "$(rules_of $prov review | grep '^allow')" 'git commit'
+  expect "$prov review denies git commit" "$(rules_of $prov review)" $'deny\tBash(git commit*)'
+done
+# Grok gets only the emitted globs (no argument check), so the globs alone must require -m.
+glob_only() { # job command: allow or deny by the emitted grok Bash globs alone
+  rules_of grok "$1" | python3 -c '
+import fnmatch, sys
+cmd, rules = sys.argv[1], [l.rstrip("\n").split("\t", 1) for l in sys.stdin]
+globs = lambda k: [r[5:-1] for kind, r in rules if kind == k and r.startswith("Bash(")]
+ok = any(fnmatch.fnmatchcase(cmd, g) for g in globs("allow")) and not any(fnmatch.fnmatchcase(cmd, g) for g in globs("deny"))
+print("allow" if ok else "deny")' "$2"
+}
+expect "grok globs: a commit --trailer -m is allowed" "$(glob_only resolve 'git commit --trailer Made-with:Cursor -m x')" allow
+expect "grok globs: a commit -m --trailer is allowed" "$(glob_only resolve 'git commit -m x --trailer Made-with:Cursor')" allow
+expect "grok globs: a commit --trailer with no -m is denied" "$(glob_only resolve 'git commit --trailer Made-with:Cursor')" deny
+expect "grok globs: review commit --trailer -m is denied" "$(glob_only review 'git commit --trailer T -m x')" deny
+for prov in claude grok cursor; do
+  for job in review resolve; do
+    r="$(rules_of $prov $job)"
+    expect_not "$prov/$job allows no git push" "$(printf '%s\n' "$r" | grep '^allow')" 'git push'
+    expect "$prov/$job denies git push" "$r" "$([ $prov = cursor ] && echo $'deny\tShell(git push)' || echo $'deny\tBash(git push*)')"
+    expect "$prov/$job denies git push --force" "$r" "$([ $prov = cursor ] && echo $'deny\tShell(git push --force)' || echo $'deny\tBash(git push --force*)')"
+  done
+done
+cr="$(rules_of cursor review)"
+expect "cursor B5: --output behind -p is a deny prefix" "$cr" 'Shell(git log -p --output)'
+expect "cursor B5: --output behind --stat on git diff is a deny prefix" "$cr" 'Shell(git diff --stat --output)'
+expect "claude B5: --output anywhere is a deny glob" "$(rules_of claude review)" 'Bash(*--output*)'
 hs="$(python3 "$SCRIPTS/policy.py" hook-settings --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)"
 expect "hook-settings wires a PreToolUse hook" "$hs" '"PreToolUse"'
 expect "that runs policy.py hook for this job" "$hs" "policy.py hook --job review"

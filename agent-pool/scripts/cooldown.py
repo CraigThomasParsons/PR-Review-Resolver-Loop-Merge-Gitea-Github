@@ -24,33 +24,34 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 import poolstate
 
 
-def base():
+def base() -> float:
     return float(os.environ.get("AGENT_POOL_COOLDOWN_BASE", 3600))
 
 
-def cap():
+def cap() -> float:
     return float(os.environ.get("AGENT_POOL_COOLDOWN_CAP", 86400))
 
 
-def path_for(kind, provider):
+def path_for(kind: str, provider: str) -> Path:
     return poolstate.state_dir() / kind / f"{poolstate.slug(provider)}.json"
 
 
-def read(path):
+def read(path: Path) -> dict:
     doc = poolstate.load(path) or {}
     return {} if doc.get("_unreadable") else doc
 
 
-def remaining(provider, now):
+def remaining(provider: str, now: float) -> float:
     doc = read(path_for("cooldowns", provider))
     return max(0.0, float(doc.get("until", 0)) - now)
 
 
-def cmd_record(a):
+def cmd_record(a: argparse.Namespace) -> int:
     path = path_for("cooldowns", a.provider)
     with poolstate.locked(path):
         now = poolstate.now()
@@ -72,7 +73,7 @@ def cmd_record(a):
     return 0
 
 
-def cmd_clear(a):
+def cmd_clear(a: argparse.Namespace) -> int:
     path = path_for("cooldowns", a.provider)
     with poolstate.locked(path):
         if read(path):
@@ -81,7 +82,7 @@ def cmd_clear(a):
     return 0
 
 
-def cmd_active(a):
+def cmd_active(a: argparse.Namespace) -> int:
     left = remaining(a.provider, poolstate.now())
     if left > 0:
         print(f"{left:.0f}")
@@ -89,7 +90,7 @@ def cmd_active(a):
     return 1
 
 
-def cmd_eligible(a):
+def cmd_eligible(a: argparse.Namespace) -> int:
     now = poolstate.now()
     found = [p for p in (x.strip() for x in a.order.split(",")) if p and remaining(p, now) <= 0]
     for p in found:
@@ -97,7 +98,7 @@ def cmd_eligible(a):
     return 0 if found else 1
 
 
-def cmd_fault(a):
+def cmd_fault(a: argparse.Namespace) -> int:
     path = path_for("faults", a.provider)
     with poolstate.locked(path):
         doc = read(path)
@@ -106,12 +107,12 @@ def cmd_fault(a):
     return 0
 
 
-def cmd_show(a):
+def cmd_show(a: argparse.Namespace) -> int:
     print(json.dumps(read(path_for("cooldowns", a.provider)), indent=2, sort_keys=True))
     return 0
 
 
-def main():
+def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("action", choices=["record", "clear", "active", "eligible", "fault", "show"])
     p.add_argument("--provider")

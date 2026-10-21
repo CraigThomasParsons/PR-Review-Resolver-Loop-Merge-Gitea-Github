@@ -18,6 +18,9 @@ cleanup() {
   while read -r pid; do
     [[ "$(ps -o args= -p "$pid" 2>/dev/null)" == "sleep "* ]] && kill "$pid" 2>/dev/null
   done < <(cat "$TMP/stub-pids" 2>/dev/null)
+  while read -r pid; do
+    [[ "$(ps -o args= -p "$pid" 2>/dev/null)" == *fake-nightcrew.py* ]] && kill "$pid" 2>/dev/null
+  done < <(cat "$TMP/server-pids" 2>/dev/null)
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -72,6 +75,8 @@ if cmd == "list":
 elif cmd == "labels":
     print(json.dumps(st["prs"][arg("--pr")]["labels"]))
 elif cmd == "label":
+    if os.path.exists(path + ".faildone") and "agent:done" in (arg("--add") or ""):
+        sys.exit("stub adapter: Gitea hiccup on the release")
     p = st["prs"][arg("--pr")]
     remove = [x for x in (arg("--remove") or "").split(",") if x]
     p["labels"] = [l for l in p["labels"] if l not in remove]
@@ -138,7 +143,12 @@ claim_provider="$(python3 "$STUB_CLAIMREC" show --repo "$STUB_REPO" --pr "$STUB_
   echo "SID=$(ps -o sid= -p $$ | tr -d ' ')"
   echo "CLAIM_PROVIDER=$claim_provider"
   echo "REPORT=$report"
-  [ -f "$PWD/.cursor/cli.json" ] && echo "CURSOR_CLI_JSON=present"
+  [ -f "$PWD/.cursor/cli.json" ] && echo "CURSOR_CLI_JSON=present" && python3 -c '
+import json, sys
+perms = json.load(open(sys.argv[1]))["permissions"]
+for kind in ("allow", "deny"):
+    for rule in perms[kind]:
+        print(f"CURSOR_{kind.upper()} {rule}")' "$PWD/.cursor/cli.json"
   [ -f "$PWD/.agent-pool-context.md" ] && echo "CONTEXT_DIFF_LINES=$(grep -c '^+change' "$PWD/.agent-pool-context.md")"
 } >> "$STUB_CALLS/$name.log"
 behave="$(cat "$STUB_BEHAVE/$name" 2>/dev/null || echo ok)"
@@ -173,6 +183,9 @@ case "$behave" in
   resolve-noted)    resolve_text 0 1 0 > "$report"; success ;;
   resolve-deferred) resolve_text 0 0 1 > "$report"; success ;;
   resolve-fix)      commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-trailer)
+    echo "fix $RANDOM" >> f.txt; git add f.txt; git commit -q --trailer "Made-with: Cursor" -m "fix: something"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-repoint)
     # Commit, then point the worktree's .git at a gitdir of the worker's choosing.
     commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"
@@ -184,6 +197,16 @@ case "$behave" in
   resolve-toolconf-claude)
     commit_fix; mkdir -p .claude; echo '{}' > .claude/settings.json
     git add .claude/settings.json; git commit -q -m "chore: tool config"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-context)
+    commit_fix; git add -f .agent-pool-context.md; git commit -q -m "chore: context"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-secret-msg)
+    echo "fix $RANDOM" >> f.txt; git add f.txt
+    git commit -q -m "fix: something" -m "token: 3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-secret-diff)
+    echo "GITEA_TOKEN=3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901" >> f.txt; git add f.txt; git commit -q -m "fix: config"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-lag)
     commit_fix; cat "$STUB_BEHAVE/lag" > "$STUB_GITEA.lag"
@@ -248,7 +271,8 @@ export ANTHROPIC_API_KEY=stale-key-for-test PR_LOOP_SKIP_PATTERN=""
 unset PROVIDER_ORDER AGY_AUTO_APPROVE
 
 reset() { # labels-json [assignees-json] [comments-json] [head-ref]
-  rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes" "$STUB_GITEA.race" "$STUB_GITEA.lag"
+  rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes" "$STUB_GITEA.race" "$STUB_GITEA.lag" \
+    "$STUB_GITEA.faildone"
   git --git-dir "$ORIGIN" update-ref refs/heads/feature/x "$SHA"
   git --git-dir "$ORIGIN" update-ref "refs/heads/$ODD_REF" "$SHA"
   python3 - "$STUB_GITEA" "$1" "${2:-[]}" "${3:-[]}" "${4:-feature/x}" "$SHA" <<'PY'
@@ -400,6 +424,20 @@ for tc in cursor claude; do
   expect "S3: and go to needs-human (.$tc/)" "$(labels)" "agent:needs-human"
   expect "S3: with the reason (.$tc/)" "$(comments)" "touch agent tool configuration"
 done
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-context
+tick
+expect "r4#5: a commit adding the context file is never pushed" "$(origin_head)" "$SHA"
+expect "r4#5: and the reason is given" "$(comments)" "touch agent tool configuration"
+for leak in msg diff; do
+  reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+  behave claude "resolve-secret-$leak"
+  tick
+  expect "r4#2: a credential in the commit $leak is never pushed" "$(origin_head)" "$SHA"
+  expect "r4#2: and goes to needs-human ($leak)" "$(labels)" "agent:needs-human"
+  expect "r4#2: with the reason ($leak)" "$(comments)" "contain a credential or token-shaped string"
+  expect_not "r4#2: and the secret itself is not repeated in the comment ($leak)" "$(comments)" "3f9a0c1d2e4b"
+done
 for lag in 3 99; do
   reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
   behave claude resolve-lag; echo "$lag" > "$TMP/behave/lag"
@@ -422,6 +460,42 @@ tick
 expect "a branch name with | and & renders into the prompt intact" "$(cat "$TMP/state/runs/prompt-7-"*-claude.txt)" "(branch $ODD_REF, base master)"
 expect "and the controller pushes to exactly that branch" "$(git --git-dir "$ORIGIN" log -1 --format=%s "refs/heads/$ODD_REF")" "fix: something"
 expect "and the job is done" "$(labels)" "agent:done"
+
+echo
+echo "commit trailers: resolve may commit with --trailer, review may not commit at all"
+claude_allows() { calls claude | sed -n '/^ARG --allowedTools$/,/^ARG --disallowedTools$/p'; }
+claude_denies() { calls claude | sed -n '/^ARG --disallowedTools$/,/^[^A]/p'; }
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave cursor-agent resolve-trailer
+PROVIDER_ORDER=cursor tick
+expect "cursor resolve cli.json allows git commit --trailer" "$(calls cursor-agent)" "CURSOR_ALLOW Shell(git commit --trailer)"
+expect "cursor resolve cli.json still allows git commit -m" "$(calls cursor-agent)" "CURSOR_ALLOW Shell(git commit -m)"
+for rule in 'git push' 'git push --force' 'git commit -a' 'git commit --all' 'git commit --amend' 'git commit -F' 'git commit --file'; do
+  expect "cursor resolve cli.json still denies $rule" "$(calls cursor-agent)" "CURSOR_DENY Shell($rule)"
+done
+expect_not "cursor resolve cli.json allows no push" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git push"
+expect "a trailer commit from cursor is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%B feature/x)" "Made-with: Cursor"
+expect "and the resolve is done" "$(labels)" "agent:done"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-trailer
+tick
+expect "claude resolve allows git commit --trailer" "$(claude_allows)" "ARG Bash(git commit --trailer * -m *)"
+expect "claude resolve still allows git commit -m" "$(claude_allows)" "ARG Bash(git commit -m *)"
+expect_not "claude resolve allows no push" "$(claude_allows)" "git push"
+for rule in 'git push*' 'git push --force*' 'git commit -a*' 'git commit --amend*' 'git commit -F*' 'git commit *--file*'; do
+  expect "claude resolve still denies $rule" "$(claude_denies)" "ARG Bash($rule)"
+done
+expect "a trailer commit from claude is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%B feature/x)" "Made-with: Cursor"
+reset '["agent:ready"]'
+behave cursor-agent ok
+PROVIDER_ORDER=cursor tick
+expect_not "cursor review cli.json does not allow git commit --trailer" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git commit"
+expect "cursor review cli.json denies git commit" "$(calls cursor-agent)" "CURSOR_DENY Shell(git commit)"
+reset '["agent:ready"]'
+behave claude ok
+tick
+expect_not "claude review does not allow git commit --trailer" "$(claude_allows)" "git commit"
+expect "claude review denies git commit" "$(claude_denies)" "ARG Bash(git commit*)"
 
 echo
 echo "fencing: a superseded attempt publishes nothing and its process group dies"
@@ -523,6 +597,31 @@ expect "G6: an already-verified resolve is settled even when no provider takes r
 expect "G6: the log says why" "$(cat "$TMP/out.txt")" "already verified at $RESOLVED"
 expect_not "G6: it is not skipped for want of a resolve provider" "$(cat "$TMP/out.txt")" "no eligible provider takes resolve"
 expect "G6: and no provider ran" "$(ncalls agy)" "0"
+reset '["agent:ready"]' '[]' "$CLEAN_MARKER"
+AGENT_POOL_MAX_JOBS=0 tick
+expect "r4#7: a settled PR is settled even with no job slots left" "$(labels)" "agent:done"
+reset '["agent:ready"]'
+python3 - "$STUB_GITEA" "$CLEAN_MARKER" <<'PY'
+import json, sys
+path, comments = sys.argv[1:]
+st = json.load(open(path))
+st["prs"]["8"] = dict(st["prs"]["7"], labels=["agent:ready"], comments=json.loads(comments))
+json.dump(st, open(path, "w"))
+PY
+behave claude limit
+tick
+expect "r4#7: once every provider cools down, later settled PRs are still settled" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prs"]["8"]["labels"])' "$STUB_GITEA")" "agent:done"
+expect "r4#7: the log says the tick only settles from there" "$(cat "$TMP/out.txt")" "only settling from here"
+reset '["agent:ready"]' '[]' "$CLEAN_MARKER"
+: > "$STUB_GITEA.faildone"
+tick
+expect "r4#6: a settled job whose release fails keeps its claim for reconciliation" "$(record)" "attempt_id"
+rm -f "$STUB_GITEA.faildone"
+AGENT_POOL_NOW=$(( $(date +%s) + 100000 )) tick
+expect "r4#6: the stale claim of a settled job is requeued without a strike" "$(cat "$TMP/out.txt")" "only the release failed"
+expect "r4#6: and nobody is cooled down" "$(ls "$TMP/state/cooldowns" 2>/dev/null | wc -l)" "0"
+expect "r4#6: the job then settles" "$(labels)" "agent:done"
 
 echo
 echo "setup faults: no cooldown, reported clearly"
@@ -676,6 +775,315 @@ expect_not "the generic prompts use no Claude-only skill" "$(cat "$REAL_COMMON/p
 expect_not "no prompt tells a worker to post a comment" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "__ADAPTER__ comment "
 expect_not "no prompt tells a worker to push" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "git push origin"
 expect "a rendered prompt has no unfilled placeholder" "$(cat "$TMP/state/runs/prompt-7-"*-codex.txt | grep -c '__[A-Z_]*__')" "0"
+
+echo
+echo "TheNightCrew issue hold (opt-in check against GET /repos/{repo}/issue-hold)"
+# A stub hold script whose behavior is the word in hold-state; every invocation is recorded.
+cat > "$TMP/common/nightcrew-issue-hold.py" <<'PY'
+import os, sys, time
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+open(os.path.join(here, "hold-calls"), "a").write(" ".join(sys.argv[1:]) + "\n")
+mode = open(os.path.join(here, "hold-state")).read().strip()
+if mode == "busy": print("busy")
+elif mode == "clear": print("clear")
+elif mode == "clear-rc1": print("clear"); sys.exit(1)
+elif mode == "clear-twice": print("clear"); print("clear")
+elif mode == "padded": print(" clear")
+elif mode == "crash": sys.exit(1)
+elif mode == "hang": time.sleep(30); print("clear")
+elif mode == "clear-then-busy":
+    n = sum(1 for _ in open(os.path.join(here, "hold-calls")))
+    print("clear" if n <= 2 else "busy")
+PY
+hold_calls() { if [ -f "$TMP/common/hold-calls" ]; then wc -l < "$TMP/common/hold-calls" | tr -d ' '; else echo 0; fi; }
+hold_reset() { reset '["agent:ready"]'; behave claude ok; rm -f "$TMP/common/hold-calls"; echo "$1" > "$TMP/common/hold-state"; }
+export AGENT_POOL_NIGHTCREW_HOLD_SCRIPT="$TMP/common/nightcrew-issue-hold.py"
+unset AGENT_POOL_NIGHTCREW_HOLD AGENT_POOL_NIGHTCREW_BOT AGENT_POOL_NIGHTCREW_TIMEOUT
+
+hold_reset busy
+tick
+expect "not opted in: the hold check is never run" "$(hold_calls)" "0"
+expect "not opted in: claiming is unaffected" "$(ncalls claude)" "1"
+
+export AGENT_POOL_NIGHTCREW_HOLD=1
+hold_reset busy
+tick
+expect "opted in: the check runs once per tick for this repo" "$(cat "$TMP/common/hold-calls" 2>/dev/null)" "--repo $R"
+expect "no provider is invoked while TheNightCrew reports the repo held" "$(ncalls claude)" "0"
+expect "the PR is left exactly as queued, not claimed" "$(labels)" "agent:ready"
+expect "the hold is logged" "$(cat "$TMP/out.txt")" "TheNightCrew reports active issue/maintenance work"
+
+echo clear > "$TMP/common/hold-state"
+tick
+expect "claiming resumes once the hold is released" "$(ncalls claude)" "1"
+expect "the review lands normally" "$(comments)" "pulse-review:v1"
+
+echo "  (a cached clear from before the first claim must not cover the second, Codex PR #13)"
+hold_reset clear-then-busy
+python3 - "$STUB_GITEA" <<'PY'
+import json, sys
+path = sys.argv[1]
+st = json.load(open(path))
+st["prs"]["8"] = dict(st["prs"]["7"], labels=["agent:ready"], comments=[])
+st["prs"]["9"] = dict(st["prs"]["7"], labels=["agent:ready"], comments=[])
+json.dump(st, open(path, "w"))
+PY
+tick
+expect "the first job still claims and runs (hold was clear)" "$(ncalls claude)" "1"
+expect "pr 7 ran and requeued for resolve (review with findings, not a crash or a skip)" \
+  "$(python3 "$STUB_ADAPTER" comments --repo $R --pr 7)" "pulse-review:v1"
+expect "pr 8 was never touched -- skipped before any provider ran" \
+  "$(python3 "$STUB_ADAPTER" comments --repo $R --pr 8)" "[]"
+expect "pr 8 is skipped (hold went busy between claims, not cached from tick start)" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prs"]["8"]["labels"])' "$STUB_GITEA")" "agent:ready"
+expect "the rechecked skip is logged" "$(cat "$TMP/out.txt")" "rechecked before claim"
+expect "pr 9 was never touched either" "$(python3 "$STUB_ADAPTER" comments --repo "$R" --pr 9)" "[]"
+expect "the check ran three times: the early filter, job 1, then job 2's busy answer stops the rest" "$(hold_calls)" "3"
+
+for mode in crash clear-rc1 clear-twice padded; do
+  hold_reset "$mode"
+  tick
+  expect "a hold check that answers '$mode' claims nothing" "$(ncalls claude)" "0"
+  expect "the PR stays queued after a '$mode' hold check" "$(labels)" "agent:ready"
+  expect "a '$mode' hold check is logged as failing closed" "$(cat "$TMP/out.txt")" "failing closed"
+done
+
+hold_reset clear
+AGENT_POOL_NIGHTCREW_HOLD_SCRIPT="$TMP/common/no-such-hold-script.py" tick
+expect "a missing hold script claims nothing" "$(ncalls claude)" "0"
+
+hold_reset hang
+started=$(date +%s)
+AGENT_POOL_NIGHTCREW_TIMEOUT=1 tick
+expect "a hung hold check claims nothing" "$(ncalls claude)" "0"
+expect "a hung hold check is cut off by the outer bound" "$(( $(date +%s) - started < 20 ))" "1"
+
+hold_reset clear
+AGENT_POOL_NIGHTCREW_TIMEOUT=soon tick
+expect "an invalid AGENT_POOL_NIGHTCREW_TIMEOUT claims nothing" "$(ncalls claude)" "0"
+expect "an invalid timeout is logged" "$(cat "$TMP/out.txt")" "AGENT_POOL_NIGHTCREW_TIMEOUT"
+
+for value in yes on true TRUE ture; do
+  hold_reset busy
+  AGENT_POOL_NIGHTCREW_HOLD="$value" tick
+  expect "AGENT_POOL_NIGHTCREW_HOLD=$value turns the check on" "$(ncalls claude)" "0"
+done
+for value in 0 off false no; do
+  hold_reset busy
+  AGENT_POOL_NIGHTCREW_HOLD="$value" tick
+  expect "AGENT_POOL_NIGHTCREW_HOLD=$value leaves the check off" "$(ncalls claude)" "1"
+done
+
+unset AGENT_POOL_NIGHTCREW_HOLD
+echo "  (upgrade from the Gitea bot-assignee proxy)"
+hold_reset busy
+AGENT_POOL_NIGHTCREW_BOT=night-crew-bot tick
+expect "the old AGENT_POOL_NIGHTCREW_BOT alone still turns the check on" "$(hold_calls)" "1"
+expect "the old variable alone still blocks a held repo" "$(ncalls claude)" "0"
+expect "the old variable is reported as deprecated" "$(cat "$TMP/out.txt")" "AGENT_POOL_NIGHTCREW_BOT is deprecated"
+expect_not "the old bot login is not passed to the new check" "$(cat "$TMP/common/hold-calls" 2>/dev/null)" "night-crew-bot"
+hold_reset busy
+AGENT_POOL_NIGHTCREW_BOT=night-crew-bot AGENT_POOL_NIGHTCREW_HOLD=0 tick
+expect "AGENT_POOL_NIGHTCREW_HOLD=0 cannot switch off a still-set old variable" "$(ncalls claude)" "0"
+
+echo "  (the real hold script, installed layout, loopback fake NightCrew)"
+unset AGENT_POOL_NIGHTCREW_HOLD_SCRIPT
+INSTALLED="$TMP/installed/agent-pool"
+mkdir -p "$INSTALLED"
+cp -R "$ROOT/agent-pool/bin" "$ROOT/agent-pool/scripts" "$INSTALLED/"
+python3 "$ROOT/agent-pool/tests/fake-nightcrew.py" "$TMP/nc.json" "$TMP/nc.log" "$TMP/nc.port" &
+echo $! >> "$TMP/server-pids"
+for _ in $(seq 1 50); do [ -s "$TMP/nc.port" ] && break; sleep 0.1; done
+NC_SECRET="nc-provider-test-token-91c4"
+mkdir -p "$HOME/.config/pulse"
+installed_tick() {
+  AGENT_POOL_COMMON="$REAL_COMMON" AGENT_POOL_NIGHTCREW_HOLD=1 \
+    AGENT_POOL_NIGHTCREW_URL="http://127.0.0.1:$(cat "$TMP/nc.port")/api" \
+    bash "$INSTALLED/bin/prod-common.sh" > "$TMP/out.txt" 2>&1
+}
+nc_answer() { printf '{"status": %s, "body": %s}' "$1" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2")" > "$TMP/nc.json"; : > "$TMP/nc.log"; }
+
+hold_reset unused
+nc_answer 200 "{\"repo\": \"$R\", \"held\": false}"
+installed_tick
+expect "no Worker token file: nothing is claimed" "$(ncalls claude)" "0"
+expect "no Worker token file: no request is sent" "$(wc -l < "$TMP/nc.log" | tr -d ' ')" "0"
+printf '%s\n' "$NC_SECRET" > "$HOME/.config/pulse/night_crew_token"
+
+hold_reset unused
+nc_answer 200 "{\"repo\": \"$R\", \"held\": true}"
+installed_tick
+expect "installed: a held repo claims nothing" "$(ncalls claude)" "0"
+expect "installed: the endpoint is asked for this repo" "$(cat "$TMP/nc.log")" "\"path\": \"/api/repos/$R/issue-hold\""
+expect "installed: with the Worker token as a bearer" "$(cat "$TMP/nc.log")" "\"authorization\": \"Bearer $NC_SECRET\""
+nc_answer 200 "{\"repo\": \"$R\", \"held\": false}"
+installed_tick
+expect "installed: the released repo is claimed on the next tick" "$(ncalls claude)" "1"
+
+for answer in "401|{\"repo\": \"$R\", \"held\": false}" "403|{\"repo\": \"$R\", \"held\": false}" \
+              "500|{\"repo\": \"$R\", \"held\": false}" "200|{\"repo\": \"owner/other\", \"held\": false}" \
+              "200|{\"repo\": \"$R\", \"held\": \"false\"}" "200|{\"repo\": \"$R\"}" "200|not json"; do
+  hold_reset unused
+  nc_answer "${answer%%|*}" "${answer#*|}"
+  installed_tick
+  expect "installed: HTTP ${answer%%|*} ${answer#*|} claims nothing" "$(ncalls claude)" "0"
+done
+expect_not "installed: the Worker token never reaches the pool log" "$(cat "$TMP/state/pool.log" "$TMP/out.txt" 2>/dev/null)" "$NC_SECRET"
+
+unset AGENT_POOL_NIGHTCREW_HOLD AGENT_POOL_NIGHTCREW_BOT AGENT_POOL_NIGHTCREW_TIMEOUT
+
+echo
+echo "entrypoints: prod-<provider>.sh ticks what repos.toml enables"
+EP="$ROOT/agent-pool/bin"
+CONF="$TMP/repos.toml"
+export AGENT_POOL_CONFIG="$CONF"
+conf() { printf '%s\n' "$@" > "$CONF"; }
+# The harness exports AGENT_POOL_REPO/MAIN/WORKER_ID for direct ticks; an entrypoint takes them
+# from the config instead.
+entry() { # provider [VAR=value...]
+  local p="$1"; shift
+  env -u AGENT_POOL_REPO -u AGENT_POOL_MAIN -u AGENT_POOL_WORKER_ID "$@" bash "$EP/prod-$p.sh" > "$TMP/out.txt" 2>&1
+  TICK_RC=$?
+}
+repoconf() { python3 "$ROOT/agent-pool/scripts/repoconfig.py" "$@" 2>&1; }
+HOST="$(hostname -s 2>/dev/null || echo host)"
+
+conf '[repos."owner/repo"]' "main = \"$TMP/main\""
+reset '["agent:ready"]'
+behave claude ok
+entry claude
+expect "a repo with no abilities key is reviewed" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
+expect "the entrypoint ticks as <host>-claude" "$(cat "$TMP/out.txt")" "claimed by $HOST-claude for review"
+expect "and says which abilities it ticks with" "$(cat "$TMP/out.txt")" "owner/repo: tick as $HOST-claude with abilities review"
+expect "the entrypoint tick is a normal exit" "$TICK_RC" "0"
+entry claude
+expect "the default is review only: the queued resolve is skipped" "$(cat "$TMP/out.txt")" \
+  "resolve is not an enabled ability for owner/repo here (enabled: review)"
+expect "claude never ran for the resolve" "$(ncalls claude)" "1"
+expect "the resolve stays queued" "$(labels)" "agent:ready"
+
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" 'abilities = ["review", "resolve"]'
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-noted
+entry claude
+expect "with resolve enabled the entrypoint resolves" "$(labels)" "agent:done"
+
+conf '[pool]' 'providers = ["claude"]'
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-noted
+AGENT_POOL_REPO="$R" AGENT_POOL_MAIN="$TMP/main" bash "$EP/prod-claude.sh" > "$TMP/out.txt" 2>&1
+expect "a repo absent from repos.toml (named by AGENT_POOL_REPO) is review only" "$(cat "$TMP/out.txt")" \
+  "resolve is not an enabled ability for owner/repo here (enabled: review)"
+expect "so nothing ran on it" "$(ncalls claude)" "0"
+
+conf '[repos."owner/repo"]' "main = \"$TMP/main\""
+for p in claude cursor grok agy codex; do
+  cli="$p"; [ "$p" = cursor ] && cli=cursor-agent
+  reset '["agent:ready"]'
+  behave "$cli" final-only
+  entry "$p" PROVIDER_ORDER=claude,cursor,grok,agy,codex AGENT_POOL_MODEL_CODEX=test-codex
+  expect "prod-$p.sh runs $p" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
+  others=0
+  for o in claude cursor-agent grok agy codex; do [ "$o" = "$cli" ] || others=$((others + $(ncalls "$o"))); done
+  expect "prod-$p.sh runs no other provider, whatever PROVIDER_ORDER says" "$others" "0"
+  expect "prod-$p.sh ticks as <host>-$p" "$(cat "$TMP/out.txt")" "claimed by $HOST-$p"
+done
+ln -s "$EP/prod-claude.sh" "$BIN/prod-claude.sh"
+reset '["agent:ready"]'
+behave claude ok
+env -u AGENT_POOL_REPO -u AGENT_POOL_MAIN bash "$BIN/prod-claude.sh" > "$TMP/out.txt" 2>&1
+expect "an entrypoint installed as a symlink still finds prod-common.sh" "$(comments)" "pulse-review:v1"
+rm -f "$BIN/prod-claude.sh"
+
+echo "  (agy never resolves)"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" 'abilities = ["plan", "review", "prototype", "test-author", "resolve"]' \
+  '[repos."owner/repo".providers.agy]' 'abilities = ["review", "resolve"]'
+expect "repoconfig caps agy below resolve" "$(repoconf abilities --repo owner/repo --provider agy)" "review"
+expect_not "even when its own table lists resolve" "$(python3 "$ROOT/agent-pool/scripts/repoconfig.py" abilities --repo owner/repo --provider agy 2>/dev/null)" "resolve"
+expect "and says it ignored that" "$(repoconf abilities --repo owner/repo --provider agy)" "agy can never take resolve; ignored"
+expect "claude keeps resolve on the same repo" "$(repoconf abilities --repo owner/repo --provider claude)" "review,prototype,test-author,resolve"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" 'abilities = ["plan", "review", "prototype", "test-author", "resolve"]'
+expect "agy gets plan, review, prototype and test-author" "$(repoconf abilities --repo owner/repo --provider agy)" \
+  "plan,review,prototype,test-author"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave agy resolve-noted
+entry agy AGY_AUTO_APPROVE=1
+expect "prod-agy.sh takes no resolve job, even with AGY_AUTO_APPROVE=1" "$(ncalls agy)" "0"
+expect "it says resolve is not enabled for agy" "$(cat "$TMP/out.txt")" "resolve is not an enabled ability"
+expect "the resolve stays queued" "$(labels)" "agent:ready"
+expect_not "and agy is never given --dangerously-skip-permissions" "$(calls agy)" "dangerously-skip-permissions"
+AGENT_POOL_ABILITIES=review,resolve AGY_AUTO_APPROVE=1 PROVIDER_ORDER=agy tick
+expect "prod-common.sh refuses agy a resolve under AGENT_POOL_ABILITIES, whatever it lists" "$(cat "$TMP/out.txt")" \
+  "no eligible provider takes resolve jobs"
+expect "so agy still never ran" "$(ncalls agy)" "0"
+reset '["agent:ready"]'
+behave agy final-only
+entry agy
+expect "prod-agy.sh reviews" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
+expect "in plan mode" "$(calls agy | tr '\n' ' ')" "ARG --mode ARG plan"
+
+echo "  (roster, config errors, per-repo settings)"
+conf '[pool]' 'providers = ["claude"]' '[repos."owner/repo"]' "main = \"$TMP/main\""
+reset '["agent:ready"]'
+behave grok ok
+entry grok
+expect "a provider outside the roster ticks nothing" "$(ncalls grok)" "0"
+expect "and says so" "$(cat "$TMP/out.txt")" "grok is not in the roster"
+expect "which is a normal exit" "$TICK_RC" "0"
+for bad in 'abilities = ["reveiw"]' 'abilites = ["review"]' 'abilities = "review"'; do
+  conf '[repos."owner/repo"]' "main = \"$TMP/main\"" "$bad"
+  reset '["agent:ready"]'
+  behave claude ok
+  entry claude
+  expect "a config with '$bad' is a setup fault (exit 2)" "$TICK_RC" "2"
+  expect "and nothing ran ($bad)" "$(ncalls claude)" "0"
+done
+conf '[repos."owner/repo"' 'main = 1'
+entry claude
+expect "an unparseable config is a setup fault" "$TICK_RC" "2"
+expect "with the reason" "$(cat "$TMP/out.txt")" "the repo config is unusable"
+reset '["agent:ready"]'
+behave claude ok
+AGENT_POOL_ABILITIES=review,bogus tick
+expect "an unknown ability in AGENT_POOL_ABILITIES is refused" "$(cat "$TMP/out.txt")" "unknown ability 'bogus'"
+expect "and nothing ran" "$(ncalls claude)" "0"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" 'nightcrew_hold = true'
+hold_reset busy
+AGENT_POOL_NIGHTCREW_HOLD_SCRIPT="$TMP/common/nightcrew-issue-hold.py" entry claude
+expect "nightcrew_hold = true turns the hold check on for that repo" "$(hold_calls)" "1"
+expect "so a held repo claims nothing" "$(ncalls claude)" "0"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" '[repos."owner/other"]' "main = \"$TMP/no-such-clone\""
+reset '["agent:ready"]'
+behave claude ok
+entry claude
+expect "each configured repo gets its own tick" "$(cat "$TMP/out.txt")" "owner/other: tick as"
+expect "a broken repo does not stop the others" "$(comments)" "pulse-review:v1"
+expect "but the run reports its setup fault" "$TICK_RC" "2"
+bash "$EP/prod-claude.sh" extra > "$TMP/out.txt" 2>&1
+expect "an entrypoint takes no arguments" "$?" "2"
+
+echo "  (a stop that signals only the entrypoint, as systemd's KillMode=mixed does)"
+conf '[repos."owner/repo"]' "main = \"$TMP/main\"" '[repos."owner/other"]' "main = \"$TMP/main\""
+reset '["agent:ready"]'
+behave claude hang
+env -u AGENT_POOL_REPO -u AGENT_POOL_MAIN -u AGENT_POOL_WORKER_ID bash "$EP/prod-claude.sh" > "$TMP/out.txt" 2>&1 &
+ep=$!
+for _ in $(seq 150); do [ "$(ncalls claude)" -ge 1 ] && break; sleep 0.1; done
+sleep 1
+hung="$(tail -n 1 "$STUB_PIDS")"
+t0=$(date +%s); kill -TERM "$ep"; wait "$ep"; rc=$?; took=$(( $(date +%s) - t0 ))
+expect "TERM to the entrypoint alone stops the run (exit 143)" "$rc" "143"
+expect "without waiting out the worker" "$([ "$took" -lt 30 ] && echo fast || echo "slow ${took}s")" "fast"
+expect "the TERM reached the tick, whose exit trap requeued the job" "$(labels)" "agent:ready"
+expect "and released its claim" "$(record)" "{}"
+expect "the tick says why" "$(cat "$TMP/out.txt")" "exited unexpectedly (exit 143)"
+expect "the hung worker was stopped with its group" "$(kill -0 "$hung" 2>/dev/null && echo alive || echo dead)" "dead"
+expect "and no further repo was ticked" "$(cat "$TMP/out.txt")" "stopped; ticking no further repos"
+expect_not "owner/other never started" "$(cat "$TMP/out.txt")" "owner/other: tick as"
+AGENT_POOL_CONFIG="$ROOT/agent-pool/config/repos.example.toml" python3 "$ROOT/agent-pool/scripts/repoconfig.py" check >/dev/null 2>&1
+expect "the shipped example config validates" "$?" "0"
+expect "a repo the config does not name is review only" "$(repoconf abilities --repo some/where --provider claude)" "review"
+unset AGENT_POOL_CONFIG
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

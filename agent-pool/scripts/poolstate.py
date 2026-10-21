@@ -14,7 +14,9 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 
 def now() -> float:
@@ -29,7 +31,7 @@ def state_dir() -> Path:
     return path
 
 
-def save(path: Path, doc) -> None:
+def save(path: Path, doc: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
     try:
@@ -49,7 +51,7 @@ def save(path: Path, doc) -> None:
             os.unlink(temporary)
 
 
-def load(path: Path):
+def load(path: Path) -> Any:
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
@@ -61,12 +63,32 @@ def load(path: Path):
 
 
 @contextlib.contextmanager
-def locked(path: Path):
+def locked(path: Path) -> Iterator[None]:
     """Hold an exclusive flock on a stable sibling inode while the JSON beside it is replaced."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(str(path) + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
+
+
+def lock_abandoned(path: Path) -> bool:
+    """True if the lock file exists and nobody holds it. A prod tick holds its
+    pool-<worker>-<repo>.lock for its whole run, so an abandoned one means the tick that wrote a
+    claim has exited. A missing file is no evidence either way (False). The probe is a
+    non-blocking shared lock, released at once; it never creates the file."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(descriptor)
 
 
 def slug(text: str) -> str:

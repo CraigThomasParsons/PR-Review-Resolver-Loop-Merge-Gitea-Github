@@ -4,6 +4,8 @@
 Usage:
   report.py review  --marker-module F --file R --sha S
   report.py resolve --marker-module F --file R --review-head H --findings N
+  report.py scan    --file F      exit 1 ("leak") if F holds a credential; the controller runs it
+                                  over the commit messages and added lines it is about to push
 
 Prints "ok<TAB><head><TAB><fixed>" when the report carries a marker the loop can verify
 (review: a pulse-review marker naming S; resolve: a pulse-resolve marker whose reviewed= is H,
@@ -17,6 +19,8 @@ import argparse
 import importlib.util
 import os
 import re
+import sys
+import types
 from pathlib import Path
 
 # Bare 40-hex is deliberately absent: commit SHAs have the same shape. The live token is matched
@@ -30,11 +34,14 @@ TOKEN_SHAPES = re.compile(
     r"|\bAKIA[0-9A-Z]{16}\b"
     r"|\bglpat-[A-Za-z0-9_-]{20,}"
     r"|\bxox[abprs]-[A-Za-z0-9-]{10,}"
-    r"|\b(?:token|bearer)\s+[0-9a-f]{40}\b",
+    r"|\b(?:token|bearer)\s+[0-9a-f]{40}\b"
+    # YAML, key=value and JSON credential lines: `token: 3f9a...`, GITEA_TOKEN="...", "password": "..."
+    r"|\b[\w.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|access[_-]?key|private[_-]?key)[\"']?"
+    r"\s*[:=]\s*[\"']?(?=[A-Za-z_\-+/]*\d)[A-Za-z0-9+/_\-]{16,}",
     re.IGNORECASE)
 
 
-def live_tokens():
+def live_tokens() -> list[str]:
     found = []
     env = os.environ.get("GITEA_TOKEN", "").strip()
     if env:
@@ -48,31 +55,39 @@ def live_tokens():
     return [t for t in found if len(t) >= 8]
 
 
-def leaks_secret(body):
+def leaks_secret(body: str) -> bool:
     return bool(TOKEN_SHAPES.search(body)) or any(t in body for t in live_tokens())
 
 
-def load_marker(path):
+def load_marker(path: str) -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("marker", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def main():
+def main() -> int | None:
     p = argparse.ArgumentParser()
-    p.add_argument("job", choices=["review", "resolve"])
-    p.add_argument("--marker-module", required=True)
+    p.add_argument("job", choices=["review", "resolve", "scan"])
+    p.add_argument("--marker-module")
     p.add_argument("--file", required=True)
     p.add_argument("--sha", default="")
     p.add_argument("--review-head", default="")
     p.add_argument("--findings", type=int)
     a = p.parse_args()
-    marker = load_marker(a.marker_module)
     try:
         body = open(a.file, errors="replace").read()
     except OSError:
         body = ""
+    if a.job == "scan":
+        if leaks_secret(body):
+            print("leak\tcontains a credential or token-shaped string")
+            return 1
+        print("clean")
+        return 0
+    if not a.marker_module:
+        p.error("--marker-module is required for review and resolve")
+    marker = load_marker(a.marker_module)
     if not body.strip():
         print("nomarker\tthe worker left no report")
         return
@@ -102,4 +117,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

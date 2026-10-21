@@ -1,0 +1,25 @@
+[Unit]
+# One instance per provider: agent-pool-prod@claude, @cursor, @grok, @agy, @codex. Each tick
+# claims and works what ~/.config/agent-pool/repos.toml enables for that provider; see
+# agent-pool/bin/prod-common.sh. Installed by agent-pool/bin/install-systemd-units.sh, which
+# fills in @POOL_ROOT@.
+Description=Agent pool: %i prod tick
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+# Explicit PATH, as in pr-trigger-drain.service: systemd gives a thin one and the workers need
+# the provider CLIs, tea, git and node.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin:%h/.npm-global/bin
+# Optional overrides (AGENT_POOL_STATE, WORKER_TIMEOUT, GITEA_* ...), one VAR=value per line.
+EnvironmentFile=-%h/.config/agent-pool/env
+ExecStart=@POOL_ROOT@/agent-pool/bin/prod-%i.sh
+# Backstop only: every worker is already bounded by WORKER_TIMEOUT. A tick killed here leaves
+# its claim behind with its tick lock free, which agent-pool-doctor requeues as a dead worker.
+TimeoutStartSec=4h
+# On a stop or timeout, TERM only the entrypoint: it forwards TERM to the tick, whose exit trap
+# stops the worker group and releases the claim (claim-record.py, the adapter) undisturbed.
+# Whatever is still running after TimeoutStopSec is killed.
+KillMode=mixed
+TimeoutStopSec=2min

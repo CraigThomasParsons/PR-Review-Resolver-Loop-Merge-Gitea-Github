@@ -41,7 +41,12 @@
 # Permissions come from scripts/policy.py, per worktree and per invocation only: claude
 # --allowedTools/--disallowedTools, cursor .cursor/cli.json in the worktree (no --force), grok
 # --allow/--deny. agy has no rule list: it reviews in --mode plan and is only eligible for
-# resolve with AGY_AUTO_APPROVE=1. Nothing global is widened.
+# resolve with AGY_AUTO_APPROVE=1. codex also has no rule list, by owner decision (PR #2
+# review, Spec 1): --sandbox workspace-write has no network and confines writes to the
+# worktree, so the pushurl override and controller-only publication contain it instead. The
+# sandbox does not stop reads; the report and pre-push secret scans contain what it reads. The
+# exemption holds only for CODEX_SANDBOX_MODE=workspace-write or read-only.
+# Nothing global is widened.
 #
 # Environment knobs (all optional unless marked):
 #   AGENT_POOL_MAIN (required, or PR_LOOP_MAIN)  the repo's main clone
@@ -60,6 +65,26 @@
 #   AGENT_POOL_TIMEOUT_COOLDOWN=900    a timed-out provider pauses this long (no strike); the job
 #                                      falls through to the next provider
 #   AGENT_POOL_HOLD_LABELS="status: in-progress"   extra labels that read as a hold
+#   AGENT_POOL_NIGHTCREW_HOLD=1    for a repo shared with TheNightCrew: before each claim, ask its
+#                                  GET <api>/repos/<repo>/issue-hold (scripts/nightcrew-issue-hold.py)
+#                                  and claim nothing more this tick unless the answer is exactly
+#                                  clear. Any failure (no token, HTTP error, timeout, bad answer,
+#                                  a crashed or hung check) also claims nothing. Unset, 0, off,
+#                                  false or no (default): no check -- most repos aren't shared.
+#                                  Any other value turns it on.
+#   AGENT_POOL_NIGHTCREW_URL       the NightCrew API base including /api (else NIGHT_CREW_URL,
+#                                  else http://localhost:8771/api)
+#   AGENT_POOL_NIGHTCREW_TOKEN_FILE  file holding a NightCrew Worker token whose served_repos
+#                                  include this repo (default ~/.config/pulse/night_crew_token)
+#   AGENT_POOL_NIGHTCREW_TIMEOUT=10  seconds per request; the whole check is cut off at 2x+3
+#                                  The answer is a snapshot, not a cross-system mutex: an issue
+#                                  job TheNightCrew claims right after a clear answer still
+#                                  overlaps, so TheNightCrew's own ClaimNextJob::blockReason and
+#                                  this pool's claim records both stay in force.
+#   AGENT_POOL_NIGHTCREW_BOT       deprecated (the old Gitea bot-assignee proxy, now removed).
+#                                  Still set, it turns the endpoint check on, even over
+#                                  AGENT_POOL_NIGHTCREW_HOLD=0, and logs a warning each tick;
+#                                  replace it with AGENT_POOL_NIGHTCREW_HOLD=1 plus a Worker token.
 #   AGENT_POOL_PROTECTED_BRANCHES=develop,main,master,release   never pushed to (nor release/*)
 #   AGENT_POOL_BOT                 the pool's Gitea login; any other assignee is a human hold
 #   AGENT_POOL_MODEL_<PROVIDER>    model per provider (claude=opus cursor=auto grok=grok-build;
@@ -69,10 +94,69 @@
 #   CLAUDE_PERMISSION_MODE=default  GROK_PERMISSION_MODE=dontAsk  CODEX_SANDBOX_MODE=workspace-write
 #   AGY_AUTO_APPROVE=1             let agy take resolve jobs (--dangerously-skip-permissions)
 #   AGY_PRINT_TIMEOUT=0            agy's own print timeout; 0 leaves WORKER_TIMEOUT as the only limit
+#   AGENT_POOL_ABILITIES           comma list of the abilities this repo grants (plan, review,
+#                                  prototype, test-author, resolve); a job kind runs only if its
+#                                  ability is listed, and agy never resolves, AGY_AUTO_APPROVE or
+#                                  not. Set by the entrypoints; unset keeps review and resolve.
+#
+# Entrypoint mode: bin/prod-<provider>.sh sets AGENT_POOL_PROVIDER and sources this file. It then
+# runs one tick per repo that repos.toml (scripts/repoconfig.py, AGENT_POOL_CONFIG) enables for
+# that provider, each with PROVIDER_ORDER=<provider>, AGENT_POOL_ABILITIES from the config,
+# AGY_AUTO_APPROVE unset, AGENT_POOL_WORKER_ID defaulting to <host>-<provider>, and
+# AGENT_POOL_NIGHTCREW_HOLD=1 where the repo sets nightcrew_hold. With AGENT_POOL_REPO set, only
+# that repo is ticked.
 #
 # Exit codes: 0 for a normal tick (including nothing to do); 2 for a setup fault.
 
 set -uo pipefail
+
+# forward_signals cmd...: run cmd as a child and pass TERM (and INT, as TERM: a non-interactive
+# shell's background child ignores INT) on to it. systemd's KillMode=mixed signals only the main
+# process, which is a wrapper here; the tick below it must still get TERM and run its exit trap.
+fwd_stopped=0
+forward_signals() {
+  local fwd_rc
+  "$@" &
+  fwd_child=$!
+  trap 'fwd_stopped=1; kill -TERM "$fwd_child" 2>/dev/null' TERM INT
+  while :; do
+    wait "$fwd_child"; fwd_rc=$?
+    kill -0 "$fwd_child" 2>/dev/null || break
+  done
+  trap - TERM INT
+  return "$fwd_rc"
+}
+
+if [ -n "${AGENT_POOL_PROVIDER:-}" ]; then
+  # Sourced by an entrypoint, possibly under set -e: every command below tolerates failure.
+  entry_provider="$AGENT_POOL_PROVIDER"
+  entry_self="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+  entry_log() { printf '%s [prod-%s] %s\n' "$(date -Is)" "$entry_provider" "$*" >&2; }
+  case "$entry_provider" in claude|cursor|grok|agy|codex) ;; *) entry_log "unknown provider"; exit 2 ;; esac
+  [ "$#" -eq 0 ] || { echo "usage: prod-$entry_provider.sh (no arguments; repos come from repos.toml)" >&2; exit 2; }
+  if ! entry_ticks="$(python3 "$(dirname -- "$entry_self")/../scripts/repoconfig.py" ticks --provider "$entry_provider")"; then
+    entry_log "the repo config is unusable; ticking nothing"
+    exit 2
+  fi
+  entry_worker="${AGENT_POOL_WORKER_ID:-$(hostname -s 2>/dev/null || echo host)-$entry_provider}"
+  entry_rc=0
+  while IFS=$'\t' read -r entry_repo entry_main entry_abilities entry_hold; do
+    [ -n "$entry_repo" ] || continue
+    entry_env=(-u AGENT_POOL_PROVIDER -u AGY_AUTO_APPROVE AGENT_POOL_REPO="$entry_repo" AGENT_POOL_MAIN="$entry_main"
+      AGENT_POOL_ABILITIES="$entry_abilities" PROVIDER_ORDER="$entry_provider" AGENT_POOL_WORKER_ID="$entry_worker")
+    [ "$entry_hold" = 1 ] && entry_env+=(AGENT_POOL_NIGHTCREW_HOLD=1)
+    entry_log "$entry_repo: tick as $entry_worker with abilities $entry_abilities"
+    rc=0
+    forward_signals env "${entry_env[@]}" bash "$entry_self" </dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      entry_log "$entry_repo: tick exited $rc"
+      [ "$entry_rc" -eq 2 ] || entry_rc="$rc"
+    fi
+    if [ "$fwd_stopped" = 1 ]; then entry_log "stopped; ticking no further repos"; exit 143; fi
+  done <<<"$entry_ticks"
+  exit "$entry_rc"
+fi
 
 # Run from a private copy, for the reason pr-loop.sh gives: bash reads scripts by offset, and an
 # edit during a long tick would otherwise land the running tick in the middle of a function.
@@ -82,8 +166,8 @@ if [ -z "${AGENT_POOL_PINNED:-}" ]; then
   pinned="$(mktemp -t prod-common.XXXXXX.sh)"
   cat "${BASH_SOURCE[0]}" > "$pinned"
   export AGENT_POOL_PINNED="$pinned"
-  bash "$pinned" "$@"
-  rc=$?
+  rc=0
+  forward_signals bash "$pinned" "$@" || rc=$?
   rm -f "$pinned"
   exit $rc
 fi
@@ -120,7 +204,19 @@ READY="${AGENT_POOL_LABEL_READY:-agent:ready}"
 CLAIMED="${AGENT_POOL_LABEL_CLAIMED:-agent:claimed}"
 DONE="${AGENT_POOL_LABEL_DONE:-agent:done}"
 HUMAN="${AGENT_POOL_LABEL_NEEDS_HUMAN:-agent:needs-human}"
+# Opt-in per repo, since most repos this pool runs against aren't tracked by TheNightCrew. Only
+# the explicit off words disable it, so a typo cannot silently drop the protection.
+NIGHTCREW_LEGACY_BOT="${AGENT_POOL_NIGHTCREW_BOT:-}"
+case "$(printf '%s' "${AGENT_POOL_NIGHTCREW_HOLD:-}" | tr '[:upper:]' '[:lower:]')" in
+  ""|0|off|false|no) NIGHTCREW_CHECK=0 ;;
+  *) NIGHTCREW_CHECK=1 ;;
+esac
+[ -n "$NIGHTCREW_LEGACY_BOT" ] && NIGHTCREW_CHECK=1
+NIGHTCREW_TIMEOUT="${AGENT_POOL_NIGHTCREW_TIMEOUT:-10}"
+NIGHTCREW_HOLD_SCRIPT="${AGENT_POOL_NIGHTCREW_HOLD_SCRIPT:-$SCRIPTS/nightcrew-issue-hold.py}"
 PROTECTED="${AGENT_POOL_PROTECTED_BRANCHES:-develop,main,master,release}"
+ABILITIES_SET=0; ABILITIES=""
+if [ -n "${AGENT_POOL_ABILITIES+x}" ]; then ABILITIES_SET=1; ABILITIES="$AGENT_POOL_ABILITIES"; fi
 NOPUSH_URL="/nonexistent/agent-pool-workers-never-push"
 CONTEXT_FILE=".agent-pool-context.md"
 
@@ -193,13 +289,19 @@ drop_cooling_providers() {
   PROVIDERS=("${kept[@]}")
 }
 
+ability_enabled() { # job
+  [ "$ABILITIES_SET" = 0 ] || [[ ",$ABILITIES," == *",$1,"* ]]
+}
+
 # JOB_PROVIDERS := PROVIDERS that may take a job of this kind. agy has no deny list, so it only
-# resolves when the operator has opted in to running it unattended.
+# resolves when an operator running this tick directly opted in to it unattended; under an
+# entrypoint (AGENT_POOL_ABILITIES set) it never resolves.
 job_providers() { # job
   local p
   JOB_PROVIDERS=()
+  ability_enabled "$1" || return 0
   for p in "${PROVIDERS[@]}"; do
-    [ "$1" = resolve ] && [ "$p" = agy ] && [ "${AGY_AUTO_APPROVE:-0}" != 1 ] && continue
+    [ "$1" = resolve ] && [ "$p" = agy ] && { [ "${AGY_AUTO_APPROVE:-0}" != 1 ] || [ "$ABILITIES_SET" = 1 ]; } && continue
     JOB_PROVIDERS+=("$p")
   done
 }
@@ -312,30 +414,12 @@ verify() { # job pr base-sha headref [pushed-sha] -> ok | clean | fail-nomarker:
   git -C "$MAIN" fetch origin --quiet "refs/heads/$headref" 2>/dev/null
   local rm; rm="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" resolve "$pr" 2>/dev/null || true)"
   if [ -z "$rm" ]; then echo "fail-nomarker:the resolver left no disposition marker, so what it did to each finding is unknown"; return; fi
-  local r_head r_reviewed r_fixed r_deferred r_noted
-  read -r r_head r_reviewed r_fixed r_deferred r_noted <<<"$rm"
-  r_noted="${r_noted:-0}"
   local review; review="$(PR_LOOP_REPO="$REPO" python3 "$MARKER" latest "$pr" 2>/dev/null || true)"
-  local review_head="${review%% *}" review_count="${review##* }"
-  if [ "$r_reviewed" != "$review_head" ]; then
-    echo "fail:the resolver answered a review of $r_reviewed but the findings on this PR are from $review_head"; return
-  fi
-  if [ "$((r_fixed + r_noted + r_deferred))" -ne "${review_count:-0}" ]; then
-    echo "fail:the review raised $review_count finding(s) but the resolver accounted for $((r_fixed + r_noted + r_deferred))"; return
-  fi
-  if [ "$r_fixed" -gt 0 ]; then
-    if [ "$newsha" = "$sha" ]; then echo "fail:the resolver claims $r_fixed fix(es) but the PR head never moved"; return; fi
-    if [ "$r_head" != "$newsha" ]; then echo "fail:the resolver named head $r_head but the PR is at $newsha"; return; fi
-    if ! git -C "$MAIN" merge-base --is-ancestor "$sha" "$newsha"; then
-      echo "fail:the PR head moved to $newsha but not as a fast-forward of $sha"; return
-    fi
-  elif [ "$newsha" != "$sha" ]; then
-    echo "fail:the resolver claims no fixes yet the PR head moved to $newsha"; return
-  fi
-  if [ "$r_deferred" -gt 0 ]; then
-    echo "fail:$r_deferred of $review_count finding(s) are blocking and need a human decision; $r_fixed fixed, $r_noted noted"; return
-  fi
-  echo ok
+  local ff=yes
+  if [ "$newsha" != "$sha" ] && ! git -C "$MAIN" merge-base --is-ancestor "$sha" "$newsha" 2>/dev/null; then ff=no; fi
+  # The same check the doctor applies before it calls a PR settled (scripts/marker.py).
+  python3 "$SCRIPTS/marker.py" check-resolve --review "$review" --resolve "$rm" --base "$sha" --head "$newsha" \
+    --fast-forward "$ff" 2>/dev/null || echo "fail:the resolver's disposition marker could not be checked"
 }
 
 # derive_job pr sha headref -> DJ (review|resolve|settled), DBASE (the head verify measures from),
@@ -393,6 +477,8 @@ release_to() { # label
   return "$rc"
 }
 published_mark() { printf '%s/%s__%s.%s' "$PUBLISHED" "$(slug "$REPO")" "$JOB_PR" "$1"; }
+# The job's outcome is already on Gitea; a failed release must not cost anyone a cooldown strike.
+mark_published() { : > "$(published_mark "$ATTEMPT")"; }
 
 # ---------------------------------------------------------------- worker process group and watcher
 spawn_worker() { # out err
@@ -498,7 +584,7 @@ trap 'exit 143' TERM
 # publish provider sha headref report result -> PUB: published | nomarker:<why> | requeue:<why> |
 # fail:<why> | lost. The only path by which a worker's work reaches Gitea.
 publish() {
-  local p="$1" sha="$2" headref="$3" report="$4" result="$5" chk alt head fixed newhead remote rc tool
+  local p="$1" sha="$2" headref="$3" report="$4" result="$5" chk alt head fixed newhead remote rc tool scan
   local args=(--marker-module "$MARKER")
   PUSHED=""
   if [ "$JOB_KIND" = review ]; then args+=(--sha "$sha")
@@ -524,8 +610,18 @@ publish() {
       headref_safe "$headref" || { PUB="fail:refusing to push to '$headref'"; return; }
       git -C "$MAIN" merge-base --is-ancestor "$sha" "$newhead" 2>/dev/null \
         || { PUB="fail:the worker's commits at $newhead are not a fast-forward of $sha"; return; }
-      tool="$(git -C "$MAIN" diff --name-only "$sha" "$newhead" 2>/dev/null | grep -E '(^|/)\.(cursor|grok|claude)/' | head -3 | tr '\n' ' ')"
+      tool="$(git -C "$MAIN" diff --name-only "$sha" "$newhead" 2>/dev/null \
+        | grep -E "(^|/)\.(cursor|grok|claude)/|(^|/)${CONTEXT_FILE//./\\.}\$" | head -3 | tr '\n' ' ')"
       [ -z "$tool" ] || { PUB="fail:the worker's commits touch agent tool configuration (${tool% }); refusing to push"; return; }
+      # Commit messages and added lines go public with the push; nothing secret may ride along.
+      scan="$RUNS/push-scan-$JOB_PR-${ATTEMPT:0:8}.txt"
+      { git -C "$MAIN" log --format=%B "$sha..$newhead"; git -C "$MAIN" diff "$sha" "$newhead" | grep '^+' | grep -v '^+++ '; } \
+        > "$scan" 2>/dev/null
+      if ! python3 "$SCRIPTS/report.py" scan --file "$scan" >/dev/null; then
+        rm -f "$scan"
+        PUB="fail:the worker's commits contain a credential or token-shaped string; refusing to push"; return
+      fi
+      rm -f "$scan"
       remote="$(git -C "$MAIN" ls-remote origin "refs/heads/$headref" 2>/dev/null | cut -f1)"
       [ "$remote" = "$sha" ] || { PUB="requeue:origin/$headref is at ${remote:-nothing}, not $sha; the branch moved during the run"; return; }
       # No hooks and no force: the server refuses anything that is not a fast-forward.
@@ -539,7 +635,7 @@ publish() {
   comment_file "$report"; rc=$?
   case "$rc" in 0) PUB=published ;; 4) PUB=lost ;; *) PUB="requeue:posting the $JOB_KIND report failed" ;; esac
   # If the release after this fails, the claim goes stale although the provider did its job.
-  [ "$PUB" = published ] && : > "$(published_mark "$ATTEMPT")"
+  [ "$PUB" = published ] && mark_published
 }
 
 # ---------------------------------------------------------------- one provider attempt
@@ -653,9 +749,10 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
   esac
   jlog "claimed by $WORKER_ID for $job with $1"
   # derive_job already verified it; the claim re-checked the head, so it is not verified again.
-  if [ "$job" = settled ]; then finish_job done "$SETTLED_WHY"; return 0; fi
+  if [ "$job" = settled ]; then mark_published; finish_job done "$SETTLED_WHY"; return 0; fi
 
   before="$(verify "$job" "$pr" "$vbase" "$headref")"
+  case "$before" in clean|ok) mark_published ;; esac
   case "$before" in
     clean) finish_job done "the review of $sha is already posted and clean"; return 0 ;;
     ok) if [ "$job" = resolve ]; then finish_job done "the resolve of $vbase is already verified at $sha"
@@ -706,6 +803,14 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
 [ -n "$MAIN" ] && [ -e "$MAIN/.git" ] || die "no checkout for $REPO: set AGENT_POOL_MAIN to its clone (got '$MAIN')"
 [ "$WORKER_TIMEOUT" -lt "$DEADLINE_SECS" ] \
   || die "WORKER_TIMEOUT ($WORKER_TIMEOUT) must be shorter than AGENT_POOL_DEADLINE_SECS ($DEADLINE_SECS)"
+if [ "$ABILITIES_SET" = 1 ]; then
+  IFS=, read -ra ability_list <<<"$ABILITIES"
+  for ability in "${ability_list[@]}"; do
+    case "$ability" in plan|review|prototype|test-author|resolve) ;;
+      *) die "unknown ability '$ability' in AGENT_POOL_ABILITIES (plan, review, prototype, test-author, resolve)" ;;
+    esac
+  done
+fi
 WT_ROOT="${AGENT_POOL_WORKTREES:-$(dirname "$MAIN")/.pool-worktrees}"
 mkdir -p "$WT_ROOT"
 
@@ -741,6 +846,42 @@ for pr in json.load(sys.stdin):
 fi
 mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 [ "${#CANDIDATES[@]}" -eq 0 ] && { log "no open PR in $REPO carries $READY or $CLAIMED"; exit 0; }
+
+# Every candidate below is in the same repo, so a cheap first pass here skips the whole tick
+# early when already busy. It is NOT the real gate: MAX_JOBS can run more than one job per
+# tick, each up to WORKER_TIMEOUT long, and NightCrew can start a job in that window, so a
+# result cached from before the first claim would otherwise go stale before the second. Nothing
+# else in agent-pool-core shares state with TheNightCrew's issue/maintenance job board; this is
+# the one place the two systems' claims on the same repo could otherwise collide.
+#
+# nightcrew_busy asks fresh every time it is called -- here once up front, and again,
+# immediately before each real claim below (Codex adversarial review, PR #13).
+nightcrew_busy() {
+  [ "$NIGHTCREW_CHECK" = 1 ] || return 1
+  # Only exit 0 with exactly "clear" lets claiming go on; a crash, a hang, a nonzero exit or
+  # any other output reads as held.
+  local hold_out="" hold_rc=0
+  if [[ "$NIGHTCREW_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]]; then
+    hold_out="$(timeout -k 5 "$(( NIGHTCREW_TIMEOUT * 2 + 3 ))" python3 "$NIGHTCREW_HOLD_SCRIPT" --repo "$REPO" \
+      --timeout "$NIGHTCREW_TIMEOUT" 2>>"$LOG")" || hold_rc=$?
+  else
+    hold_rc=2
+    log "AGENT_POOL_NIGHTCREW_TIMEOUT must be whole seconds from 1 to 999"
+  fi
+  if [ "$hold_rc" -ne 0 ] || [ "$hold_out" != "clear" ]; then
+    if [ "$hold_rc" -eq 0 ] && [ "$hold_out" = "busy" ]; then
+      log "$REPO: TheNightCrew reports active issue/maintenance work here"
+    else
+      log "$REPO: TheNightCrew issue-hold check failed (exit $hold_rc); failing closed"
+    fi
+    return 0
+  fi
+  return 1
+}
+[ "$NIGHTCREW_CHECK" = 1 ] && [ -n "$NIGHTCREW_LEGACY_BOT" ] && log "AGENT_POOL_NIGHTCREW_BOT is deprecated and no longer read as a bot login;" \
+  "the NightCrew issue-hold endpoint check is on because it is set. Replace it with AGENT_POOL_NIGHTCREW_HOLD=1."
+NIGHTCREW_HOLD=0
+nightcrew_busy && { NIGHTCREW_HOLD=1; log "$REPO: no PR claimed this tick"; }
 
 # reconcile_pr pr -> 0 to go on considering the PR (labels may have become ready), 1 to skip it.
 reconcile_pr() {
@@ -784,6 +925,7 @@ for row in "${CANDIDATES[@]}"; do
     [ "$RECONCILED_READY" = 1 ] && labels="${labels//\"$CLAIMED\"/\"$READY\"}"
   fi
   [[ "$labels" == *"\"$READY\""* ]] || continue
+  if [ "$NIGHTCREW_HOLD" = 1 ]; then continue; fi
   hold="$(JOB_PR="$pr" claim hold --labels "$labels" --assignees "$assignees" --hold-labels "$EXTRA_HOLD" --bot "$BOT" 2>>"$LOG")"
   state="${hold%%$'\t'*}"; why="${hold#*$'\t'}"
   remove="$READY"
@@ -801,15 +943,20 @@ for row in "${CANDIDATES[@]}"; do
 done
 [ "${#QUEUE[@]}" -eq 0 ] && { log "nothing to do after skips"; [ "$SETUP_FAULTS" -gt 0 ] && exit 2; exit 0; }
 
-jobs_run=0
+jobs_run=0; stopped=""
 for row in "${QUEUE[@]}"; do
-  [ "$jobs_run" -ge "$MAX_JOBS" ] && break
   IFS=$'\t' read -r pr headref sha base job vbase rhead nfind remove SETTLED_WHY <<<"$row"
   [ "$rhead" = - ] && rhead=""; [ "$nfind" = - ] && nfind=""
   if [ "$job" = settled ]; then
-    # Settling needs no provider, so it never waits on one.
+    # Settling needs no provider and is no provider job, so neither limit below holds it back.
     if [ "$DRY_RUN" = 1 ]; then log "DRY: would settle $REPO#$pr ($SETTLED_WHY)"
     else run_job "$pr" "$headref" "$sha" "$base" "$job" "$vbase" "$rhead" "$nfind" "$remove" controller; fi
+    continue
+  fi
+  [ -n "$stopped" ] && continue
+  [ "$jobs_run" -ge "$MAX_JOBS" ] && continue
+  if ! ability_enabled "$job"; then
+    log "$REPO#$pr: $job is not an enabled ability for $REPO here (enabled: ${ABILITIES:-none}); skipping"
     continue
   fi
   job_providers "$job"
@@ -817,9 +964,16 @@ for row in "${QUEUE[@]}"; do
   if [ "$DRY_RUN" = 1 ]; then
     log "DRY: would claim $REPO#$pr at $sha for $job with providers ${JOB_PROVIDERS[*]}"
   else
+    if nightcrew_busy; then
+      # One busy answer settles it for the rest of the tick: no more provider jobs, so no more
+      # checks (each can cost up to 2 * AGENT_POOL_NIGHTCREW_TIMEOUT + 3 s failing closed).
+      log "$REPO#$pr: TheNightCrew holds this repo (rechecked before claim); skipping, only settling from here"
+      stopped=1
+      continue
+    fi
     run_job "$pr" "$headref" "$sha" "$base" "$job" "$vbase" "$rhead" "$nfind" "$remove" "${JOB_PROVIDERS[@]}"
     drop_cooling_providers
-    [ "${#PROVIDERS[@]}" -eq 0 ] && { log "every provider is cooling down; stopping the tick"; break; }
+    [ "${#PROVIDERS[@]}" -eq 0 ] && { log "every provider is cooling down; only settling from here"; stopped=1; }
   fi
   jobs_run=$((jobs_run + 1))
 done
