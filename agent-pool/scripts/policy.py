@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """policy.py: the one worker permission policy, translated per provider CLI.
 
-Workers never publish. They read, edit and commit locally (resolve), or only read (review),
-and write a report file. The controller does every push and comment through the claim guard,
-so the policy denies all of `git push` and every gitea-pr.py write to every worker.
+Workers never publish. They read, edit and commit locally (resolve), read and edit without
+touching git history (edit), or only read (review), and write a report file. The controller does
+every push and comment through the claim guard, so the policy denies all of `git push` and every
+gitea-pr.py write to every worker. An edit worker's commits are the controller's too: it gets
+resolve's writes and gate commands, and `git add`, `git commit` and every other history-writing
+git subcommand are denied by name.
 
 The policy is deny-by-default at the ARGUMENT level (`check`). An unquoted `{` or `}` anywhere
 denies the whole command before anything else is read: bash brace expansion would otherwise
@@ -18,8 +21,8 @@ denied segment. Every remaining command must be one of:
   python3 <adapter> head|comments|threads --repo R --pr N  the adapter's reads, absolute path
   git add <named paths> / git commit -m                    resolve only; no -A/-u/-f/., no
         tool configuration paths, no --amend/-a, no -F (a file would become the message)
-  the named gate commands                                  resolve only (their arguments are
-        not vetted; the controller will run gates itself from a pinned list, see D1)
+  the named gate commands                                  resolve and edit (their arguments
+        are not vetted; the controller will run gates itself from a pinned list, see D1)
 
 Paths are normalised (~ expanded, //, /./ and .. collapsed, symlinks resolved) before they are
 checked. Every path a reader or git is given must stay inside the worktree or the runs folder;
@@ -44,11 +47,11 @@ The emitted rules follow the same policy as far as each CLI's syntax allows:
           Cursor's own CLI does not. Cursor is not contained by cli.json alone and must not run
           unattended on an untrusted repo. No `git commit --trailer` prefix is allowed (#29): it
           would widen that gap to every commit Cursor rewrites with its attribution trailer.
-Writes: review may write only its report; resolve may write the worktree and its report.
+Writes: review may write only its report; resolve and edit may write the worktree and its report.
 `.git` (the worktree's pointer file and any .git directory) is never writable.
 
 Usage:
-  policy.py rules  --provider P --job review|resolve --adapter F --worktree D --report R
+  policy.py rules  --provider P --job review|resolve|edit --adapter F --worktree D --report R
   policy.py cursor-json  (same options)
   policy.py hook-settings (same options)       Claude --settings JSON with the PreToolUse hook
   policy.py hook   (same options)              read a Claude hook event on stdin; exit 2 = deny
@@ -140,6 +143,7 @@ GATES = [["npm", "run"], ["npm", "test"], ["dotnet", "build"], ["dotnet", "test"
          ["composer", "test"], ["composer", "lint"], ["php", "artisan", "test"],
          ["vendor/bin/pint"], ["vendor/bin/phpunit"], ["./vendor/bin/pint"], ["./vendor/bin/phpunit"]]
 ADAPTER_READS = ("head", "comments", "threads")
+WRITING_JOBS = ("resolve", "edit")
 
 
 def unquoted_brace(command: str) -> bool:
@@ -314,7 +318,7 @@ def segment_ok(seg: list[str], a: argparse.Namespace) -> bool:
                 return False
             seen.add(name)
         return True
-    if a.job == "resolve":
+    if a.job in WRITING_JOBS:
         for gate in GATES:
             if seg[:len(gate)] == gate and (len(seg) > len(gate) or gate != ["npm", "run"]):
                 return not any(sensitive(t, a) for t in seg)
@@ -357,6 +361,9 @@ DENY_SHELL = [
     "*/proc/*", "*gitea_token*",
 ]
 REVIEW_DENY_SHELL = ["git add*", "git commit*"]
+EDIT_DENY_SHELL = REVIEW_DENY_SHELL + ["git cherry-pick*", "git revert*", "git am*", "git stash*",
+                                       "git tag*", "git notes*", "git apply*", "git checkout*",
+                                       "git switch*", "git restore*", "git rm*", "git mv*"]
 CURSOR_DENY = ["git push", "git push --force", "git reset --hard", "git merge", "git rebase", "git branch -D",
                "git difftool", "git diff --output", "git log --output", "git show --output",
                "git diff --ext-diff", "git log --ext-diff", "git show --ext-diff",
@@ -375,6 +382,9 @@ CURSOR_DENY += [f"git {sub} {lead}--output" for sub in ("diff", "log", "show")
                              "--stat -p ", "--format=%H ", "-1 ", "-n 1 ")]
 CURSOR_DENY = list(dict.fromkeys(CURSOR_DENY))
 CURSOR_REVIEW_DENY = ["git add", "git commit"]
+CURSOR_EDIT_DENY = CURSOR_REVIEW_DENY + [
+    "git commit-tree", "git cherry-pick", "git revert", "git am", "git stash", "git tag", "git notes",
+    "git apply", "git checkout", "git switch", "git restore", "git rm", "git mv"]
 
 
 def home() -> str:
@@ -392,9 +402,18 @@ def shell_rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
     deny = list(DENY_SHELL)
     if a.job == "resolve":
         allow += COMMIT_SHELL + GATE_SHELL
+    elif a.job == "edit":
+        allow += GATE_SHELL
+        deny += EDIT_DENY_SHELL
     else:
         deny += REVIEW_DENY_SHELL
     return allow, deny
+
+
+def cursor_deny(a: argparse.Namespace) -> list[str]:
+    extra = {"review": CURSOR_REVIEW_DENY, "edit": CURSOR_EDIT_DENY}.get(a.job, [])
+    adapter_writes = [f"python3 {a.adapter} {sub}" for sub in ("comment", "label", "merge")]
+    return list(dict.fromkeys(CURSOR_DENY + extra + adapter_writes))
 
 
 def git_paths(a: argparse.Namespace) -> list[str]:
@@ -413,7 +432,7 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
         # Claude rule paths: //abs is an absolute path.
         ab = lambda p: "/" + p if p.startswith("/") else p
         tools = [f"Read({ab(r)}/**)" for r in read_roots(a)] + ["Grep", "Glob", f"Write({ab(a.report)})"]
-        if a.job == "resolve":
+        if a.job in WRITING_JOBS:
             tools += [f"Edit({ab(wt)}/**)", f"Write({ab(wt)}/**)"]
         denies = [f"Bash({r})" for r in deny]
         denies += [f"{t}({ab(p)})" for p in git_paths(a) for t in ("Edit", "Write")]
@@ -421,7 +440,7 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
         return tools + [f"Bash({r})" for r in allow], denies
     if a.provider == "grok":
         tools = [f"Read({r}/**)" for r in read_roots(a)] + ["Grep", f"Write({a.report})"]
-        if a.job == "resolve":
+        if a.job in WRITING_JOBS:
             tools += [f"Edit({wt}/**)", f"Write({wt}/**)"]
         denies = [f"Bash({r})" for r in deny]
         denies += [f"{t}({p})" for p in git_paths(a) for t in ("Edit", "Write")]
@@ -429,10 +448,8 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
         return tools + [f"Bash({r})" for r in allow], denies
     if a.provider == "cursor":
         prefixes = [prefix_of(r) for r in allow]
-        allow_rules = [f"Read({r}/**)" for r in read_roots(a)] + [f"Write({a.report})"] + ([f"Write({wt}/**)"] if a.job == "resolve" else [])
-        deny_rules = CURSOR_DENY + (CURSOR_REVIEW_DENY if a.job == "review" else [])
-        deny_rules += [f"python3 {a.adapter} {sub}" for sub in ("comment", "label", "merge")]
-        denies = [f"Shell({p})" for p in deny_rules]
+        allow_rules = [f"Read({r}/**)" for r in read_roots(a)] + [f"Write({a.report})"] + ([f"Write({wt}/**)"] if a.job in WRITING_JOBS else [])
+        denies = [f"Shell({p})" for p in cursor_deny(a)]
         denies += [f"Write({p})" for p in git_paths(a)] + [f"Read({p})" for p in credential_globs()]
         return allow_rules + [f"Shell({p})" for p in dict.fromkeys(prefixes)], denies
     raise SystemExit(f"policy: no rule translation for provider {a.provider}")
@@ -451,8 +468,7 @@ def family_allows(segment: str, a: argparse.Namespace) -> bool:
     allow, deny = shell_rules(a)
     if a.family == "prefix":
         allow = [prefix_of(r) for r in allow]
-        deny = CURSOR_DENY + (CURSOR_REVIEW_DENY if a.job == "review" else []) \
-            + [f"python3 {a.adapter} {sub}" for sub in ("comment", "label", "merge")]
+        deny = cursor_deny(a)
         return any(prefix_match(segment, p) for p in allow) and not any(prefix_match(segment, p) for p in deny)
     return any(fnmatch.fnmatchcase(segment, p) for p in allow) and \
         not any(fnmatch.fnmatchcase(segment, p) for p in deny)
@@ -483,7 +499,7 @@ def write_allowed(path: str, a: argparse.Namespace) -> bool:
     p = os.path.realpath(os.path.join(a.worktree or "/", os.path.expanduser(path)))
     if p == os.path.realpath(a.report):
         return True
-    if a.job != "resolve" or not a.worktree:
+    if a.job not in WRITING_JOBS or not a.worktree:
         return False
     wt = os.path.realpath(a.worktree)
     if not p.startswith(wt + os.sep):
@@ -543,7 +559,7 @@ def main() -> int:
     p.add_argument("action", choices=["rules", "cursor-json", "hook-settings", "hook", "check"])
     p.add_argument("--provider", default="")
     p.add_argument("--family", choices=["glob", "prefix"], default="glob")
-    p.add_argument("--job", choices=["review", "resolve"], required=True)
+    p.add_argument("--job", choices=["review", "resolve", "edit"], required=True)
     p.add_argument("--adapter", required=True)
     p.add_argument("--worktree", default="")
     p.add_argument("--report", default="")
