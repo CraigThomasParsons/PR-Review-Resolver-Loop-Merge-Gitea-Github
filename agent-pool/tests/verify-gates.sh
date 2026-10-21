@@ -160,6 +160,8 @@ EOF
 out="$(AGENT_POOL_GATES_DIR="$TMP/gatesdir" load "$REPO" "$BASE_SHA" owner/repo)"
 expect "an override file wins over the base file" "$out" '"source": "override"'
 expect "and its own gate is the one returned" "$out" "override-gate"
+OVERRIDE_SHA="$(git hash-object --no-filters "$TMP/gatesdir/owner__repo.toml")"
+expect "and its blob is the override file's own blob SHA" "$out" "\"blob\": \"$OVERRIDE_SHA\""
 
 EMPTY="$TMP/empty-repo"
 mkdir -p "$EMPTY"

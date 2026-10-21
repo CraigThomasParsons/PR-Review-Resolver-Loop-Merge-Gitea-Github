@@ -207,36 +207,45 @@ def cmd_validate(a: argparse.Namespace) -> int:
     return 2 if errors else 0
 
 
-def _gate_show(main: str, base_sha: str, path: str) -> str | None:
-    """`git show BASE_SHA:path` through a scrubbed env; None if the blob doesn't exist."""
-    proc = subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "-C", main, "show", f"{base_sha}:{path}"],
+def _scrubbed_git(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    """Run git with hooks, system and global config, and HOME all scrubbed."""
+    return subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
         env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_NOSYSTEM": "1",
              "GIT_CONFIG_GLOBAL": "/dev/null", "HOME": "/nonexistent", "LANG": "C.UTF-8"},
-        capture_output=True, text=True, check=False,
+        input=stdin, capture_output=True, encoding="utf-8", check=False,
     )
-    return proc.stdout if proc.returncode == 0 else None
 
 
-def _gate_blob_sha(main: str, base_sha: str, path: str) -> str:
-    proc = subprocess.run(
-        ["git", "-C", main, "rev-parse", "--verify", "-q", f"{base_sha}:{path}"],
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
-        capture_output=True, text=True, check=False,
-    )
-    return proc.stdout.strip()
+def _gate_blob(main: str, base_sha: str, path: str) -> tuple[str, str] | None:
+    """(blob SHA, contents) of BASE_SHA:path, or None if the blob doesn't exist. The contents
+    are read by that SHA, so the receipt's blob is exactly the bytes that were parsed."""
+    proc = _scrubbed_git("-C", main, "rev-parse", "--verify", "-q", f"{base_sha}:{path}")
+    blob = proc.stdout.strip()
+    if proc.returncode != 0 or not blob:
+        return None
+    proc = _scrubbed_git("-C", main, "cat-file", "blob", blob)
+    return (blob, proc.stdout) if proc.returncode == 0 else None
+
+
+def _text_blob_sha(text: str) -> str:
+    """The git blob SHA of text read outside any repo, comparable with a base blob's SHA."""
+    proc = _scrubbed_git("hash-object", "--no-filters", "--stdin", stdin=text)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def cmd_load(a: argparse.Namespace) -> int:
     override = gates_dir() / f"{a.repo.replace('/', '__')}.toml"
     if override.is_file():
-        source, blob, text = "override", "", override.read_text()
+        with open(override, encoding="utf-8", newline="") as handle:  # exact bytes, for the SHA
+            text = handle.read()
+        source, blob = "override", _text_blob_sha(text)
     else:
-        text = _gate_show(a.main, a.base_sha, ".agent-pool/gates.toml")
-        if text is None:
+        found = _gate_blob(a.main, a.base_sha, ".agent-pool/gates.toml")
+        if found is None:
             print(json.dumps({"source": "none", "blob": "", "manifest": None}))
             return 0
-        source, blob = "base", _gate_blob_sha(a.main, a.base_sha, ".agent-pool/gates.toml")
+        source, (blob, text) = "base", found
 
     try:
         doc = tomllib.loads(text)
