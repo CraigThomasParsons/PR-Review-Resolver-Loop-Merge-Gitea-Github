@@ -301,8 +301,9 @@ commit_staged() {
 
 # Any limit parks, even with commits: they stay on the local branch and the rerun after the
 # reset publishes them with whatever the agent still had to do. Staged work is committed first
-# so the requeued run can start; unstaged or untracked work still keeps the worktree, and the
-# requeued run then refuses to start beside it until a human recovers that work.
+# when the worker made no commit of its own, so the requeued run can start; staged work on top
+# of a worker commit, and unstaged or untracked work, still keep the worktree, and the requeued
+# run then refuses to start beside it until a human recovers that work.
 if [ "$CLASS" = "limit" ]; then
   commit_staged || log "WARN could not commit the worker's staged changes before parking"
   log "PARK: provider limit reached; exiting 75 so this issue is requeued, not failed"
