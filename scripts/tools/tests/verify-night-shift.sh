@@ -258,6 +258,8 @@ same "branch pushed by the launcher" "$(remote_has_branch feature/7-nightcrew)" 
 same "one PR opened" "$(created_count)" 1
 pr_fields="$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readline()); print(b["head"], b["base"], b["title"], "Closes #7" in b["body"])' "$GITEA/created.jsonl")"
 same "PR head/base/title/closing reference" "$pr_fields" "feature/7-nightcrew master #7: Add a widget True"
+same "a worker's own commit gets no launcher-commit note in the PR body" \
+  "$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readline()); print("launcher committed" in b["body"])' "$GITEA/created.jsonl")" False
 remote_head="$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/7-nightcrew)"
 receipt="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["pr_number"], r["branch"], r["head"])' "$RECEIPT" 2>&1)"
 same "receipt names PR, branch and pushed head" "$receipt" "99 feature/7-nightcrew $remote_head"
