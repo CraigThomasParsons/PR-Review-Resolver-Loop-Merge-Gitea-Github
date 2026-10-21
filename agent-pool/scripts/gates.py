@@ -255,7 +255,11 @@ def cmd_load(a: argparse.Namespace) -> int:
 def _load_manifest_arg(raw: str) -> dict:
     text = Path(raw).read_text() if os.path.isfile(raw) else raw
     doc = json.loads(text)
-    return doc.get("manifest", doc) if isinstance(doc, dict) else doc
+    if isinstance(doc, dict) and "manifest" in doc:
+        doc = doc["manifest"]
+    # `load` prints "manifest": null when the repo has none; the built-in protections still
+    # apply then, so treat it as an empty manifest rather than crashing.
+    return {} if doc is None else doc
 
 
 def _changed_paths(raw: str) -> list[str]:

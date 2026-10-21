@@ -231,5 +231,12 @@ expect "a gitlink the caller flags via --gitlinks is protected" "$out" "vendor/s
 out="$(protected "$TMP/example.json" "$(changed_file src/app.py)")"
 expect "an unrelated path is not protected" "$out" "none"
 
+printf '{"source": "none", "blob": "", "manifest": null}' > "$TMP/none.json"
+out="$(protected "$TMP/none.json" "$(changed_file .agent-pool-context.md README.md)" 2>&1)"
+expect "load's no-manifest output still applies the built-in protections" "$out" ".agent-pool-context.md"
+expect_not "without crashing" "$out" "Traceback"
+out="$(select_gates "$TMP/none.json" "$(changed_file README.md)" 2>&1)"
+expect "and select on it prints none" "$out" "none"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
