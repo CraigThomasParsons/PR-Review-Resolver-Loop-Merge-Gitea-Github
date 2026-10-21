@@ -79,6 +79,28 @@ EOF
 out="$(validate "$TMP/bad-cwd.toml" 2>&1)"
 expect "cwd=../x escaping the tree" "$out" "must be a relative path inside the tree"
 
+cat > "$TMP/unnormalised-cwd.toml" <<'EOF'
+version = 1
+[[gate]]
+name = "x"
+cwd = "./a//b"
+argv = ["npm", "test"]
+paths = ["**"]
+EOF
+out="$(validate "$TMP/unnormalised-cwd.toml" 2>&1)"
+expect "cwd=./a//b that is not normalised" "$out" "must be normalised"
+
+cat > "$TMP/defaults-not-table.toml" <<'EOF'
+version = 1
+defaults = 5
+gate = 7
+EOF
+out="$(validate "$TMP/defaults-not-table.toml" 2>&1)"; rc=$?
+expect "a non-table defaults is reported, not a traceback" "$out" "defaults: must be a table"
+expect "a non-array gate is reported too" "$out" "gate: must be an array of tables"
+expect_not "and nothing crashes" "$out" "Traceback"
+expect "still exits 2" "$rc" "2"
+
 cat > "$TMP/over-budget.toml" <<'EOF'
 version = 1
 [defaults]

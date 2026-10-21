@@ -107,6 +107,8 @@ def _check_cwd(where: str, cwd: Any, errors: list[str]) -> None:
     norm = posixpath.normpath(cwd)
     if posixpath.isabs(cwd) or norm == ".." or norm.startswith("../"):
         errors.append(_err(where, f"cwd {cwd!r} must be a relative path inside the tree"))
+    elif norm != cwd:
+        errors.append(_err(where, f"cwd {cwd!r} must be normalised (as {norm!r})"))
 
 
 def _check_timeout(where: str, timeout: Any, budget: int, errors: list[str]) -> None:
@@ -129,6 +131,8 @@ def validate(doc: Any) -> list[str]:
 
     defaults = doc.get("defaults", {})
     _check_keys("defaults", defaults, DEFAULTS_KEYS, errors)
+    if not isinstance(defaults, dict):
+        defaults = {}
     budget = defaults.get("budget", BUILTIN_DEFAULTS["budget"])
     if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
         errors.append(_err("defaults.budget", "must be a positive integer of seconds"))
@@ -144,7 +148,11 @@ def validate(doc: Any) -> list[str]:
         errors.append(_err("defaults.tasks", "must be an integer"))
 
     names_seen: set[str] = set()
-    for i, dep in enumerate(doc.get("deps", [])):
+    deps = doc.get("deps", [])
+    if not isinstance(deps, list):
+        errors.append(_err("deps", "must be an array of tables"))
+        deps = []
+    for i, dep in enumerate(deps):
         where = f"deps[{i}]"
         _check_keys(where, dep, DEPS_KEYS, errors)
         if not isinstance(dep, dict):
@@ -158,7 +166,11 @@ def validate(doc: Any) -> list[str]:
             if phase in dep:
                 _check_argv(f"{where}.{phase}", dep[phase], errors)
 
-    for i, gate in enumerate(doc.get("gate", [])):
+    gates = doc.get("gate", [])
+    if not isinstance(gates, list):
+        errors.append(_err("gate", "must be an array of tables"))
+        gates = []
+    for i, gate in enumerate(gates):
         where = f"gate[{i}]"
         _check_keys(where, gate, GATE_KEYS, errors)
         if not isinstance(gate, dict):
