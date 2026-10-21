@@ -17,7 +17,7 @@ You are in a detached worktree checked out at the PR head __SHA__ (branch __HEAD
    git add path/to/first/file path/to/second/file
    git commit -m "fix: what changed"
 
-   Never use git add -A, git add ., git add --all, git add -u, git commit -a or git commit --amend, and never stage anything under .cursor/, .grok/ or other tool configuration. Check git status before each commit and stage nothing you cannot explain. If the PR references an issue, add a Refs: #N trailer.
+   Never use git add -A, git add ., git add --all, git add -u, git commit -a or git commit --amend, and never stage anything under .cursor/, .grok/ or other tool configuration. Check git status before each commit and stage nothing you cannot explain. If the PR references an issue, end the -m message with a Refs: #N line (git commit --trailer is denied).
 
 5. Before you finish, run the gate AGENTS.md names for the paths you changed. A change only to Markdown or other docs needs no gate; say so. If the gate is red, do not leave the failing commit in place as fixed: mark that finding deferred and explain.
 

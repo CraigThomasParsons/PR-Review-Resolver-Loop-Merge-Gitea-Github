@@ -351,15 +351,16 @@ for fam in glob prefix; do
   expect "$fam/resolve: the gate is allowed" "$(pol $fam resolve 'npm run test')" allow
   expect "$fam/resolve: git commit --amend is denied" "$(pol $fam resolve 'git commit --amend -m x')" deny
   expect "$fam/resolve: git commit -a is denied" "$(pol $fam resolve 'git commit -a -m x')" deny
-  # Cursor commits as `git commit --trailer ... -m ...`.
+  # #29: no --trailer form is allowed. Cursor matches by prefix, so a `git commit --trailer`
+  # prefix would admit a later --amend/-a/-F; the night-shift launcher commits staged work instead.
   T='--trailer "Made-with: Cursor"'
-  expect "$fam/resolve: a commit --trailer -m is allowed" "$(pol $fam resolve "git commit $T -m 'fix: x'")" allow
-  expect "$fam/resolve: repeated --trailer is allowed" "$(pol $fam resolve "git commit $T --trailer 'Co-authored-by: A' -m x")" allow
-  expect "$fam/resolve: a --trailer after -m is allowed" "$(pol $fam resolve "git commit -m x $T")" allow
+  expect "$fam/resolve: a commit --trailer -m is denied" "$(pol $fam resolve "git commit $T -m 'fix: x'")" deny
+  expect "$fam/resolve: repeated --trailer is denied" "$(pol $fam resolve "git commit $T --trailer 'Co-authored-by: A' -m x")" deny
+  expect "$fam/resolve: a --trailer after -m is denied" "$(pol $fam resolve "git commit -m x $T")" deny
   expect "$fam/review: a commit --trailer -m is denied" "$(pol $fam review "git commit $T -m 'fix: x'")" deny
   expect "$fam/review: a commit -m --trailer is denied" "$(pol $fam review "git commit -m x $T")" deny
   expect "$fam/resolve: --trailer without -m is denied" "$(pol $fam resolve "git commit $T")" deny
-  expect "$fam/resolve: --trailer=VALUE is allowed like --message=" "$(pol $fam resolve 'git commit -m x --trailer=Made-with:Cursor')" allow
+  expect "$fam/resolve: --trailer=VALUE is denied" "$(pol $fam resolve 'git commit -m x --trailer=Made-with:Cursor')" deny
   expect "$fam/resolve: --trailer= naming a credential is denied" "$(pol $fam resolve 'git commit -m x --trailer=~/.ssh/id_rsa')" deny
   expect "$fam/resolve: --trailer without a value is denied" "$(pol $fam resolve 'git commit -m x --trailer')" deny
   expect "$fam/resolve: --trailer with -a is denied" "$(pol $fam resolve "git commit $T -a -m x")" deny
@@ -619,17 +620,19 @@ expect "claude r4#1: brace expansion is denied in the emitted globs" "$r" 'Bash(
 expect "claude r4#2: git commit -F is denied in the emitted globs" "$(rules_of claude resolve)" 'Bash(git commit -F*)'
 expect_not "claude r4#2: git commit -F is no longer allowed" "$(rules_of claude resolve | grep '^allow')" 'git commit -F'
 expect "cursor r4#2: git commit -F is a deny prefix" "$(rules_of cursor resolve)" 'Shell(git commit -F)'
-expect "cursor resolve allows git commit --trailer" "$(rules_of cursor resolve)" $'allow\tShell(git commit --trailer)'
-expect "cursor resolve still allows git commit -m" "$(rules_of cursor resolve)" $'allow\tShell(git commit -m)'
+expect_not "cursor resolve does not allow git commit --trailer" "$(rules_of cursor resolve | grep '^allow')" 'git commit --trailer'
+# Bracketed so the substring match is exact and a failure prints the whole commit allow list.
+expect "cursor resolve's only commit prefix is git commit -m" \
+  "[$(rules_of cursor resolve | grep '^allow' | grep 'git commit')]" $'[allow\tShell(git commit -m)]'
 expect_not "cursor review does not allow git commit --trailer" "$(rules_of cursor review | grep '^allow')" 'git commit'
 expect "cursor review denies git commit" "$(rules_of cursor review)" $'deny\tShell(git commit)'
 for prov in claude grok; do
-  expect "$prov resolve allows git commit --trailer" "$(rules_of $prov resolve)" $'allow\tBash(git commit --trailer * -m *)'
+  expect_not "$prov resolve does not allow git commit --trailer" "$(rules_of $prov resolve | grep '^allow')" 'git commit --trailer'
   expect "$prov resolve still allows git commit -m" "$(rules_of $prov resolve)" $'allow\tBash(git commit -m *)'
   expect_not "$prov review does not allow git commit --trailer" "$(rules_of $prov review | grep '^allow')" 'git commit'
   expect "$prov review denies git commit" "$(rules_of $prov review)" $'deny\tBash(git commit*)'
 done
-# Grok gets only the emitted globs (no argument check), so the globs alone must require -m.
+# Grok gets only the emitted globs (no argument check).
 glob_only() { # job command: allow or deny by the emitted grok Bash globs alone
   rules_of grok "$1" | python3 -c '
 import fnmatch, sys
@@ -638,8 +641,8 @@ globs = lambda k: [r[5:-1] for kind, r in rules if kind == k and r.startswith("B
 ok = any(fnmatch.fnmatchcase(cmd, g) for g in globs("allow")) and not any(fnmatch.fnmatchcase(cmd, g) for g in globs("deny"))
 print("allow" if ok else "deny")' "$2"
 }
-expect "grok globs: a commit --trailer -m is allowed" "$(glob_only resolve 'git commit --trailer Made-with:Cursor -m x')" allow
-expect "grok globs: a commit -m --trailer is allowed" "$(glob_only resolve 'git commit -m x --trailer Made-with:Cursor')" allow
+expect "grok globs: a commit -m is allowed" "$(glob_only resolve 'git commit -m x')" allow
+expect "grok globs: a commit --trailer -m is denied" "$(glob_only resolve 'git commit --trailer Made-with:Cursor -m x')" deny
 expect "grok globs: a commit --trailer with no -m is denied" "$(glob_only resolve 'git commit --trailer Made-with:Cursor')" deny
 expect "grok globs: review commit --trailer -m is denied" "$(glob_only review 'git commit --trailer T -m x')" deny
 for prov in claude grok cursor; do
