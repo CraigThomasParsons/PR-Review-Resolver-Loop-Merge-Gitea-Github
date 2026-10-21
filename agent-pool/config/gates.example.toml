@@ -1,0 +1,47 @@
+# Example gate manifest. Copy to .agent-pool/gates.toml on the repo's base branch (read by
+# blob, never from a worker's worktree or PR head -- only a merged change to this file ever
+# takes effect) or to a controller-owned override under
+# ~/.config/agent-pool/gates/<owner>__<name>.toml, which wins when present. Read by
+# agent-pool/scripts/gates.py, which validates every rule documented in its own docstring and
+# in docs/plans/controller-gates.md Section 1.
+#
+# argv is always an argv list, never a shell string, and argv[0] must be one of gates.py's
+# GATE_RUNNERS (npm, dotnet, just, composer, php, vendor/bin/pint, vendor/bin/phpunit).
+
+version = 1
+
+# Paths whose change by the WORKER sends the job to needs-human instead of running gates:
+# anything that redefines what a gate does. A top-level key in TOML must come before the
+# FIRST table header in the file -- after any [section] or [[array]] header, a bare key
+# attaches to that header, not to the top level (confirmed against Python's tomllib; the
+# hazard this comment warns about is exactly what a later edit could silently reintroduce).
+protect = ["clientv2/package.json", "justfile", "composer.json", "phpunit.xml*",
+           "Directory.Build.*", "*.sln"]
+
+[defaults]
+timeout = 600      # seconds per gate
+memory  = "4G"     # cgroup MemoryMax
+tasks   = 512      # cgroup TasksMax
+cpu     = "200%"   # cgroup CPUQuota
+budget  = 1200     # total seconds for all gates of one job
+
+# Dependencies are installed offline inside the sandbox, from a cache the controller warms
+# from the BASE branch's lockfile.
+[[deps]]
+name     = "client-npm"
+cwd      = "clientv2"
+lockfile = "clientv2/package-lock.json"
+warm     = ["npm", "ci", "--ignore-scripts"]   # controller, base tree, network on
+install  = ["npm", "ci", "--offline"]          # sandbox, worker's tree, network off
+
+[[gate]]
+name    = "client"
+cwd     = "clientv2"
+argv    = ["npm", "run", "gate"]
+paths   = ["clientv2/**"]   # run when the worker's diff touches these
+timeout = 900
+
+[[gate]]
+name  = "net"
+argv  = ["dotnet", "build", "Pulse.sln", "-c", "Release", "--no-restore"]
+paths = ["net/**", "*.sln", "Directory.Build.*"]
