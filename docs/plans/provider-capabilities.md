@@ -1,17 +1,18 @@
 # Provider capability model
 
-Status: design plan, decisions settled 2026-10-20 (see Section 9). Written against `master` at
-`9a5b472` (which includes merged PRs #2, #11, #13, #15, and #17), open PR #19
-(`scripts/tools/night_shift.sh`), `docs/plans/agent-pool-worker-pool.md`,
+Status: design plan, decisions settled 2026-10-20 (see Section 9), rebased on master 2026-10-21
+to reconcile with the per-repo abilities model and `doctor.sh` that PR #19 and PR #21 already
+merged (Section 9, decision 10). Written against `master` at `e92b7c8` (which includes merged
+PRs #2, #11, #13, #15, #17, #19, and #21), `docs/plans/agent-pool-worker-pool.md`,
 `docs/plans/controller-gates.md`, and `docs/plans/controller-commits-everything.md` (split out
 of this plan's former Section 7 — see Section 9's decision on scope).
 
 ## Context and motivation
 
-Today `agent-pool/bin/prod-common.sh` models only two job kinds (`review` and `resolve`, plus `settled` which runs no provider) and hardcodes provider eligibility in `job_providers()` in `agent-pool/bin/prod-common.sh` with a single special case: `agy` is skipped for `resolve` unless `AGY_AUTO_APPROVE=1` is set. Meanwhile:
+Today `agent-pool/bin/prod-common.sh` models only two job kinds (`review` and `resolve`, plus `settled` which runs no provider) and hardcodes provider eligibility in `job_providers()` in `agent-pool/bin/prod-common.sh` with a single special case: `agy` is skipped for `resolve` unless `AGY_AUTO_APPROVE=1` is set. `~/.config/agent-pool/repos.toml` already grants each repo a per-provider `AGENT_POOL_ABILITIES` list (read by `scripts/repoconfig.py`, consumed by `prod-<provider>.sh`), and `agent-pool/bin/doctor.sh`/`scripts/doctor.py` already escalate an `agent:ready` job to `agent:needs-human` when no roster provider in `repos.toml` has the needed ability enabled on that repo. That existing machinery answers one question only: *which providers is this repo allowed to use at all, and for which of the five ability names.* It says nothing about a provider's *own* abilities independent of any repo, or about a single job declaring which abilities it specifically needs (`requires`) versus the coarser five-name list a repo grants wholesale. Meanwhile:
 
 1. `docs/plans/controller-gates.md` moves gate execution out of workers into a controller-owned bubblewrap sandbox (`agent-pool/scripts/gates.py` reading `.agent-pool/gates.toml`), strips keys and ambient credentials from workers, and removes `agy` from `resolve` permanently because `--dangerously-skip-permissions` violates the no-keys invariant.
-2. Open PR #19 adds `scripts/tools/night_shift.sh` so TheNightCrew can dispatch `cursor` on repository issues using `policy.py cursor-json --job resolve`, while noting that test execution inside the worker remains a temporary residual risk until controller-run gates land.
+2. PR #19 (merged) added `scripts/tools/night_shift.sh` so TheNightCrew can dispatch `cursor` on repository issues using `policy.py cursor-json --job resolve`, noting that test execution inside the worker remains a temporary residual risk until controller-run gates land; PR #21 (merged) added `agent-pool/bin/doctor.sh`, `scripts/doctor.py`, `scripts/repoconfig.py`, `repos.toml`, and `skills/pr-loops-common/gitea-labels.py`'s `agent:*` labels — all without capability-awareness, since `capabilities.py` (this plan) doesn't exist yet.
 3. Different tasks require different trust boundaries and publication contracts: writing a design plan, reviewing a diff, building a throwaway prototype, authoring tests without touching production code, and resolving findings on a branch.
 
 Borrowing the capability-and-requirement model from Atlassian Bamboo, each provider worker advertises a set of **abilities**, each queued job declares its **required abilities** (`requires`), and a worker only claims or falls back onto a job when its available abilities satisfy every requirement on the job.
@@ -53,7 +54,17 @@ Every job processed by `agent-pool/bin/prod-common.sh` (and issue-dispatched job
 
 ## 2. Per-provider capability manifest
 
-Capabilities are defined in a new helper `agent-pool/scripts/capabilities.py` (backed by static defaults and optional per-host narrowing via `AGENT_POOL_ABILITIES_<PROVIDER>`). An operator env var can **narrow** a provider's advertised abilities (for example `AGENT_POOL_ABILITIES_GROK=review,plan`), but can never **widen** a provider beyond its hard ceiling in `capabilities.py` (in particular, `agy` can never be granted `resolve`).
+Capabilities are defined in a new helper `agent-pool/scripts/capabilities.py` (backed by static defaults and optional per-host narrowing via `AGENT_POOL_CEILING_<PROVIDER>`, named apart from `repos.toml`'s existing per-repo `AGENT_POOL_ABILITIES` — see "Relationship to `repos.toml`" below). An operator env var can **narrow** a provider's advertised abilities (for example `AGENT_POOL_CEILING_GROK=review,plan`), but can never **widen** a provider beyond its hard ceiling in `capabilities.py` (in particular, `agy` can never be granted `resolve`).
+
+### Relationship to `repos.toml`'s existing `AGENT_POOL_ABILITIES` (extends, does not replace)
+
+`repos.toml` and `capabilities.py` answer different questions and both must pass for a claim:
+
+- **`repos.toml`'s `AGENT_POOL_ABILITIES`** (existing, unchanged by this plan): per-**repo**, per-provider authorization — which of the five ability names a given repo's operator has chosen to let a given provider run there at all. Read by `scripts/repoconfig.py`, set into the tick's environment by `prod-<provider>.sh`. This stays the first gate; this plan does not touch it.
+- **`capabilities.py`'s manifest + `AGENT_POOL_CEILING_<PROVIDER>`** (new, this plan): per-**provider**, host-wide safety ceiling — what a provider is permitted to do on *any* repo, independent of which repo granted it. `agy` lacking `resolve` here holds everywhere, even if some future `repos.toml` entry mistakenly granted `agy` resolve on a specific repo.
+- **`capabilities.py`'s `requires`/`match`** (new, this plan): per-**job** routing — which specific provider among those already authorized by both layers above should claim *this* job, based on what the job itself declares it needs.
+
+A provider claims a job only when all three pass: the repo's `AGENT_POOL_ABILITIES` includes the job's ability, the provider's host-wide ceiling includes it too, and `set(job.requires) <= set(capabilities.py abilities(provider))`. `capable_providers()` (Step 3) checks all three; it does not shadow or duplicate `repos.toml`'s existing per-repo check, it runs after it.
 
 ### Capability matrix
 
@@ -214,7 +225,7 @@ A pull-based worker pool where workers only claim what they can satisfy introduc
 
 Both `agent-pool/bin/prod-common.sh` (during normal ticks) and `agent-pool/bin/doctor.sh` (on its 5-minute non-LLM timer from `docs/plans/agent-pool-worker-pool.md`) evaluate unsatisfiable `agent:ready` jobs using a deterministic three-tier partition. **Decided 2026-10-20 (Section 9): `C_roster` is checked against the host-wide roster, not the current tick's own `PROVIDER_ORDER`** — otherwise an `agy`-only tick would wrongly conclude a `resolve` job is unsatisfiable by anyone, even though a separate `claude` timer runs on the same host. `C_configured`/`C_eligible` still narrow by what the CURRENT tick can actually run:
 
-- **`C_roster`**: providers listed in the host-wide `AGENT_POOL_ROSTER` (every provider enabled anywhere on the host, across every per-service `PROVIDER_ORDER` — see Step 1) whose capability manifest (`capabilities.py`) satisfies `job.requires`.
+- **`C_roster`**: providers in the host-wide `AGENT_POOL_ROSTER` whose capability manifest (`capabilities.py`) satisfies `job.requires`. `AGENT_POOL_ROSTER` is not a separately maintained list: `doctor.py` already reads `repos.toml` repo-by-repo for exactly this purpose (its own docstring calls it "the roster in repos.toml"), so Step 1 generalizes that existing read into a host-wide union — every provider `repos.toml` enables, for any ability, on any repo this host's doctor is configured to cover — computed by `repoconfig.py`, not hand-set by an operator alongside it.
 - **`C_configured`**: providers in `C_roster`, filtered to this tick's own `PROVIDER_ORDER`, that pass binary, model, and prompt preflight without a `SETUP FAULT`.
 - **`C_eligible`**: providers in `C_configured` that are not in an active provider-level cooldown, not in an active ability-level cooldown for any ability in `job.requires`, and not blocked by an active `faults/gates.json` infra fault.
 
@@ -354,23 +365,22 @@ it from today's worker-commits-locally mechanism once that plan lands.
 
 ---
 
-## 8. Migration order after the controller-gates follow-up and PR #19
+## 8. Migration order after the controller-gates follow-up
 
 Every step keeps all existing offline suites green (`agent-pool/tests/verify-lease.sh`, `agent-pool/tests/verify-providers.sh`, `agent-pool/tests/verify-nightcrew-issue-hold.sh`, `skills/pr-loops-common/tests/verify-merge.sh`, `skills/pr-loops-common/tests/verify-resolve.sh`, `skills/pr-loops-common/tests/verify-trigger.sh`, and `tests/verify-install.sh`).
 
 ### Step 0: Land prerequisite plans first
-1. Review and merge open PR #19 (`scripts/tools/night_shift.sh`, `scripts/tools/night_shift_maintenance.sh`, `scripts/tools/night_shift_gitea.py`, `scripts/tools/tests/verify-night-shift.sh`) via `skills/pr-loops-common/pr-merge.sh`.
-2. Land the `controller-gates` PR (`docs/plans/controller-gates.md` Steps 1-10): `agent-pool/scripts/gates.py`, `.agent-pool/gates.toml`, `gate_git`, bubblewrap gate runner, shrunk `agent-pool/scripts/policy.py`, `workerbin/git` PATH shim, `agy` removed from `resolve`, and `AGY_AUTO_APPROVE` retired.
-3. Update `scripts/tools/night_shift.sh` (from PR #19) to drop the temporary `python3 -m unittest`, `python3 -m behave`, and `bash <dir>/verify-*.sh` allowances from Cursor's `.cursor/cli.json` and run `agent-pool/scripts/gates.py run` from the launcher after `cursor-agent` exits (closing PR #19's documented residual risk).
-4. Land `docs/plans/controller-commits-everything.md` (its own migration, Section 5 there) before Step 4 below, since `prototype` and `test-author` have no fallback mechanism without it.
+1. Land the `controller-gates` PR (`docs/plans/controller-gates.md` Steps 1-10): `agent-pool/scripts/gates.py`, `.agent-pool/gates.toml`, `gate_git`, bubblewrap gate runner, shrunk `agent-pool/scripts/policy.py`, `workerbin/git` PATH shim, `agy` removed from `resolve`, and `AGY_AUTO_APPROVE` retired.
+2. Update `scripts/tools/night_shift.sh` (merged by PR #19) to drop the temporary `python3 -m unittest`, `python3 -m behave`, and `bash <dir>/verify-*.sh` allowances from Cursor's `.cursor/cli.json` and run `agent-pool/scripts/gates.py run` from the launcher after `cursor-agent` exits (closing PR #19's documented residual risk). Gitea issue #29 ("Cursor's commit trailer defeats the `git commit -m` allow rule, and cleanup force-removes the staged work") is a related, separate defect in the same launcher — its fix (rejecting `cursor-agent`'s `--trailer`-rewritten commits, or not force-removing a worktree with unstaged work on no-commit exit) is independent of this plan and should not block it, but touches the same file.
+3. Land `docs/plans/controller-commits-everything.md` (its own migration, Section 5 there) before Step 4 below, since `prototype` and `test-author` have no fallback mechanism without it.
 
 ### Step 1: Capability manifest, requirement parser, and the host-wide roster
-- **Files**: new `agent-pool/scripts/capabilities.py`, `skills/pr-loops-common/gitea-labels.py`, `skills/pr-loops-common/pr-merge.sh`, `skills/pr-loops-common/marker.py`.
-- Implement `agent-pool/scripts/capabilities.py` with subcommands:
-  - `abilities --provider P`: prints the effective abilities for `P` (baseline manifest intersected with `AGENT_POOL_ABILITIES_<P>`, never widening past the baseline ceiling).
+- **Files**: new `agent-pool/scripts/capabilities.py`; `agent-pool/scripts/repoconfig.py` gains a roster-union helper; `skills/pr-loops-common/gitea-labels.py`, `skills/pr-loops-common/pr-merge.sh`, `skills/pr-loops-common/marker.py`.
+- Implement `agent-pool/scripts/capabilities.py` as a pure matcher with no knowledge of `repos.toml` (that stays `repoconfig.py`'s job — see "Relationship to `repos.toml`" in Section 2):
+  - `abilities --provider P`: prints the effective abilities for `P` (baseline manifest intersected with `AGENT_POOL_CEILING_<P>`, never widening past the baseline ceiling).
   - `match --order CSV --requires CSV`: prints providers in `order` whose abilities are a superset of `requires`.
   - `parse-requires --labels JSON [--body FILE] --default-job J`: outputs the canonical `requires` CSV.
-  - `check-queue --order CSV --requires CSV --roster CSV`: the `C_roster`/`C_configured`/`C_eligible` partition (Section 5) — takes the **host-wide roster** (every provider enabled anywhere on the host, across every per-service `PROVIDER_ORDER`, read from `AGENT_POOL_ROSTER`) as `--roster`, separately from the calling tick's own narrower `--order`, so an `agy`-only tick never wrongly concludes a `resolve` job is unsatisfiable just because `agy` itself can't do it. This is resolved here, in Step 1, specifically because Step 3's `doctor.sh` escalation logic depends on getting it right from the start rather than being rebuilt once decided.
+  - `check-queue --order CSV --requires CSV --roster CSV`: the `C_roster`/`C_configured`/`C_eligible` partition (Section 5) — takes the **host-wide roster** as `--roster`, separately from the calling tick's own narrower `--order`, so an `agy`-only tick never wrongly concludes a `resolve` job is unsatisfiable just because `agy` itself can't do it. The caller (`prod-common.sh` or `doctor.sh`), not `capabilities.py`, computes `--roster`'s value by calling a new `repoconfig.py` helper that unions every repo's `AGENT_POOL_ABILITIES` grants across whatever repos that host's doctor is configured to cover, then exports it as `AGENT_POOL_ROSTER` for the tick. This is resolved here, in Step 1, specifically because Step 3's `doctor.sh` escalation logic depends on getting it right from the start rather than being rebuilt once decided.
 - Add `agent:plan`, `agent:review`, `agent:prototype`, `agent:test-author`, `agent:resolve`, and `agent:promote` to `LABELS` in `skills/pr-loops-common/gitea-labels.py` and update the blocking/cleanup label sets in `skills/pr-loops-common/pr-merge.sh`.
 - Add `pulse-plan:v1`, `pulse-prototype:v1`, and `pulse-test-author:v1` marker parsers in `skills/pr-loops-common/marker.py` and `agent-pool/scripts/report.py`.
 - Add unit tests in `agent-pool/tests/verify-lease.sh` and `skills/pr-loops-common/tests/verify-merge.sh`, including: an `agy`-only `PROVIDER_ORDER` with a host-wide roster that also includes `claude` does NOT escalate a `resolve` job to `agent:needs-human`.
@@ -384,7 +394,7 @@ Every step keeps all existing offline suites green (`agent-pool/tests/verify-lea
   - `clear --provider claude --ability resolve` clears both the `resolve` ability cooldown and any top-level provider strikes.
 
 ### Step 3: Claim filtering by ability and unsatisfiable-job handling in `prod-common.sh` and `doctor.sh`
-- **Files**: `agent-pool/scripts/claim-record.py`, `agent-pool/bin/prod-common.sh`, new `agent-pool/bin/doctor.sh`, `agent-pool/tests/verify-providers.sh`, new `agent-pool/tests/inject-staleness.sh`.
+- **Files**: `agent-pool/scripts/claim-record.py`, `agent-pool/bin/prod-common.sh`, existing `agent-pool/bin/doctor.sh` (PR #21, extended here with capability-awareness — not new), `agent-pool/tests/verify-providers.sh`, new `agent-pool/tests/inject-staleness.sh`.
 - Add `--requires` and `--expect-ability-labels` to `agent-pool/scripts/claim-record.py`.
 - Replace `job_providers()` in `agent-pool/bin/prod-common.sh` with `capable_providers()`, implementing the `C_roster` / `C_configured` / `C_eligible` partition:
   - `C_roster` empty -> transition `agent:ready` to `agent:needs-human` with comment.
@@ -443,17 +453,33 @@ it.
    host's existing backup routine rather than building new push-to-a-durable-branch
    infrastructure. If the controller host's backup coverage changes later, revisit whether
    unpromoted prototype refs need their own explicit backup path.
+10. **Relationship to `repos.toml`'s existing per-repo `AGENT_POOL_ABILITIES` (PR #21, merged
+    while this plan was open): extend, not replace.** `repos.toml` stays the per-repo
+    authorization gate, unchanged; `capabilities.py` adds a per-provider, host-wide safety
+    ceiling and per-job `requires` routing on top of it (Section 2, "Relationship to
+    `repos.toml`"). The plan's own operator-narrowing var is renamed
+    `AGENT_POOL_CEILING_<PROVIDER>` (was `AGENT_POOL_ABILITIES_<PROVIDER>`) to stop it colliding
+    in name, though not in meaning, with `repos.toml`'s per-repo `AGENT_POOL_ABILITIES`. The
+    host-wide `AGENT_POOL_ROSTER` (Section 5, Step 1) is likewise not a second config an
+    operator maintains by hand: it is computed from `repos.toml` via a new `repoconfig.py`
+    helper, since `doctor.py` already reads `repos.toml` for the same purpose per repo and
+    calls that list "the roster" in its own docstring. `agent-pool/bin/doctor.sh` itself is
+    existing (PR #21), extended here with capability-awareness, not built fresh.
 
 ## 10. Relationship to "Conduits" (issue #6)
 
-Issue #6 (`PR-Review-Resolver-Loop-Merge-Gitea-Github#6` on GitHub) envisions named, database-
-configured agent personas (e.g. two differently-configured Claude-backed identities) — richer
-than anything in this plan. Decided: **this plan is a stepping stone, not a replacement.**
-`capabilities.py`'s static per-provider manifest stays the hard ceiling (Section 2: "can never
-widen a provider beyond its hard ceiling"). If Conduits is built later, named personas narrow
-within that ceiling, the same pattern this plan already uses for
-`AGENT_POOL_ABILITIES_<PROVIDER>` — rather than this plan being redesigned around a database that
-does not exist yet.
+GitHub issue #6 (`PR-Review-Resolver-Loop-Merge-Gitea-Github#6`) originally envisioned named,
+database-configured agent personas (e.g. two differently-configured Claude-backed identities) —
+richer than anything in this plan. That issue is now **closed**: Gitea issue #12 on this repo
+turned out to already carry a more advanced, authorized, substantially-executed implementation
+of the same idea (SQLite config-only registry, `agent-pool/` as the implementation home,
+Charlie/Chase as canonical BDD examples), so #6 was closed in favor of it rather than left to
+diverge as a second source of truth. Decided: **this plan is a stepping stone, not a
+replacement, for whatever Conduits work lands under #12.** `capabilities.py`'s static
+per-provider manifest stays the hard ceiling (Section 2: "can never widen a provider beyond its
+hard ceiling"). If Conduits is built, named personas narrow within that ceiling, the same
+pattern this plan already uses for `AGENT_POOL_CEILING_<PROVIDER>` — rather than this plan being
+redesigned around a database that does not exist yet.
 
 Refined during the same session: a **conduit is a template** — one per provider, each living in
 its own repo (one repo per provider: Claude, Codex, Grok, Agy, Cursor). The tunable settings
