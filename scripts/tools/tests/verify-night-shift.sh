@@ -87,11 +87,11 @@ case "${STUB_MODE:-edit}" in
     for var in GITEA_TOKEN NIGHT_SHIFT_GITEA_TOKEN_FILE NIGHT_CREW_TASK_RECEIPT NIGHT_CREW_TOKEN_FILE SSH_AUTH_SOCK; do
       if [ -n "${!var+x}" ]; then echo "$var=set"; else echo "$var=unset"; fi
     done > "$STUB_STATE/worker-env"
-    if [ -e "/proc/$$/fd/9" ]; then echo open; else echo closed; fi > "$STUB_STATE/worker-fd9"
+    if { : >&9; } 2>/dev/null; then echo open; else echo closed; fi > "$STUB_STATE/worker-fd9"
     if git push -q origin HEAD:refs/heads/worker-push 2>/dev/null; then echo pushed; else echo refused; fi > "$STUB_STATE/worker-push"
     cat > agent-pool/tests/verify-probe.sh <<PROBE
 #!/usr/bin/env bash
-if [ -e "/proc/\$\$/fd/9" ]; then echo open; else echo closed; fi > "$STUB_STATE/suite-fd9"
+if { : >&9; } 2>/dev/null; then echo open; else echo closed; fi > "$STUB_STATE/suite-fd9"
 PROBE
     echo '{"type":"result","subtype":"success","result":"done"}' ;;
   noedit) echo '{"type":"result","result":"nothing to do"}' ;;
@@ -660,6 +660,15 @@ same "the suites the launcher runs on the worker's edits do not hold fd 9 either
 same "the launcher still pushes the branch itself" "$(remote_has_branch feature/25-nightcrew)" yes
 same "and writes the receipt the worker could not see" \
   "$( [ -s "$TMP/receipts/issue-25.json" ] && echo written || echo none)" written
+drop_issue 25
+git -C "$PROJECT" config remote.origin.pushurl "$TMP/origin.git"
+rm -f "$STUB_STATE/argv"
+STUB_MODE=probe run "$PROJECT" 25
+git -C "$PROJECT" config --unset remote.origin.pushurl
+same "a configured pushurl the override cannot replace -> exit 1" "$CODE" 1
+case "$OUT" in *"remote.origin.pushurl is configured"*) ok "the refusal names the pushurl" ;; *) bad "pushurl refusal" "$OUT" ;; esac
+same "no agent ran with a pushurl configured" "$( [ -e "$STUB_STATE/argv" ] && echo ran || echo none)" none
+same "nothing pushed with a pushurl configured" "$(remote_has_branch worker-push)" no
 drop_issue 25
 
 echo

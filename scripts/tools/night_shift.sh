@@ -266,12 +266,19 @@ ${ISSUE_CONTEXT}"
 AGENT_LOG="$LOG_DIR/night_shift_agent.log"
 AGENT_ERR="$LOG_DIR/night_shift_agent.err"
 log "launching cursor-agent (timeout ${AGENT_TIMEOUT}s); output in ${AGENT_LOG}"
-# The worker, and anything it starts in the background, gets none of the controller's authority:
-# not the shift lock's fd 9 (it could release it, or outlive the run holding it), not the Gitea
-# token or token-file path, the task-receipt path, the NightCrew token-file path or ssh-agent, and
-# origin's push URL points nowhere, as agent-pool does for its workers. Process-level only: files
-# the user account can read stay readable, so the cli.json read denies still matter.
+# The worker, and anything it starts in the background, does not inherit the controller's lock or
+# credentials: not the shift lock's fd 9 (it could release it, or outlive the run holding it), not
+# the Gitea token or token-file path, the task-receipt path, the NightCrew token-file path or
+# ssh-agent, and origin's push URL points nowhere, as agent-pool does for its workers. This is
+# process-level only: files the user account can read stay readable, and a push to an explicit
+# URL with the user's own keys still works, until #14's sandboxed gates; the cli.json denies and
+# the controller's pre-push checks remain the guard there.
 NOPUSH_URL="/nonexistent/night-shift-workers-never-push"
+# A configured pushurl would be kept beside the dead one (git pushes to every pushurl), so the
+# override would not stop a push; refuse instead of launching a worker that can publish.
+if [ -n "$(git -C "$WORKTREE" config --get-all remote.origin.pushurl || true)" ]; then
+  fail setup "ABORT — remote.origin.pushurl is configured for ${PROJECT_DIR}; the worker's push could not be disabled"
+fi
 # A failing agent is classified below, so its status is captured on an || list the ERR trap skips.
 AGENT_EXIT=0
 (cd "$WORKTREE" && exec 9>&- && env -u GITEA_TOKEN -u NIGHT_SHIFT_GITEA_TOKEN_FILE -u NIGHT_CREW_TASK_RECEIPT \
