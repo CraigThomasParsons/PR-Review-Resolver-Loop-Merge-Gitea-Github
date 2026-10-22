@@ -12,7 +12,8 @@ gitea_token, id_rsa and PEM rule, plus other private-key names); the content rul
 conduit_registry.CREDENTIAL_RULES (private-key, provider-token, credential-assignment) over every
 line the diff adds. Deleted paths add nothing and are skipped. A rename or copy is scanned under
 its new name. Binary content has no lines, so the whole new blob is decoded byte for byte and
-scanned. Only names and added lines are judged: a credential already in BASE is not reported.
+scanned. Otherwise only names and added lines are judged, so a credential already in BASE is not
+reported; the one exception is a binary file, where one already in BASE is reported again.
 """
 import argparse
 import os
