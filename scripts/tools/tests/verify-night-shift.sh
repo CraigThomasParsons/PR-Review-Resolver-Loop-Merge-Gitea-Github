@@ -667,6 +667,7 @@ STUB_MODE=probe run "$PROJECT" 25
 git -C "$PROJECT" config --unset remote.origin.pushurl
 same "a configured pushurl the override cannot replace -> exit 1" "$CODE" 1
 case "$OUT" in *"remote.origin.pushurl is configured"*) ok "the refusal names the pushurl" ;; *) bad "pushurl refusal" "$OUT" ;; esac
+case "$OUT" in *"launching cursor-agent"*) bad "the refusal is not logged as a launch" "$OUT" ;; *) ok "the refusal is not logged as a launch" ;; esac
 same "no agent ran with a pushurl configured" "$( [ -e "$STUB_STATE/argv" ] && echo ran || echo none)" none
 same "nothing pushed with a pushurl configured" "$(remote_has_branch worker-push)" no
 drop_issue 25
