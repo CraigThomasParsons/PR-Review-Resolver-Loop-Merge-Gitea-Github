@@ -81,6 +81,19 @@ case "${STUB_MODE:-edit}" in
   editlimit) echo edited > edited.txt; echo "You've hit your usage limit. Resets at 3am."; exit 1 ;;
   breaklimit) echo edited > edited.txt; printf '#!/usr/bin/env bash\nexit 1\n' > agent-pool/tests/verify-broken.sh
     echo "You've hit your usage limit. Resets at 3am."; exit 1 ;;
+  # Records what the worker inherited (#25), as set/unset only so no value reaches a log, and
+  # writes a suite that records whether the launcher's test run holds fd 9.
+  probe) echo widget > widget.txt
+    for var in GITEA_TOKEN NIGHT_SHIFT_GITEA_TOKEN_FILE NIGHT_CREW_TASK_RECEIPT NIGHT_CREW_TOKEN_FILE SSH_AUTH_SOCK; do
+      if [ -n "${!var+x}" ]; then echo "$var=set"; else echo "$var=unset"; fi
+    done > "$STUB_STATE/worker-env"
+    if [ -e "/proc/$$/fd/9" ]; then echo open; else echo closed; fi > "$STUB_STATE/worker-fd9"
+    if git push -q origin HEAD:refs/heads/worker-push 2>/dev/null; then echo pushed; else echo refused; fi > "$STUB_STATE/worker-push"
+    cat > agent-pool/tests/verify-probe.sh <<PROBE
+#!/usr/bin/env bash
+if [ -e "/proc/\$\$/fd/9" ]; then echo open; else echo closed; fi > "$STUB_STATE/suite-fd9"
+PROBE
+    echo '{"type":"result","subtype":"success","result":"done"}' ;;
   noedit) echo '{"type":"result","result":"nothing to do"}' ;;
   limit) echo "You've hit your usage limit. Resets at 3am."; exit 1 ;;
   readlimit) echo '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"result":{"success":{"content":"this module is rate-limitable; rate limit 429"}}}}}'; exit 1 ;;
@@ -629,6 +642,25 @@ git init -q "$TMP/nosuites"
 OUT="$(bash "$MAINT" "$TMP/nosuites" quality 2>&1)"; CODE=$?
 same "quality with no suite to run -> exit 1" "$CODE" 1
 case "$OUT" in *"FAIL no offline verify suite found"*) ok "quality says no suite was found" ;; *) bad "no-suite output" "$OUT" ;; esac
+
+echo
+echo "the worker inherits no controller authority (#25)"
+rm -f "$STUB_STATE"/worker-* "$STUB_STATE/suite-fd9"
+GITEA_TOKEN="$SECRET" NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-25.json" NIGHT_CREW_TOKEN_FILE="$TMP/crew_token" \
+  SSH_AUTH_SOCK="$TMP/agent.sock" STUB_MODE=probe run "$PROJECT" 25
+same "a contained worker run still publishes -> exit 0" "$CODE" 0
+same "the worker sees no Gitea token, token file, task receipt, NightCrew token file or ssh-agent" \
+  "$(tr '\n' ' ' < "$STUB_STATE/worker-env" 2>/dev/null)" \
+  "GITEA_TOKEN=unset NIGHT_SHIFT_GITEA_TOKEN_FILE=unset NIGHT_CREW_TASK_RECEIPT=unset NIGHT_CREW_TOKEN_FILE=unset SSH_AUTH_SOCK=unset "
+same "the worker does not hold the shift lock's fd 9" "$(cat "$STUB_STATE/worker-fd9" 2>/dev/null)" closed
+same "a git push from the worker's worktree fails" "$(cat "$STUB_STATE/worker-push" 2>/dev/null)" refused
+same "and reaches nothing on the remote" "$(remote_has_branch worker-push)" no
+same "the suites the launcher runs on the worker's edits do not hold fd 9 either" \
+  "$(cat "$STUB_STATE/suite-fd9" 2>/dev/null)" closed
+same "the launcher still pushes the branch itself" "$(remote_has_branch feature/25-nightcrew)" yes
+same "and writes the receipt the worker could not see" \
+  "$( [ -s "$TMP/receipts/issue-25.json" ] && echo written || echo none)" written
+drop_issue 25
 
 echo
 echo "nothing secret is printed"

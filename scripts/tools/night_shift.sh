@@ -266,9 +266,18 @@ ${ISSUE_CONTEXT}"
 AGENT_LOG="$LOG_DIR/night_shift_agent.log"
 AGENT_ERR="$LOG_DIR/night_shift_agent.err"
 log "launching cursor-agent (timeout ${AGENT_TIMEOUT}s); output in ${AGENT_LOG}"
+# The worker, and anything it starts in the background, gets none of the controller's authority:
+# not the shift lock's fd 9 (it could release it, or outlive the run holding it), not the Gitea
+# token or token-file path, the task-receipt path, the NightCrew token-file path or ssh-agent, and
+# origin's push URL points nowhere, as agent-pool does for its workers. Process-level only: files
+# the user account can read stay readable, so the cli.json read denies still matter.
+NOPUSH_URL="/nonexistent/night-shift-workers-never-push"
 # A failing agent is classified below, so its status is captured on an || list the ERR trap skips.
 AGENT_EXIT=0
-(cd "$WORKTREE" && timeout --kill-after=60 "$AGENT_TIMEOUT" "$CURSOR_AGENT_BIN" -p --trust --workspace "$WORKTREE" \
+(cd "$WORKTREE" && exec 9>&- && env -u GITEA_TOKEN -u NIGHT_SHIFT_GITEA_TOKEN_FILE -u NIGHT_CREW_TASK_RECEIPT \
+  -u NIGHT_CREW_TOKEN_FILE -u SSH_AUTH_SOCK \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.pushurl GIT_CONFIG_VALUE_0="$NOPUSH_URL" \
+  timeout --kill-after=60 "$AGENT_TIMEOUT" "$CURSOR_AGENT_BIN" -p --trust --workspace "$WORKTREE" \
   --output-format stream-json --model "$MODEL" "$PROMPT") > "$AGENT_LOG" 2> "$AGENT_ERR" || AGENT_EXIT=$?
 log "agent exited ${AGENT_EXIT}"
 tail -n 20 "$AGENT_LOG" | cut -c1-400 || true
@@ -338,10 +347,10 @@ stage_edits() {
 }
 # The project checkout's maintenance script runs the worktree's offline suites (the staged tree)
 # in a minimal environment; it fails when no suite exists. Suites the worker wrote run too, with
-# the exposure described at the cli.json above.
+# the exposure described at the cli.json above, but never holding the shift lock's fd 9.
 run_tests() {
   log "running the offline test suites on ${BRANCH}; output in ${TEST_LOG}"
-  bash "$TOOLS/night_shift_maintenance.sh" "$WORKTREE" quality > "$TEST_LOG" 2>&1
+  bash "$TOOLS/night_shift_maintenance.sh" "$WORKTREE" quality > "$TEST_LOG" 2>&1 9>&-
 }
 # Returns 0 committed, 1 no change, 2 credential-shaped filename, 3 tests failed, 4 staging or
 # commit failed. Callers use an || list, so set -e is off in here and each status is checked.
