@@ -458,9 +458,10 @@ def _checked_path(database_path: Path | str) -> Path:
 
 
 def _is_busy(error: sqlite3.Error) -> bool:
-    if getattr(error, "sqlite_errorcode", None) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-        return True
-    return "locked" in str(error) or "busy" in str(error)
+    # sqlite_errorcode is the extended code (SQLITE_BUSY_SNAPSHOT and the like); its low byte is
+    # the primary code. No message matching: an unrelated error must not read as lock contention.
+    code = getattr(error, "sqlite_errorcode", None)
+    return isinstance(code, int) and code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
 @contextlib.contextmanager
