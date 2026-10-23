@@ -35,7 +35,10 @@ An alternate form of this I would like to enable are long living feature branche
   provider can take to `agent:needs-human`; `bin/install-systemd-units.sh`, which copies
   `systemd/agent-pool-*` into the user unit dir without enabling anything;
   `scripts/agent-labels.py`, which creates the `agent:*` labels on one repo; helper scripts
-  and offline tests. Design in `docs/plans/agent-pool-worker-pool.md`.
+  and offline tests. Design in `docs/plans/agent-pool-worker-pool.md`. `scripts/conduit_registry.py`
+  and `scripts/conduit-registry.py` are the Conduit configuration registry (Slice 1: a versioned,
+  configuration-only SQLite schema, the Charlie and Chase examples and a pure deny-by-default
+  matcher, wired into nothing yet); see `docs/plans/conduit-registry.md`.
 - `scripts/tools/`: the entry points TheNightCrew's client requires for every repository it
   serves. `night_shift.sh <project_dir> <issue> [agent]` is the issue executor, Cursor only:
   the launcher is the controller, so it prepares the worktree, runs `cursor-agent` under a
@@ -117,8 +120,13 @@ agent-pool/tests/verify-nightcrew-issue-hold.sh
 agent-pool/tests/verify-doctor.sh
 agent-pool/tests/verify-systemd-units.sh
 agent-pool/tests/verify-agent-labels.sh
+agent-pool/tests/verify-conduits.sh
 scripts/tools/tests/verify-night-shift.sh
 ```
+
+`verify-conduits.sh` also needs Behave: it runs under `${CONDUITS_PYTHON:-python3}` and fails
+when that interpreter lacks it. Install `agent-pool/tests/requirements-conduits.lock` into a
+dedicated environment (see the lockfile header).
 
 All offline: stubbed adapter and CLIs, temporary home, no systemctl. The labels test talks to
 a fake Gitea on 127.0.0.1 only. `verify-night-shift.sh` uses a stub `cursor-agent` and a loopback fake Gitea

@@ -1,0 +1,50 @@
+{
+  "format": "conduit-registry/v1",
+  "providers": [
+    {"id": "claude", "name": "Claude", "enabled": true}
+  ],
+  "model_policies": [
+    {"id": "claude-auto", "provider_id": "claude", "kind": "auto", "models": [], "enabled": true},
+    {"id": "claude-sonnet", "provider_id": "claude", "kind": "fixed", "models": ["sonnet"], "enabled": true}
+  ],
+  "capabilities": [
+    {"id": "coding", "name": "Coding", "enabled": true},
+    {"id": "planning", "name": "Planning", "enabled": true},
+    {"id": "reviewing", "name": "Reviewing", "enabled": true}
+  ],
+  "permissions": [
+    {"id": "code", "name": "Write code on a branch", "enabled": true},
+    {"id": "plan", "name": "Publish a plan", "enabled": true},
+    {"id": "review", "name": "Publish a review", "enabled": true},
+    {"id": "test", "name": "Run tests", "enabled": true}
+  ],
+  "skills": [
+    {"id": "tdd", "version": "1.0.0", "name": "Test-driven development", "procedure": "skills/tdd.md", "enabled": true}
+  ],
+  "conduits": [
+    {
+      "id": "charlie",
+      "name": "Charlie",
+      "provider_id": "claude",
+      "model_policy_id": "claude-auto",
+      "executable": "claude",
+      "invocation": ["claude"],
+      "enabled": true,
+      "capabilities": ["planning", "reviewing"],
+      "permissions": ["plan", "review"],
+      "skills": []
+    },
+    {
+      "id": "chase",
+      "name": "Chase",
+      "provider_id": "claude",
+      "model_policy_id": "claude-sonnet",
+      "executable": "claude",
+      "invocation": ["claude"],
+      "enabled": true,
+      "capabilities": ["coding"],
+      "permissions": ["code", "test"],
+      "skills": [{"id": "tdd", "version": "1.0.0"}]
+    }
+  ]
+}
