@@ -48,6 +48,13 @@
 #   PR_LOOP_AGY_BIN=agy  the Agy CLI used when Claude is limited; review only. Never a bare `agent`
 #   PR_LOOP_AGY_MODEL    --model for Agy (unset = Agy's own default)
 #   PR_LOOP_LIMIT_DEFAULT_SECS=21600  how long a limit lasts when its message names no reset
+#   PR_LOOP_POOL=auto  hand this tick's PRs to the agent pool instead of spawning workers here.
+#                      auto (default): when ~/.config/agent-pool/repos.toml (AGENT_POOL_CONFIG)
+#                      gives some rostered provider this MODE's ability on the repo. 1 forces it,
+#                      0 turns it off. The handoff only moves TRIGGER -> agent:ready; the pool's
+#                      prods pick a provider that is not cooling down, and pr-merge.sh already
+#                      merges on agent:done.
+#   PR_LOOP_POOL_ROOT  the checkout holding agent-pool/ (default: two levels above COMMON's real path)
 #
 # Exit codes: 0 always for a normal tick (including "nothing to do"); 2 for a setup fault.
 
@@ -227,6 +234,35 @@ mapfile -t CANDIDATES < <(printf '%s\n' "$LISTING" | sed '/^$/d')
 if [ "${#CANDIDATES[@]}" -eq 0 ]; then
   if [ -n "$ONLY_PR" ]; then log "#$ONLY_PR is not an open, non-draft, non-bot PR carrying $TRIGGER"
   else log "no open, non-draft, non-bot PR carries $TRIGGER"; fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------- agent pool handoff
+# The pool (agent-pool/) pulls agent:ready PRs and picks whichever provider is enabled and not
+# cooling down, so a limited Claude no longer stalls review or resolve here. When it owns this
+# repo for MODE, this loop only queues: it never spawns a worker beside a pool claim.
+POOL_MODE="${PR_LOOP_POOL:-auto}"
+POOL_ROOT="${PR_LOOP_POOL_ROOT:-$(cd -- "$(readlink -f -- "$COMMON")/../.." 2>/dev/null && pwd)}"
+pool_owns_repo() {
+  case "$POOL_MODE" in 1|on|yes|true) return 0 ;; 0|off|no|false) return 1 ;; esac
+  local cfg="$POOL_ROOT/agent-pool/scripts/repoconfig.py" p ab
+  [ -f "$cfg" ] || return 1
+  for p in claude cursor grok agy codex; do
+    ab="$(python3 "$cfg" ticks --provider "$p" 2>/dev/null | awk -F'\t' -v r="$REPO" '$1==r {print $3}')"
+    case ",$ab," in *",$MODE,"*) return 0 ;; esac
+  done
+  return 1
+}
+if pool_owns_repo; then
+  for row in "${CANDIDATES[@]}"; do
+    IFS=$'\t' read -r pr _ sha _ <<<"$row"
+    if [ "$DRY_RUN" = "1" ]; then log "DRY: #$pr would hand off to the agent pool ($TRIGGER -> agent:ready) at $sha"; continue; fi
+    if python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" --add agent:ready >/dev/null 2>&1; then
+      log "#$pr: handed off to the agent pool ($TRIGGER -> agent:ready) at $sha"
+    else
+      log "warning: hand-off of #$pr to the agent pool failed; it stays at $TRIGGER"
+    fi
+  done
   exit 0
 fi
 
