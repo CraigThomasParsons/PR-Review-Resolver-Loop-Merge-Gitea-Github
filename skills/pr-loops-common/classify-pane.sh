@@ -16,7 +16,13 @@
 #
 # Prints one of:
 #   STATE=WORKING  worker is actively running (or busy in a shell/subagent wait)
-#   STATE=BLOCKED  a tool-approval prompt is waiting (safe to answer per policy)
+#   STATE=BLOCKED  a tool-approval prompt or other selection menu is waiting
+#   STATE=RATE_LIMITED  the provider hit a usage or rate limit: HTTP 429, "hit your weekly
+#                  limit", "usage limit", or the "Stop and wait / Wait here" menu, on a pane
+#                  with no live "esc to interrupt"; or any of those after the worker exited.
+#                  The orchestrator kills the worker and falls back; it never answers the menu.
+#   STATE=EXITED   the worker process ended (pr-loop.sh's launch script prints
+#                  PR_LOOP_WORKER_EXIT=<rc> when it does) with no limit wording on screen
 #   STATE=PARKED   a Claude Code PRODUCT dialog needs a human (usage limit, login,
 #                  auto-mode setup, credits). NEVER approvable; the orchestrator
 #                  must not keep ticking against it.
@@ -53,14 +59,33 @@ parked=0
 printf '%s\n' "$out" | grep -qiE \
   "You've reached your .* limit|/usage-credits|Set up auto mode for your environment|Select login method|log in to continue|purchase more credits|upgrade your plan to continue" && parked=1
 
+# Usage and rate limits. Read from the tail only while the worker is not mid-turn: a reviewer
+# whose tool output quotes "429" or "usage limit" from the code under review is still working.
+# Once the worker process has exited, the whole capture is the provider's last word. The
+# product's own limit dialogs are read from the whole capture like PARKED's, since they scroll.
+PRODUCT_LIMIT_RE="[Hh]it your [^.]*limit|You've reached your [^.]*limit|Stop and wait|Wait here|/usage-credits|purchase more credits|upgrade your plan to continue"
+LIMIT_RE="API Error[: (]*429|\\b429\\b.*([Rr]ate|[Ll]imit|Too Many)|Too Many Requests|rate_limit_error|[Uu]sage limit|$PRODUCT_LIMIT_RE"
+live=0
+printf '%s\n' "$tail" | grep -q "esc to interrupt" && live=1
+exited=0
+printf '%s\n' "$out" | grep -qE '^PR_LOOP_WORKER_EXIT=[0-9]+$' && exited=1
+limited=0
+if [ "$exited" -eq 1 ]; then
+  printf '%s\n' "$out" | grep -qE "$LIMIT_RE" && limited=1
+elif [ "$live" -eq 0 ]; then
+  printf '%s\n' "$tail" | grep -qE "$LIMIT_RE" && limited=1
+  printf '%s\n' "$out" | grep -qE "$PRODUCT_LIMIT_RE" && limited=1
+fi
+
 # Sentinel must be its OWN standalone line (optionally a leading bullet), never
 # merely embedded in the instruction text echoed back into the pane.
 hit=0
 printf '%s\n' "$out" | grep -qE "^[[:space:]]*(.[[:space:]]*)?${sentinel}[[:space:]]*$" && hit=1
 
-# Tool-approval prompt patterns.
+# Tool-approval prompt patterns, plus any other selection menu: the loop never answers one, so a
+# menu it does not recognise must reach BLOCKED (and the strike count) rather than sit as IDLE.
 blocked=0
-printf '%s\n' "$tail" | grep -qiE "Do you want to (proceed|create|make|run|allow)|^[[:space:]]*1\. Yes" && blocked=1
+printf '%s\n' "$tail" | grep -qiE "Do you want to (proceed|create|make|run|allow)|^[[:space:]]*1\. Yes|Enter to confirm" && blocked=1
 
 # Idle-streak persistence (state-file mode). Any non-idle tick resets the streak.
 streak=0
@@ -76,6 +101,13 @@ emit() { echo "STATE=$1"; }
 # idle=0 and strand a finished worker until WORKER_TIMEOUT.
 if [ "$hit" -eq 1 ] && ! printf '%s\n' "$tail" | grep -q "esc to interrupt"; then
   emit DONE
+  [ -n "$state_file" ] && echo 0 > "$state_file"
+elif [ "$limited" -eq 1 ]; then
+  # Before PARKED and BLOCKED: the limit menu is a product dialog and a selection menu too.
+  emit RATE_LIMITED
+  [ -n "$state_file" ] && echo 0 > "$state_file"
+elif [ "$exited" -eq 1 ]; then
+  emit EXITED
   [ -n "$state_file" ] && echo 0 > "$state_file"
 elif [ "$parked" -eq 1 ] && [ "$idle" -eq 1 ]; then
   # A frozen pane wearing a product dialog. Parked wins over blocked: the

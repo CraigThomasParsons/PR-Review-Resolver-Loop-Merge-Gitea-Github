@@ -16,16 +16,25 @@ no `SKILL.md` on purpose.
   by named path only, and workers never push or comment (the pool controller publishes).
   Resolve workers must not run unattended until the controller-gates follow-up (branch
   docs/controller-gates-plan, docs/plans/controller-gates.md) lands.
-- `prompts/review.agy.txt` the agent pool's review prompt for Agy, which runs in plan mode with
-  no commands; the controller gathers the diff and discussion into a context file for it
+- `prompts/review.agy.txt` the review prompt for Agy, which runs in plan mode with no commands;
+  the controller (the agent pool, or `pr-loop.sh` on a Claude limit) gathers the diff and
+  discussion into a context file for it and posts Agy's response as the review
+- `provider-fallback.py` records a provider's usage limit with the reset time parsed from its
+  message (six hours when it names none; `PR_LOOP_LIMIT_DEFAULT_SECS`) under
+  `$PR_LOOP_STATE/provider-limits/`, and checks Agy's JSON result against the review marker.
+  While a Claude limit stands, review ticks go straight to Agy and resolve ticks leave PRs at
+  `review:findings`
 - `marker.py` reads the hidden `pulse-review:v1` and `pulse-resolve:v1` markers off a PR. A
   resolve marker counts each finding as `fixed`, `noted` (non-blocking, left for the author) or
   `deferred` (blocking); only `deferred` sends a PR to `review:needs-human`
 - `gitea-pr.py` the Gitea adapter (list, head, labels, state, label, comment, comments,
   threads, diff, merge)
-- `classify-pane.sh` classifies a worker pane (WORKING, BLOCKED, PARKED, DONE, IDLE, STALLED)
-  from the pane text and an idle-streak state file. The loop depends on the four-argument form
-  and the PARKED and STALLED states, which the tmux-pipeline skill's classifier does not provide.
+- `classify-pane.sh` classifies a worker pane (WORKING, BLOCKED, RATE_LIMITED, EXITED, PARKED,
+  DONE, IDLE, STALLED) from the pane text and an idle-streak state file. The loop depends on the
+  four-argument form and the RATE_LIMITED, EXITED, PARKED and STALLED states, which the
+  tmux-pipeline skill's classifier does not provide. RATE_LIMITED (HTTP 429, "hit your weekly
+  limit", "usage limit", the "Stop and wait" menu) gets the Claude worker killed at the next poll
+  and the review rerun under Agy
 - `tests/verify-resolve.sh` offline cases for the resolve verification gate; run it after any
   edit to `verify()` in `pr-loop.sh`
 - `tests/verify-merge.sh` offline cases for merge candidate and safety gates
@@ -36,6 +45,14 @@ no `SKILL.md` on purpose.
   stub provider CLIs, a stub Gitea adapter and a local git remote
 - `tests/verify-trigger.sh` offline cases for `pr-trigger`, `pr-drain` and the `PR_LOOP_PR` /
   `PR_LOOP_LOCK_WAIT` knobs in `pr-loop.sh`
+- `tests/verify-fallback.sh` offline cases for the usage-limit fallback: the RATE_LIMITED and
+  EXITED pane classes, reset-time parsing, and whole review and resolve ticks against stub
+  `claude`, `agy`, `tmux`, `git` and Gitea adapter
+
+TODO: resolve has no fallback provider. Agy has no tool deny list, so the agent pool never lets it
+resolve and neither does this loop; a resolve that hits a Claude limit is killed and handed back
+to `review:findings` until the reset. A resolve fallback needs a provider with a deny list (the
+agent pool's grok or cursor adapters) and the pool's controller-side push gates.
 
 Production runs a copy of this folder deployed by the repo's top-level `install.sh`;
 `.deployed-from` in the deployed copy names the commit.

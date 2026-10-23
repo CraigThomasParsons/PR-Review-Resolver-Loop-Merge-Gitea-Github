@@ -38,7 +38,7 @@ probe_available() {
   # separate, costlier question -- see the note in the coach notes doc.
   local first=1
   printf '{"available":['
-  for entry in "claude:claude" "codex:codex" "cursor:cursor-agent" "grok:$HOME/.grok/bin/grok" "gemini:gemini"; do
+  for entry in "claude:claude" "codex:codex" "cursor:cursor-agent" "grok:$HOME/.grok/bin/grok" "gemini:gemini" "agy:agy"; do
     local name="${entry%%:*}" cmd="${entry#*:}" path
     path="$(command -v "$cmd" 2>/dev/null || { [ -x "$cmd" ] && echo "$cmd"; })"
     [ -n "$path" ] || continue

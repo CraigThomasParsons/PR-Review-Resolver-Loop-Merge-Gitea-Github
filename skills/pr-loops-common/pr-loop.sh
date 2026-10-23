@@ -17,6 +17,15 @@
 # Skips, before any worker is spawned: Dependabot and other bot authors, drafts, PRs whose head
 # was already reviewed (hidden marker), and the whole tick when the box is busy or short of memory.
 #
+# Usage limits: a Claude worker that hits one (HTTP 429, "You've hit your weekly limit", the
+# "Stop and wait" menu; see classify-pane.sh's RATE_LIMITED) is killed at the next poll, never
+# answered. The limit is recorded with its reset time (provider-fallback.py; six hours when the
+# message names none) and until then no tick starts Claude at all. A review then runs under Agy
+# instead: `agy --mode plan` with prompts/review.agy.txt and a context file of the diff and PR
+# discussion, and the loop posts Agy's response itself, marker and all, so verify() is unchanged.
+# Resolve has no fallback (Agy never resolves; it has no deny list): a limited resolve goes back
+# to review:findings untouched and waits for the reset.
+#
 # Never merges, never enables auto-merge, never force-pushes, never deletes branches. The worker
 # launch denies those tools; the resolver skill refuses them; and the repo hook denies them again
 # once .claude/hooks/pipeline-guardrails.mjs is on develop.
@@ -36,6 +45,9 @@
 #   PR_LOOP_REMOTE     the remote that carries this repo's PR branches (default: origin). Only
 #                      needed when a repo's "origin" is not Gitea -- see TheGiteaCodeFactory,
 #                      whose "origin" is its GitHub mirror and whose Gitea remote is "gitea".
+#   PR_LOOP_AGY_BIN=agy  the Agy CLI used when Claude is limited; review only. Never a bare `agent`
+#   PR_LOOP_AGY_MODEL    --model for Agy (unset = Agy's own default)
+#   PR_LOOP_LIMIT_DEFAULT_SECS=21600  how long a limit lasts when its message names no reset
 #
 # Exit codes: 0 always for a normal tick (including "nothing to do"); 2 for a setup fault.
 
@@ -100,6 +112,11 @@ SKIP_BUSY_GUARD="${SKIP_BUSY_GUARD:-0}"
 ONLY_PR="${PR_LOOP_PR:-}"
 LOCK_WAIT="${PR_LOOP_LOCK_WAIT:-}"
 CLASSIFY="$COMMON/classify-pane.sh"
+FALLBACK="$COMMON/provider-fallback.py"
+AGY="${PR_LOOP_AGY_BIN:-agy}"
+AGY_PROMPT="$COMMON/prompts/review.agy.txt"
+LIMIT_DEFAULT_SECS="${PR_LOOP_LIMIT_DEFAULT_SECS:-21600}"
+CONTEXT_FILE=".pr-loop-context.md"
 
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
@@ -140,6 +157,7 @@ die() { log "FATAL: $*"; exit 2; }
 # ---------------------------------------------------------------- preconditions
 [ -z "$ONLY_PR" ] || [[ "$ONLY_PR" =~ ^[1-9][0-9]*$ ]] || die "PR_LOOP_PR must be a PR number (got '$ONLY_PR')"
 [ -z "$LOCK_WAIT" ] || [[ "$LOCK_WAIT" =~ ^[0-9]+$ ]] || die "PR_LOOP_LOCK_WAIT must be whole seconds (got '$LOCK_WAIT')"
+[[ "$LIMIT_DEFAULT_SECS" =~ ^[1-9][0-9]*$ ]] || die "PR_LOOP_LIMIT_DEFAULT_SECS must be whole seconds (got '$LIMIT_DEFAULT_SECS')"
 command -v claude >/dev/null || die "claude not on PATH"
 command -v tea >/dev/null || [ -x "$HOME/.local/bin/tea" ] || die "tea not on PATH"
 [ -f "$ADAPTER" ] || die "missing Gitea adapter: $ADAPTER"
@@ -223,6 +241,35 @@ comment() { # pr body
   rm -f "$bf"
 }
 
+# ---------------------------------------------------------------- usage limits and the Agy fallback
+claude_limited() { # -> 0 while a recorded Claude limit stands, with LIMIT_UNTIL set
+  local rec
+  rec="$(python3 "$FALLBACK" limit-check --state "$STATE" --provider claude 2>/dev/null)" || return 1
+  IFS=$'\t' read -r _ LIMIT_UNTIL _ <<<"$rec"
+}
+agy_ready() { # -> 0 when the Agy review fallback can run; otherwise AGY_WHY says why not
+  AGY_WHY=""
+  [ "$(basename -- "$AGY")" = agent ] && AGY_WHY="refusing a bare 'agent' binary (Cursor's alias)"
+  command -v "$AGY" >/dev/null 2>&1 || AGY_WHY="${AGY_WHY:-$AGY is not on PATH}"
+  [ -f "$AGY_PROMPT" ] || AGY_WHY="${AGY_WHY:-missing $AGY_PROMPT}"
+  [ -f "$FALLBACK" ] || AGY_WHY="${AGY_WHY:-missing $FALLBACK}"
+  [ -z "$AGY_WHY" ]
+}
+# The provider's own last words, for the log and the needs-human comment: its error lines when it
+# printed any, otherwise its last lines. Home paths are shortened and code fences defused.
+text_excerpt() { # text
+  local pick line
+  pick="$(printf '%s\n' "$1" | grep -E '[Ee]rror|\b429\b|[Ll]imit|[Ff]ailed|[Dd]enied|Stop and wait|Wait here|PR_LOOP_WORKER_EXIT')" \
+    || pick="$(printf '%s\n' "$1" | grep -v '^[[:space:]]*$')"
+  printf '%s\n' "$pick" | tail -n 12 | while IFS= read -r line; do
+    line="${line//"$HOME"/'~'}"; line="${line//'```'/"'''"}"
+    printf '%s\n' "${line:0:300}"
+  done
+}
+pane_excerpt() { # session
+  text_excerpt "$(tmux capture-pane -t "$1" -p -S -40 2>/dev/null)"
+}
+
 declare -a QUEUE=()
 for row in "${CANDIDATES[@]}"; do
   IFS=$'\t' read -r pr headref sha base <<<"$row"
@@ -240,7 +287,9 @@ done
 if [ "${#QUEUE[@]}" -eq 0 ]; then log "nothing to do after skips"; exit 0; fi
 
 # ---------------------------------------------------------------- workers
-declare -A W_SESS W_WT W_SHA W_HEADREF W_START W_STALLS W_BLOCKS
+# W_SESS is every live worker's name (a tmux session for claude); W_PROV says which provider it is.
+# Assigned empty, not just declared: under set -u, ${#W_SESS[@]} of a declared-only array is unbound.
+declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=()
 spawned=0
 
 # Mark a worktree path trusted in ~/.claude.json so Claude Code skips the
@@ -299,26 +348,93 @@ PY
 }
 
 
+render_prompt() { # template out pr headref sha base [context]
+  sed -e "s|__PR__|$3|g" -e "s|__HEADREF__|$4|g" -e "s|__SHA__|$5|g" -e "s|__BASE__|$6|g" -e "s|__SENTINEL__|$SENTINEL|g" -e "s|__REPO__|$REPO|g" -e "s|__ADAPTER__|$ADAPTER|g" -e "s|__COMMON__|$COMMON|g" -e "s|__CONTEXT__|${7:-}|g" \
+    "$1" > "$2"
+}
+
+# What Agy cannot fetch for itself in plan mode, where every command is denied. A file, not an
+# argument: one argument over 128 KiB fails exec with E2BIG.
+write_context() { # pr wt sha base
+  {
+    printf '# Context for PR #%s at %s (base %s), gathered by the PR loop\n\n' "$1" "$3" "$4"
+    printf '## Commits (git log %s/%s..%s)\n\n```\n' "$PR_LOOP_REMOTE" "$4" "$3"
+    git -C "$MAIN" log --format='%h %s' "$PR_LOOP_REMOTE/$4..$3" 2>/dev/null
+    printf '```\n\n## Diff (git diff %s/%s...%s)\n\n```diff\n' "$PR_LOOP_REMOTE" "$4" "$3"
+    git -C "$MAIN" diff "$PR_LOOP_REMOTE/$4...$3" 2>/dev/null
+    printf '```\n\n## PR comments (JSON)\n\n```json\n'
+    python3 "$ADAPTER" comments --repo "$REPO" --pr "$1" 2>/dev/null || echo '[] (could not read the comments)'
+    printf '```\n'
+  } > "$2/$CONTEXT_FILE"
+}
+
+# Run the review of an already-claimed PR under Agy, in the background. The worktree and W_* entries
+# must already exist. stdin is /dev/null and `timeout` bounds it: Agy never gets a menu to sit on.
+start_agy() { # pr
+  local pr="$1"
+  local wt="${W_WT[$pr]}" sha="${W_SHA[$pr]}" run="$STATE/agy-$MODE-$pr"
+  local cmd=("$AGY" -p "" --output-format json --print-timeout 0 --mode plan)
+  rm -f "$run.out" "$run.err" "$run.rc" "$run.report"
+  write_context "$pr" "$wt" "$sha" "${W_BASE[$pr]}"
+  render_prompt "$AGY_PROMPT" "$run.prompt" "$pr" "${W_HEADREF[$pr]}" "$sha" "${W_BASE[$pr]}" "$wt/$CONTEXT_FILE"
+  cmd[2]="$(cat "$run.prompt")"
+  [ -n "${PR_LOOP_AGY_MODEL:-}" ] && cmd+=(--model "$PR_LOOP_AGY_MODEL")
+  (
+    cd "$wt" && timeout -k 30 "$WORKER_TIMEOUT" "${cmd[@]}" </dev/null >"$run.out" 2>"$run.err"
+    echo $? > "$run.rc.tmp" && mv "$run.rc.tmp" "$run.rc"
+  ) &
+  W_PID[$pr]=$!; W_PROV[$pr]=agy; W_SESS[$pr]="agy-$MODE-$pr"
+  W_START[$pr]="$(date +%s)"; W_STALLS[$pr]=0; W_BLOCKS[$pr]=0
+  log "#$pr: started agy review in $wt at $sha"
+}
+stop_agy() { # pr
+  local pid="${W_PID[$1]:-}"
+  [ -n "$pid" ] || return 0
+  pkill -TERM -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  return 0
+}
+
 spawn() { # row
   IFS=$'\t' read -r pr headref sha base <<<"$1"
   local sess="prloop-$MODE-$pr" wt="$WT_ROOT/prloop-$MODE-$pr" prompt="$STATE/prompt-$MODE-$pr.txt" launch="$STATE/launch-$MODE-$pr.sh"
-  if [ "$DRY_RUN" = "1" ]; then log "DRY: would spawn $sess at $sha ($headref -> $base)"; return 0; fi
-  if tmux has-session -t "$sess" 2>/dev/null; then log "#$pr: session $sess already exists; leaving it alone"; return 1; fi
+  local use=claude
+  if claude_limited; then
+    if [ "$MODE" = resolve ]; then
+      log "#$pr: Claude is limited until $LIMIT_UNTIL and resolve has no fallback; leaving it at $TRIGGER"; return 1
+    fi
+    if ! agy_ready; then
+      log "#$pr: Claude is limited until $LIMIT_UNTIL and the Agy fallback is unavailable ($AGY_WHY); leaving it at $TRIGGER"; return 1
+    fi
+    use=agy
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    if [ "$use" = agy ]; then log "DRY: would spawn agy for #$pr at $sha ($headref -> $base); Claude is limited until $LIMIT_UNTIL"
+    else log "DRY: would spawn $sess at $sha ($headref -> $base)"; fi
+    return 0
+  fi
+  if [ "$use" = claude ] && tmux has-session -t "$sess" 2>/dev/null; then log "#$pr: session $sess already exists; leaving it alone"; return 1; fi
   relabel "$pr" "$TRIGGER" "$CLAIM"
   git -C "$MAIN" fetch "$PR_LOOP_REMOTE" --quiet "$headref" || { log "#$pr: fetch $headref failed"; relabel "$pr" "$CLAIM" "$FAIL"; return 1; }
   [ -d "$wt" ] && git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1
   git -C "$MAIN" worktree add --detach "$wt" "$sha" >/dev/null 2>&1 || { log "#$pr: worktree add failed"; relabel "$pr" "$CLAIM" "$FAIL"; return 1; }
+  W_WT[$pr]="$wt"; W_SHA[$pr]="$sha"; W_HEADREF[$pr]="$headref"; W_BASE[$pr]="$base"
+  if [ "$use" = agy ]; then
+    log "#$pr: Claude is limited until $LIMIT_UNTIL; reviewing with agy"
+    start_agy "$pr"; return 0
+  fi
   pretrust_worktree "$wt"
-  sed -e "s|__PR__|$pr|g" -e "s|__HEADREF__|$headref|g" -e "s|__SHA__|$sha|g" -e "s|__BASE__|$base|g" -e "s|__SENTINEL__|$SENTINEL|g" -e "s|__REPO__|$REPO|g" -e "s|__ADAPTER__|$ADAPTER|g" -e "s|__COMMON__|$COMMON|g" \
-    "$PROMPT_TMPL" > "$prompt"
+  render_prompt "$PROMPT_TMPL" "$prompt" "$pr" "$headref" "$sha" "$base"
+  # Not exec: when claude exits, the pane stays up long enough for the loop to read why.
   {
     echo '#!/usr/bin/env bash'
     printf 'cd %q\n' "$wt"
-    printf 'exec claude --permission-mode auto'
+    printf 'claude --permission-mode auto'
     printf ' --allowedTools'; for t in "${ALLOW_COMMON[@]}"; do printf ' %q' "$t"; done
     if [ "$MODE" = "resolve" ]; then for t in "${ALLOW_RESOLVE[@]}"; do printf ' %q' "$t"; done; fi
     printf ' --disallowedTools'; for t in "${DENY[@]}"; do printf ' %q' "$t"; done
     echo
+    echo 'printf "\nPR_LOOP_WORKER_EXIT=%s\n" "$?"'
+    echo 'exec sleep 600'
   } > "$launch"; chmod +x "$launch"
   tmux new-session -d -s "$sess" -c "$wt" "$launch"
   # wait for the prompt box, then paste the prompt and submit it.
@@ -339,26 +455,79 @@ spawn() { # row
   tmux paste-buffer -b "prloop-$pr" -t "$sess" -d
   sleep 2; tmux send-keys -t "$sess" Enter
   for i in $(seq 1 15); do tmux capture-pane -t "$sess" -p 2>/dev/null | grep -q 'esc to interrupt' && break; sleep 2; done
-  if ! tmux capture-pane -t "$sess" -p 2>/dev/null | grep -q 'esc to interrupt'; then
+  # The nudge Enter must never land on a limit menu: it would choose "Stop and wait".
+  if ! tmux capture-pane -t "$sess" -p 2>/dev/null | grep -q 'esc to interrupt' \
+     && [ "$("$CLASSIFY" "$sess" "$SENTINEL" 40 2>/dev/null | head -1)" != STATE=RATE_LIMITED ]; then
     tmux send-keys -t "$sess" Enter; sleep 5
   fi
-  W_SESS[$pr]="$sess"; W_WT[$pr]="$wt"; W_SHA[$pr]="$sha"; W_HEADREF[$pr]="$headref"; W_START[$pr]="$(date +%s)"; W_STALLS[$pr]=0; W_BLOCKS[$pr]=0
+  W_SESS[$pr]="$sess"; W_PROV[$pr]=claude; W_START[$pr]="$(date +%s)"; W_STALLS[$pr]=0; W_BLOCKS[$pr]=0
   rm -f "$STATE/classify-$sess.state"
   log "#$pr: spawned $sess in $wt at $sha"
 }
 
-finish() { # pr outcome reason
-  local pr="$1" outcome="$2" reason="$3" sess="${W_SESS[$pr]}" wt="${W_WT[$pr]}"
-  tmux kill-session -t "$sess" 2>/dev/null
+finish() { # pr outcome reason [provider output]
+  local pr="$1" outcome="$2" reason="$3" detail="${4:-}" sess="${W_SESS[$pr]}" wt="${W_WT[$pr]}" said=""
+  if [ "${W_PROV[$pr]}" = agy ]; then stop_agy "$pr"; else tmux kill-session -t "$sess" 2>/dev/null; fi
+  [ -n "$detail" ] && printf -v said '\n\n%s said:\n\n```\n%s\n```' "${W_PROV[$pr]}" "$detail"
   case "$outcome" in
     ok)    relabel "$pr" "$CLAIM" "$OK" ;;
     clean) relabel "$pr" "$CLAIM" "$CLEAN" ;;
-    fail)  relabel "$pr" "$CLAIM" "$FAIL"; comment "$pr" "Automated $MODE loop stopped on this PR: $reason. A human needs to look; the loop log on the review host has the detail." ;;
+    fail)  relabel "$pr" "$CLAIM" "$FAIL"; comment "$pr" "Automated $MODE loop stopped on this PR: $reason. A human needs to look; the loop log on the review host has the detail.$said" ;;
+    requeue) relabel "$pr" "$CLAIM" "$TRIGGER"; comment "$pr" "Automated $MODE loop paused on this PR: $reason. It is back at $TRIGGER for a later tick.$said" ;;
   esac
+  rm -f "$wt/$CONTEXT_FILE"
   if git -C "$MAIN" worktree remove "$wt" >/dev/null 2>&1; then :; else log "#$pr: worktree $wt kept (uncommitted changes or busy); inspect and remove by hand"; fi
-  rm -f "$STATE/classify-$sess.state" "$STATE/launch-$MODE-$pr.sh"
+  rm -f "$STATE/classify-$sess.state" "$STATE/launch-$MODE-$pr.sh" "$STATE/agy-$MODE-$pr.rc" "$STATE/agy-$MODE-$pr.prompt" "$STATE/agy-$MODE-$pr.report"
   log "#$pr: $outcome ($reason)"
-  unset "W_SESS[$pr]" "W_WT[$pr]" "W_SHA[$pr]" "W_HEADREF[$pr]" "W_START[$pr]" "W_STALLS[$pr]" "W_BLOCKS[$pr]"
+  [ -n "$detail" ] && printf '%s\n' "$detail" | sed 's/^/    | /' | tee -a "$LOG" >&2
+  unset "W_SESS[$pr]" "W_WT[$pr]" "W_SHA[$pr]" "W_HEADREF[$pr]" "W_BASE[$pr]" "W_PROV[$pr]" "W_PID[$pr]" "W_START[$pr]" "W_STALLS[$pr]" "W_BLOCKS[$pr]"
+}
+
+# A Claude worker hit a usage limit: kill it now (it would sit on the limit menu until
+# WORKER_TIMEOUT), remember the limit so later ticks skip Claude, and hand the review to Agy.
+claude_hit_limit() { # pr
+  local pr="$1" sess="${W_SESS[$pr]}" cap="$STATE/limit-${W_SESS[$pr]}.txt" rec until_iso="an unknown time" source detail
+  tmux capture-pane -t "$sess" -p -S -200 > "$cap" 2>/dev/null
+  tmux kill-session -t "$sess" 2>/dev/null
+  detail="$(text_excerpt "$(tail -n 40 "$cap")")"
+  if rec="$(python3 "$FALLBACK" limit-record --state "$STATE" --provider claude --text-file "$cap" --default-secs "$LIMIT_DEFAULT_SECS")"; then
+    IFS=$'\t' read -r _ until_iso source <<<"$rec"
+    log "#$pr: Claude hit a usage limit; killed $sess; Claude is skipped until $until_iso ($source)"
+  else
+    log "#$pr: Claude hit a usage limit; killed $sess; warning: the limit could not be recorded"
+  fi
+  rm -f "$cap" "$STATE/classify-$sess.state"
+  if [ "$MODE" = resolve ]; then
+    finish "$pr" requeue "Claude hit its usage limit (skipped until $until_iso) and resolve has no fallback provider" "$detail"
+  elif agy_ready; then
+    log "#$pr: falling back to agy"
+    start_agy "$pr"
+  else
+    finish "$pr" fail "Claude hit its usage limit (skipped until $until_iso) and the Agy fallback is unavailable: $AGY_WHY" "$detail"
+  fi
+}
+
+poll_agy() { # pr
+  local pr="$1" run="$STATE/agy-$MODE-$pr" res v
+  if [ ! -f "$run.rc" ]; then
+    # timeout(1) inside start_agy is the real clock; this only catches a wrapper that never returns.
+    if [ $(( $(date +%s) - W_START[$pr] )) -gt $(( WORKER_TIMEOUT + 60 )) ]; then
+      finish "$pr" fail "the Agy fallback review never returned" "$(text_excerpt "$(cat "$run.err" 2>/dev/null)")"
+    fi
+    return
+  fi
+  res="$(python3 "$FALLBACK" agy-result --rc "$(cat "$run.rc")" --stdout "$run.out" --stderr "$run.err" \
+    --sha "${W_SHA[$pr]}" --report-out "$run.report" 2>&1)"
+  if [ "${res%%$'\t'*}" != ok ]; then
+    finish "$pr" fail "Claude is limited and the Agy fallback review failed" "${res#*$'\t'}"; return
+  fi
+  comment "$pr" "$(cat "$run.report")"
+  v="$(verify "$pr")"
+  case "$v" in
+    ok) finish "$pr" ok "verified (agy)" ;;
+    clean) finish "$pr" clean "zero findings (agy)" ;;
+    *) finish "$pr" fail "${v#fail:} (agy)" ;;
+  esac
 }
 
 verify() { # pr -> prints ok|clean|fail:<reason>
@@ -434,25 +603,28 @@ if [ "$DRY_RUN" = "1" ]; then log "DRY: ${#QUEUE[@]} candidate(s), would run up 
 while [ "${#W_SESS[@]}" -gt 0 ]; do
   sleep "$POLL"
   for pr in "${!W_SESS[@]}"; do
+    if [ "${W_PROV[$pr]}" = agy ]; then poll_agy "$pr"; continue; fi
     sess="${W_SESS[$pr]}"
     if ! tmux has-session -t "$sess" 2>/dev/null; then finish "$pr" fail "the worker session disappeared"; continue; fi
-    if [ $(( $(date +%s) - W_START[$pr] )) -gt "$WORKER_TIMEOUT" ]; then finish "$pr" fail "worker exceeded ${WORKER_TIMEOUT}s"; continue; fi
+    if [ $(( $(date +%s) - W_START[$pr] )) -gt "$WORKER_TIMEOUT" ]; then finish "$pr" fail "worker exceeded ${WORKER_TIMEOUT}s" "$(pane_excerpt "$sess")"; continue; fi
     state="$("$CLASSIFY" "$sess" "$SENTINEL" 40 "$STATE/classify-$sess.state" 2>/dev/null | head -1)"
     case "$state" in
       STATE=WORKING) W_STALLS[$pr]=0; W_BLOCKS[$pr]=0 ;;
       STATE=DONE)
         v="$(verify "$pr")"
-        case "$v" in ok) finish "$pr" ok "verified";; clean) finish "$pr" clean "zero findings";; *) finish "$pr" fail "${v#fail:}";; esac ;;
-      STATE=PARKED) finish "$pr" fail "Claude Code is parked on a product dialog (usage limit or login)" ;;
+        case "$v" in ok) finish "$pr" ok "verified";; clean) finish "$pr" clean "zero findings";; *) finish "$pr" fail "${v#fail:}" "$(pane_excerpt "$sess")";; esac ;;
+      STATE=RATE_LIMITED) claude_hit_limit "$pr" ;;
+      STATE=EXITED) finish "$pr" fail "Claude exited before finishing" "$(pane_excerpt "$sess")" ;;
+      STATE=PARKED) finish "$pr" fail "Claude Code is parked on a product dialog (login or setup)" "$(pane_excerpt "$sess")" ;;
       STATE=BLOCKED)
         W_BLOCKS[$pr]=$(( W_BLOCKS[$pr] + 1 ))
-        [ "${W_BLOCKS[$pr]}" -ge 3 ] && finish "$pr" fail "worker is waiting on a permission prompt the loop will not answer" ;;
+        [ "${W_BLOCKS[$pr]}" -ge 3 ] && finish "$pr" fail "worker is waiting on a prompt or menu the loop will not answer" "$(pane_excerpt "$sess")" ;;
       STATE=STALLED)
         W_STALLS[$pr]=$(( W_STALLS[$pr] + 1 ))
         if [ "${W_STALLS[$pr]}" -eq 1 ]; then
           tmux send-keys -t "$sess" "continue - finish the task, then print $SENTINEL on its own line"; sleep 1; tmux send-keys -t "$sess" Enter
           log "#$pr: nudged"
-        else finish "$pr" fail "worker stalled twice"; fi ;;
+        else finish "$pr" fail "worker stalled twice" "$(pane_excerpt "$sess")"; fi ;;
       *) : ;;
     esac
   done
