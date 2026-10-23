@@ -143,7 +143,12 @@ claim_provider="$(python3 "$STUB_CLAIMREC" show --repo "$STUB_REPO" --pr "$STUB_
   echo "SID=$(ps -o sid= -p $$ | tr -d ' ')"
   echo "CLAIM_PROVIDER=$claim_provider"
   echo "REPORT=$report"
-  [ -f "$PWD/.cursor/cli.json" ] && echo "CURSOR_CLI_JSON=present"
+  [ -f "$PWD/.cursor/cli.json" ] && echo "CURSOR_CLI_JSON=present" && python3 -c '
+import json, sys
+perms = json.load(open(sys.argv[1]))["permissions"]
+for kind in ("allow", "deny"):
+    for rule in perms[kind]:
+        print(f"CURSOR_{kind.upper()} {rule}")' "$PWD/.cursor/cli.json"
   [ -f "$PWD/.agent-pool-context.md" ] && echo "CONTEXT_DIFF_LINES=$(grep -c '^+change' "$PWD/.agent-pool-context.md")"
 } >> "$STUB_CALLS/$name.log"
 behave="$(cat "$STUB_BEHAVE/$name" 2>/dev/null || echo ok)"
@@ -454,6 +459,42 @@ expect "and the controller pushes to exactly that branch" "$(git --git-dir "$ORI
 expect "and the job is done" "$(labels)" "agent:done"
 
 echo
+echo "commit rules: resolve may commit only with git commit -m (no --trailer, #29), review may not commit at all"
+claude_allows() { calls claude | sed -n '/^ARG --allowedTools$/,/^ARG --disallowedTools$/p'; }
+claude_denies() { calls claude | sed -n '/^ARG --disallowedTools$/,/^[^A]/p'; }
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave cursor-agent resolve-fix
+PROVIDER_ORDER=cursor tick
+expect_not "cursor resolve cli.json does not allow git commit --trailer" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git commit --trailer"
+expect "cursor resolve cli.json still allows git commit -m" "$(calls cursor-agent)" "CURSOR_ALLOW Shell(git commit -m)"
+for rule in 'git push' 'git push --force' 'git commit -a' 'git commit --all' 'git commit --amend' 'git commit -F' 'git commit --file'; do
+  expect "cursor resolve cli.json still denies $rule" "$(calls cursor-agent)" "CURSOR_DENY Shell($rule)"
+done
+expect_not "cursor resolve cli.json allows no push" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git push"
+expect "a commit from cursor is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "and the resolve is done" "$(labels)" "agent:done"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix
+tick
+expect_not "claude resolve does not allow git commit --trailer" "$(claude_allows)" "git commit --trailer"
+expect "claude resolve still allows git commit -m" "$(claude_allows)" "ARG Bash(git commit -m *)"
+expect_not "claude resolve allows no push" "$(claude_allows)" "git push"
+for rule in 'git push*' 'git push --force*' 'git commit -a*' 'git commit --amend*' 'git commit -F*' 'git commit *--file*'; do
+  expect "claude resolve still denies $rule" "$(claude_denies)" "ARG Bash($rule)"
+done
+expect "a commit from claude is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+reset '["agent:ready"]'
+behave cursor-agent ok
+PROVIDER_ORDER=cursor tick
+expect_not "cursor review cli.json does not allow git commit --trailer" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git commit"
+expect "cursor review cli.json denies git commit" "$(calls cursor-agent)" "CURSOR_DENY Shell(git commit)"
+reset '["agent:ready"]'
+behave claude ok
+tick
+expect_not "claude review does not allow git commit --trailer" "$(claude_allows)" "git commit"
+expect "claude review denies git commit" "$(claude_denies)" "ARG Bash(git commit*)"
+
+echo
 echo "fencing: a superseded attempt publishes nothing and its process group dies"
 reset '["agent:ready"]'
 behave claude steal
@@ -722,6 +763,7 @@ expect "codex adapter shape" "$(calls codex | tr '\n' ' ')" "ARG exec ARG --ephe
 echo
 echo "prompts"
 expect "the generic resolve prompt names files to stage" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "git add path/to/first/file"
+expect "the generic resolve prompt puts Refs: #N in the -m message, not a --trailer" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "end the -m message with a Refs: #N line"
 expect "G5: the resolve prompt has the final-response fallback" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "If you cannot write files, make the complete report your final response instead"
 expect "L3: the resolve count covers only the review's numbered findings" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "thread replies are never counted"
 expect "L3: thread replies are listed separately" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "list Thread replies"

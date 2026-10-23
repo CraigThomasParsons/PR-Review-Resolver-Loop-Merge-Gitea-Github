@@ -42,8 +42,11 @@ An alternate form of this I would like to enable are long living feature branche
 - `scripts/tools/`: the entry points TheNightCrew's client requires for every repository it
   serves. `night_shift.sh <project_dir> <issue> [agent]` is the issue executor, Cursor only:
   the launcher is the controller, so it prepares the worktree, runs `cursor-agent` under a
-  generated `.cursor/cli.json`, then pushes, opens an unmerged PR and writes the task receipt.
-  The worker never publishes. `night_shift_maintenance.sh <project_dir> quality` runs the
+  generated edit-only `.cursor/cli.json` (no `git add`, `git commit` or `git push`), runs the
+  offline suites on the edits, commits them itself with `Agent-Pool-Agent`/`Agent-Pool-Provider`
+  trailers, then pushes, opens an unmerged PR and writes the task receipt. No diff or a failing
+  suite commits nothing, exits 1 and is recorded in `logs/runs/issue-<n>-state.json`.
+  The worker never commits or publishes. `night_shift_maintenance.sh <project_dir> quality` runs the
   offline verify suites (closed allowlist). `night_shift_gitea.py` makes the launcher's
   Gitea calls. See #18.
 - `skills/pr-merge-loop/` — a **third, deliberately separate, mechanical**
