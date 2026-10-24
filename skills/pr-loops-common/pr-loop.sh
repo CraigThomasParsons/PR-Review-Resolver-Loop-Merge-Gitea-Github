@@ -54,7 +54,8 @@
 #                      0 turns it off. The handoff only moves TRIGGER -> agent:ready; the pool's
 #                      prods pick a provider that is not cooling down, and pr-merge.sh already
 #                      merges on agent:done.
-#   PR_LOOP_POOL_ROOT  the checkout holding agent-pool/ (default: two levels above COMMON's real path)
+#   PR_LOOP_POOL_ROOT  the checkout holding agent-pool/ (default: the "source" in COMMON/.deployed-from,
+#                      else two levels above COMMON's real path)
 #
 # Exit codes: 0 always for a normal tick (including "nothing to do"); 2 for a setup fault.
 
@@ -242,7 +243,15 @@ fi
 # cooling down, so a limited Claude no longer stalls review or resolve here. When it owns this
 # repo for MODE, this loop only queues: it never spawns a worker beside a pool claim.
 POOL_MODE="${PR_LOOP_POOL:-auto}"
-POOL_ROOT="${PR_LOOP_POOL_ROOT:-$(cd -- "$(readlink -f -- "$COMMON")/../.." 2>/dev/null && pwd)}"
+# A deployed copy (install.sh) is a plain directory under ~/.claude/skills with no agent-pool/
+# beside it, so prefer the checkout its .deployed-from names; a checkout or symlink falls back to
+# two levels above COMMON's real path.
+POOL_ROOT="${PR_LOOP_POOL_ROOT:-}"
+if [ -z "$POOL_ROOT" ]; then
+  POOL_ROOT="$(awk '$1=="source" {sub(/^source /, ""); print; exit}' "$COMMON/.deployed-from" 2>/dev/null || true)"
+  [ -n "$POOL_ROOT" ] && [ -f "$POOL_ROOT/agent-pool/scripts/repoconfig.py" ] \
+    || POOL_ROOT="$(cd -- "$(readlink -f -- "$COMMON")/../.." 2>/dev/null && pwd)"
+fi
 pool_owns_repo() {
   case "$POOL_MODE" in 1|on|yes|true) return 0 ;; 0|off|no|false) return 1 ;; esac
   local cfg="$POOL_ROOT/agent-pool/scripts/repoconfig.py" p ab
@@ -309,15 +318,6 @@ for row in "${CANDIDATES[@]}"; do
 done
 if [ "${#QUEUE[@]}" -eq 0 ]; then log "nothing to do after skips"; exit 0; fi
 
-# ---------------------------------------------------------------- workers
-# W_SESS is every live worker's name (a tmux session for claude); W_PROV says which provider it is.
-# Assigned empty, not just declared: under set -u, ${#W_SESS[@]} of a declared-only array is unbound.
-declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=()
-spawned=0
-
-# Mark a worktree path trusted in ~/.claude.json so Claude Code skips the
-# "I trust this folder" dialog (default No/exit) that otherwise kills the pane
-# and produces a false review:needs-human. Claude stores trust per exact path;
 # The handoff runs on QUEUE, after the marker checks, so an already-reviewed head is not handed
 # to the pool and stale findings still go back to review:requested first.
 if pool_owns_repo; then
@@ -333,6 +333,15 @@ if pool_owns_repo; then
   exit 0
 fi
 
+# ---------------------------------------------------------------- workers
+# W_SESS is every live worker's name (a tmux session for claude); W_PROV says which provider it is.
+# Assigned empty, not just declared: under set -u, ${#W_SESS[@]} of a declared-only array is unbound.
+declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=()
+spawned=0
+
+# Mark a worktree path trusted in ~/.claude.json so Claude Code skips the
+# "I trust this folder" dialog (default No/exit) that otherwise kills the pane
+# and produces a false review:needs-human. Claude stores trust per exact path;
 # trusting the parent WT_ROOT alone is not enough for a new prloop-* worktree.
 pretrust_worktree() {
   local wt="$1"
