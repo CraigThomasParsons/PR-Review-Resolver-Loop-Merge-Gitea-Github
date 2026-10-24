@@ -253,19 +253,6 @@ pool_owns_repo() {
   done
   return 1
 }
-if pool_owns_repo; then
-  for row in "${CANDIDATES[@]}"; do
-    IFS=$'\t' read -r pr _ sha _ <<<"$row"
-    if [ "$DRY_RUN" = "1" ]; then log "DRY: #$pr would hand off to the agent pool ($TRIGGER -> agent:ready) at $sha"; continue; fi
-    if python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" --add agent:ready >/dev/null 2>&1; then
-      log "#$pr: handed off to the agent pool ($TRIGGER -> agent:ready) at $sha"
-    else
-      log "warning: hand-off of #$pr to the agent pool failed; it stays at $TRIGGER"
-    fi
-  done
-  exit 0
-fi
-
 relabel() { # pr from to
   if [ "$DRY_RUN" = "1" ]; then log "DRY: #$1 $2 -> $3"; return 0; fi
   python3 "$ADAPTER" label --repo "$REPO" --pr "$1" --remove "$2" --add "$3" >/dev/null 2>&1 || log "warning: relabel #$1 $2 -> $3 failed"
@@ -331,6 +318,21 @@ spawned=0
 # Mark a worktree path trusted in ~/.claude.json so Claude Code skips the
 # "I trust this folder" dialog (default No/exit) that otherwise kills the pane
 # and produces a false review:needs-human. Claude stores trust per exact path;
+# The handoff runs on QUEUE, after the marker checks, so an already-reviewed head is not handed
+# to the pool and stale findings still go back to review:requested first.
+if pool_owns_repo; then
+  for row in "${QUEUE[@]}"; do
+    IFS=$'\t' read -r pr _ sha _ <<<"$row"
+    if [ "$DRY_RUN" = "1" ]; then log "DRY: #$pr would hand off to the agent pool ($TRIGGER -> agent:ready) at $sha"; continue; fi
+    if python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" --add agent:ready >/dev/null 2>&1; then
+      log "#$pr: handed off to the agent pool ($TRIGGER -> agent:ready) at $sha"
+    else
+      log "warning: hand-off of #$pr to the agent pool failed; it stays at $TRIGGER"
+    fi
+  done
+  exit 0
+fi
+
 # trusting the parent WT_ROOT alone is not enough for a new prloop-* worktree.
 pretrust_worktree() {
   local wt="$1"
