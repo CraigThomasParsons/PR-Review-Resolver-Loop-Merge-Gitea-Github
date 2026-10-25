@@ -25,11 +25,15 @@
 # deadline is requeued and its provider cooled down, a claimed label with no record goes to
 # agent:needs-human, and a record with no claimed label is dropped.
 #
-# Workers never publish. They read, edit and commit in a detached worktree and write a report
-# file (or, when they cannot write files, end with the report as their final response). The
-# controller then checks the claim is still held, validates the report's marker, pushes
-# HEAD:refs/heads/<headref> as a fast-forward (never a protected branch, never a + refspec) and
-# posts the report, all through the claim guard. Workers run in their own process group
+# Workers never publish and never commit. They read and edit a detached worktree and write a
+# report file (or, when they cannot write files, end with the report as their final response).
+# The controller then checks the claim is still held, validates the report's marker, builds one
+# SSH-signed commit from the worktree's changes with Agent-Pool-* trailers (controller_commit,
+# docs/plans/controller-commits-everything.md), gates it, stamps its SHA into the report's
+# head=pending marker, pushes it to refs/heads/<headref> as a fast-forward (never a protected
+# branch, never a + refspec) and posts the report, all through the claim guard. With no usable
+# signing key (AGENT_POOL_SIGNING_KEY) resolve jobs are a setup fault [signing] and are not
+# claimed; nothing is ever committed unsigned. Workers run in their own process group
 # (setsid) with remote.origin.pushurl overridden to a dead path, and a read-only watcher kills
 # the whole group as soon as the claim is superseded.
 #
@@ -99,6 +103,12 @@
 #   AGENT_POOL_GATES_DIR           controller-owned manifest overrides (~/.config/agent-pool/gates)
 #   AGENT_POOL_GATE_RO_BINDS       colon list of toolchain dirs bound read-only into the gate sandbox
 #   AGENT_POOL_GATE_SANDBOX AGENT_POOL_GATE_SCOPE   bwrap and systemd-run paths (default: /usr/bin)
+#   AGENT_POOL_SIGNING_KEY (required for resolve)  absolute path of the controller-only,
+#                                  passphrase-less SSH private key (mode 0600) every controller
+#                                  commit is signed with (gpg.format=ssh); setup and rotation in
+#                                  docs/agent-pool-commit-signing.md
+#   AGENT_POOL_GIT_NAME=agent-pool AGENT_POOL_GIT_EMAIL=agent-pool@localhost   the controller
+#                                  commits' author and committer (use the bot account's email)
 #   AGENT_POOL_ABILITIES           comma list of the abilities this repo grants (plan, review,
 #                                  prototype, test-author, resolve); a job kind runs only if its
 #                                  ability is listed, and agy never resolves, AGY_AUTO_APPROVE or
@@ -113,8 +123,8 @@
 #
 # Gates (scripts/gates.py, docs/plans/controller-gates.md): workers run no gate. After a resolve
 # worker has exited and before anything is pushed, the controller loads the gate manifest from
-# the PR's base branch by blob (or a controller-owned override), refuses commits that change
-# gate-defining files, checks the worker's commit out by SHA into a fresh directory with no
+# the PR's base branch by blob (or a controller-owned override), refuses changes to
+# gate-defining files, checks the controller's signed commit out by SHA into a fresh directory with no
 # .git, and runs the selected gates there in a sandbox with no network, home, ssh agent or
 # tokens. The result is a write-once receipt bound to the attempt and the exact head; the push
 # goes ahead only for a receipt that passed. A red gate is a needs-human with nothing pushed; a
@@ -236,6 +246,10 @@ ABILITIES_SET=0; ABILITIES=""
 if [ -n "${AGENT_POOL_ABILITIES+x}" ]; then ABILITIES_SET=1; ABILITIES="$AGENT_POOL_ABILITIES"; fi
 NOPUSH_URL="/nonexistent/agent-pool-workers-never-push"
 CONTEXT_FILE=".agent-pool-context.md"
+SIGNING_KEY="${AGENT_POOL_SIGNING_KEY:-}"
+GIT_NAME="${AGENT_POOL_GIT_NAME:-agent-pool}"
+GIT_EMAIL="${AGENT_POOL_GIT_EMAIL:-agent-pool@localhost}"
+SIGNING_WHY=""; SIGNING_CHECKED=0
 
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 CURSOR_AGENT_BIN="${CURSOR_AGENT_BIN:-$HOME/.local/bin/cursor-agent}"
@@ -320,6 +334,15 @@ job_providers() { # job
   # Another provider would only hit the same broken sandbox after a full WORKER_TIMEOUT.
   if [ "$1" = resolve ] && [ -e "$STATE/faults/gates.json" ]; then
     log "$REPO: resolve jobs are paused: the gate sandbox has a recorded fault ($STATE/faults/gates.json); fix it, then delete that file"
+    return 0
+  fi
+  # Checked once per tick, before any claim: a resolve's work could never be committed.
+  if [ "$1" = resolve ] && [ "$SIGNING_CHECKED" = 0 ]; then
+    SIGNING_CHECKED=1; SIGNING_WHY="$(signing_problem)"
+    [ -n "$SIGNING_WHY" ] && setup_fault signing "$SIGNING_WHY"
+  fi
+  if [ "$1" = resolve ] && [ -n "$SIGNING_WHY" ]; then
+    log "$REPO: resolve jobs are paused: the controller cannot sign commits ($SIGNING_WHY)"
     return 0
   fi
   for p in "${PROVIDERS[@]}"; do
@@ -573,7 +596,7 @@ end_job() {
   kill_worker_group; watch_stop
   remove_worktree "$JOB_WT"
   gate_cleanup
-  rm -f "$JOB_LOSTFILE"
+  rm -f "$JOB_LOSTFILE" "$RUNS/index-$JOB_PR-${ATTEMPT:0:8}"
   JOB_PR=""; ATTEMPT=""; JOB_KIND=""; JOB_WT=""; JOB_LOST=0; JOB_LOSTFILE=""
 }
 
@@ -610,15 +633,38 @@ MAIN_GITDIR=""; MAIN_CONFIG_SUM=""; GATE_DIR=""; GATE_RECEIPT=""
 # tick's env, no global or system config (aliases, filters, textconv, insteadOf), no hooks, no
 # replace refs or grafts. MAIN's own config is the only one read; it is controller-owned and its
 # checksum is re-checked before the checkout and before the push.
-gate_git() { # [GIT_INDEX_FILE=path] git-args...
-  local idx=()
-  case "${1:-}" in GIT_INDEX_FILE=*) idx=("$1"); shift ;; esac
+gate_git() { # [GIT_INDEX_FILE=path] [GIT_AUTHOR_*=v] [GIT_COMMITTER_*=v] git-args...
+  local pre=()
+  while :; do
+    case "${1:-}" in
+      GIT_INDEX_FILE=*|GIT_AUTHOR_NAME=*|GIT_AUTHOR_EMAIL=*|GIT_COMMITTER_NAME=*|GIT_COMMITTER_EMAIL=*) pre+=("$1"); shift ;;
+      *) break ;;
+    esac
+  done
   env -i PATH=/usr/bin:/bin HOME="$STATE/empty-home" LANG=C.UTF-8 \
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_DIR="$MAIN_GITDIR" \
-    GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null GIT_TERMINAL_PROMPT=0 "${idx[@]}" \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null GIT_TERMINAL_PROMPT=0 "${pre[@]}" \
     git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false \
       -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false \
       -c core.symlinks=true -c core.autocrlf=false "$@"
+}
+
+# gate_git_signed git-args...: gate_git as the controller's identity, signing with its SSH key
+# file. env -i leaves no SSH_AUTH_SOCK, so ssh-keygen reads only that file, never an agent.
+gate_git_signed() {
+  gate_git "GIT_AUTHOR_NAME=$GIT_NAME" "GIT_AUTHOR_EMAIL=$GIT_EMAIL" "GIT_COMMITTER_NAME=$GIT_NAME" \
+    "GIT_COMMITTER_EMAIL=$GIT_EMAIL" -c gpg.format=ssh -c gpg.ssh.program=ssh-keygen \
+    -c user.signingkey="$SIGNING_KEY" "$@"
+}
+
+# signing_problem -> why the controller cannot sign a commit, or nothing when it can. ssh-keygen's
+# output (the public key) and errors are discarded; nothing here prints key material.
+signing_problem() {
+  [ -n "$SIGNING_KEY" ] || { echo "no commit signing key is configured: set AGENT_POOL_SIGNING_KEY (see docs/agent-pool-commit-signing.md)"; return; }
+  case "$SIGNING_KEY" in /*) ;; *) echo "AGENT_POOL_SIGNING_KEY ($SIGNING_KEY) is not an absolute path"; return ;; esac
+  [ -f "$SIGNING_KEY" ] && [ -r "$SIGNING_KEY" ] || { echo "the signing key $SIGNING_KEY is missing or unreadable"; return; }
+  env -i PATH=/usr/bin:/bin ssh-keygen -y -P "" -f "$SIGNING_KEY" >/dev/null 2>&1 \
+    || echo "the signing key $SIGNING_KEY is not a passphrase-less SSH private key readable only by its owner"
 }
 
 gate_config_intact() {
@@ -673,9 +719,9 @@ run_gates() {
   run="$RUNS/gates-run-$tag.json"; GATE_RECEIPT=""
   gate_config_intact || { PUB="gateinfra:the main clone's git config changed during the job; refusing to gate or push"; return 1; }
   [ "$(gate_git rev-parse --verify -q "$newhead^{commit}")" = "$newhead" ] \
-    || { PUB="gateinfra:the worker's head $newhead is not a commit in the main clone"; return 1; }
+    || { PUB="gateinfra:the candidate $newhead is not a commit in the main clone"; return 1; }
   gate_git merge-base --is-ancestor "$sha" "$newhead" 2>/dev/null \
-    || { PUB="fail:the worker's commits at $newhead are not a fast-forward of $sha"; return 1; }
+    || { PUB="fail:the candidate commit $newhead is not a fast-forward of $sha"; return 1; }
   base_sha="$(gate_git rev-parse --verify -q "refs/remotes/origin/$base^{commit}")" \
     || { PUB="gateinfra:cannot resolve origin/$base in the main clone"; return 1; }
   if ! python3 "$SCRIPTS/gates.py" load --main "$MAIN" --base-sha "$base_sha" --repo "$REPO" > "$manifest" 2>"$raw.err"; then
@@ -689,7 +735,7 @@ run_gates() {
   hits="$(python3 "$SCRIPTS/gates.py" protected --manifest "$manifest" --changed "$raw.changed" --gitlinks "$raw.gitlinks")" \
     || { PUB="gateinfra:could not check the worker's changes against the protected paths"; return 1; }
   if [ "$hits" != none ]; then
-    why="the worker's commits change gate-defining files ($(printf '%s\n' "$hits" | head -5 | tr '\n' ' ' | sed 's/ $//')); a human must review them"
+    why="the worker's edits change gate-defining files ($(printf '%s\n' "$hits" | head -5 | tr '\n' ' ' | sed 's/ $//')); a human must review them"
     gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" protected "$why"
     PUB="fail:$why"; return 1
   fi
@@ -743,12 +789,99 @@ print(d.get("result") or "infra", (d.get("reason") or "-").replace("\t", " ").re
   esac
 }
 
+# ---------------------------------------------------------------- controller commits
+# Never committed, whatever a worker leaves: the pool's own tool configuration and context file.
+COMMIT_IGNORED=(".cursor/*" ".grok/*" ".claude/*" "$CONTEXT_FILE")
+# Credential-shaped file names (AGENTS.md's pre-commit check, plus ssh key names): refused.
+CREDENTIAL_PATHS='/\.env(\.[^/]*)?$|gitea_token|/id_(rsa|ecdsa|ed25519)[^/]*$|\.pem$|/\.netrc$|/\.git-credentials$'
+
+# controller_commit provider ability sha base report refuse -> 0 with NEWHEAD, else 1 with PUB
+# set (fail:<why>, gateinfra:<why>, signinfra:<why> or lost). The one commit per ability run.
+# It runs after the worker's process group is dead and the claim re-checked, and reads the
+# worktree's changes against sha through a private index of the main clone; it never runs git
+# inside the worktree, whose .git, config and hooks are the worker's. NEWHEAD is sha when the
+# worker changed nothing; otherwise a commit object with sha as its only parent, signed with the
+# controller's SSH key, carrying the Agent-Pool-* trailers, that passed the gates. No ref is
+# updated: publish pushes the object by SHA. A non-empty `refuse` says why the worker's marker
+# allows no commit; any change then fails the run instead.
+controller_commit() {
+  local p="$1" ability="$2" sha="$3" base="$4" report="$5" refuse="$6" tag idx list msg scan f tree subject why obj
+  local keep=() creds=() nested=() pat skip
+  NEWHEAD=""
+  case "$ability" in
+    resolve) ;;
+    *) PUB="fail:the controller has no commit path for the $ability ability yet"; return 1 ;;
+  esac
+  tag="$JOB_PR-${ATTEMPT:0:8}"; idx="$RUNS/index-$tag"; list="$RUNS/changes-$tag"
+  msg="$RUNS/commit-msg-$tag"; scan="$RUNS/commit-scan-$tag"
+  gate_config_intact || { PUB="gateinfra:the main clone's git config changed during the job; refusing to commit or push"; return 1; }
+  rm -f "$idx" "$list" "$msg" "$scan"
+  # The private index starts as sha's tree with no stat data; the refresh hashes the worktree
+  # once, so diff-files then lists real content changes only.
+  if ! gate_git "GIT_INDEX_FILE=$idx" read-tree "$sha" \
+     || ! ( cd "$JOB_WT" || exit 1
+            gate_git "GIT_INDEX_FILE=$idx" --work-tree="$JOB_WT" update-index -q --refresh >/dev/null 2>&1
+            gate_git "GIT_INDEX_FILE=$idx" --work-tree="$JOB_WT" diff-files -z --name-only \
+              && gate_git "GIT_INDEX_FILE=$idx" --work-tree="$JOB_WT" ls-files -z --others --exclude-standard ) > "$list"; then
+    rm -f "$idx" "$list"; PUB="gateinfra:could not list the worker's changes against $sha"; return 1
+  fi
+  while IFS= read -r -d '' f; do
+    skip=0
+    for pat in "${COMMIT_IGNORED[@]}"; do [[ "$f" == $pat ]] && skip=1; done
+    [ "$skip" = 1 ] && continue
+    # ls-files shows a nested repository as one entry with a trailing slash.
+    case "$f" in */) nested+=("$f"); continue ;; esac
+    [[ "/$f" =~ $CREDENTIAL_PATHS ]] && creds+=("$f")
+    keep+=("$f")
+  done < "$list"
+  rm -f "$list"
+  if [ "${#nested[@]}" -gt 0 ]; then
+    rm -f "$idx"; PUB="fail:the worker left a nested git repository (${nested[0]}); refusing to commit it"; return 1
+  fi
+  if [ "${#creds[@]}" -gt 0 ]; then
+    rm -f "$idx"
+    PUB="fail:the worker's changes include credential-named files ($(printf '%s ' "${creds[@]:0:3}" | sed 's/ $//')); refusing to commit or push"
+    return 1
+  fi
+  if [ "${#keep[@]}" -eq 0 ]; then rm -f "$idx"; NEWHEAD="$sha"; return 0; fi
+  if ! printf '%s\0' "${keep[@]}" | ( cd "$JOB_WT" && gate_git "GIT_INDEX_FILE=$idx" --literal-pathspecs \
+         --work-tree="$JOB_WT" add --pathspec-from-file=- --pathspec-file-nul ) >/dev/null 2>>"$LOG" \
+     || ! tree="$(gate_git "GIT_INDEX_FILE=$idx" write-tree)"; then
+    rm -f "$idx"; PUB="gateinfra:could not stage the worker's changes into the controller's index"; return 1
+  fi
+  rm -f "$idx"
+  if [ "$tree" = "$(gate_git rev-parse "$sha^{tree}")" ]; then NEWHEAD="$sha"; return 0; fi
+  if [ -n "$refuse" ]; then PUB="fail:the worker changed ${#keep[@]} file(s) but $refuse"; return 1; fi
+
+  subject="$(python3 "$SCRIPTS/report.py" summary --file "$report" --fallback "chore($ability): automated $ability for #$JOB_PR")"
+  printf '%s\n\nAgent-Pool-Provider: %s\nAgent-Pool-Ability: %s\nAgent-Pool-Worker: %s\nAgent-Pool-Attempt: %s\nAgent-Pool-Model: %s\n' \
+    "$subject" "$p" "$ability" "$WORKER_ID" "$ATTEMPT" "$(model_for "$p" | sed 's/^$/default/')" > "$msg"
+  # The message and every added line go public with the push; nothing secret may ride along.
+  { cat "$msg"; gate_git diff-tree -p --no-ext-diff --no-textconv "$sha" "$tree" | grep '^+' | grep -v '^+++ '; } \
+    > "$scan" 2>/dev/null
+  if ! python3 "$SCRIPTS/report.py" scan --file "$scan" >/dev/null; then
+    rm -f "$msg" "$scan"; PUB="fail:the worker's changes contain a credential or token-shaped string; refusing to commit or push"; return 1
+  fi
+  rm -f "$scan"
+  why="$(signing_problem)"
+  [ -z "$why" ] || { rm -f "$msg"; PUB="signinfra:$why"; return 1; }
+  gate_config_intact || { rm -f "$msg"; PUB="gateinfra:the main clone's git config changed during the job; refusing to commit or push"; return 1; }
+  NEWHEAD="$(gate_git_signed commit-tree "$tree" -p "$sha" -S -F "$msg" 2>>"$LOG")"
+  rm -f "$msg"
+  obj="$(gate_git cat-file commit "$NEWHEAD" 2>/dev/null)"
+  if [[ ! "$NEWHEAD" =~ ^[0-9a-f]{40}$ ]] || [[ "$obj" != *$'\ngpgsig -----BEGIN SSH SIGNATURE-----'* ]]; then
+    NEWHEAD=""; PUB="signinfra:git could not make an SSH-signed commit with $SIGNING_KEY (see $LOG)"; return 1
+  fi
+  jlog "committed $sha..$NEWHEAD for $p ($ability, ${#keep[@]} path(s), signed)"
+  run_gates "$p" "$sha" "$NEWHEAD" "$base"
+}
+
 # ---------------------------------------------------------------- controller-side publication
 # publish provider sha headref report result base -> PUB: published | nomarker:<why> |
-# requeue:<why> | fail:<why> | gateinfra:<why> | lost. The only path by which a worker's work
-# reaches Gitea.
+# requeue:<why> | fail:<why> | gateinfra:<why> | signinfra:<why> | lost. The only path by which
+# a worker's work reaches Gitea.
 publish() {
-  local p="$1" sha="$2" headref="$3" report="$4" result="$5" base="$6" chk alt head fixed newhead remote rc tool scan
+  local p="$1" sha="$2" headref="$3" report="$4" result="$5" base="$6" chk alt head fixed newhead remote rc refuse
   local args=(--marker-module "$MARKER")
   PUSHED=""
   if [ "$JOB_KIND" = review ]; then args+=(--sha "$sha")
@@ -765,28 +898,26 @@ publish() {
   esac
   IFS=$'\t' read -r _ head fixed <<<"$chk"
   if [ "$JOB_KIND" = resolve ]; then
+    case "$head" in
+      pending|"$sha") ;;
+      *) PUB="fail:the resolve marker names head $head; workers never commit, so it must be head=pending (or $sha when nothing changed)"; return ;;
+    esac
     newhead="$(worker_head "$JOB_WT")" || { PUB="fail:could not read the worker's HEAD through the main clone"; return; }
-    if [ "$head" != "$newhead" ]; then PUB="fail:the resolve marker names head $head but the worker's worktree is at $newhead"; return; fi
-    if [ "$newhead" != "$sha" ] && [ "${fixed:-0}" -eq 0 ]; then
-      PUB="fail:the worker committed on top of $sha but its marker claims no fixes"; return
+    if [ "$newhead" != "$sha" ]; then
+      PUB="fail:the worker moved its worktree's HEAD from $sha to $newhead; workers never commit (the controller does), so nothing was pushed"
+      return
+    fi
+    headref_safe "$headref" || { PUB="fail:refusing to push to '$headref'"; return; }
+    refuse=""
+    if [ "${fixed:-0}" -eq 0 ]; then refuse="its marker claims no fixes"
+    elif [ "$head" != pending ]; then refuse="its marker says head=$sha, not head=pending"; fi
+    controller_commit "$p" resolve "$sha" "$base" "$report" "$refuse" || return
+    newhead="$NEWHEAD"
+    if [ "$head" = pending ]; then
+      python3 "$SCRIPTS/report.py" stamp-head --file "$report" --head "$newhead" >/dev/null 2>>"$LOG" \
+        || { PUB="fail:could not stamp head $newhead into the resolve report"; return; }
     fi
     if [ "$newhead" != "$sha" ]; then
-      headref_safe "$headref" || { PUB="fail:refusing to push to '$headref'"; return; }
-      git -C "$MAIN" merge-base --is-ancestor "$sha" "$newhead" 2>/dev/null \
-        || { PUB="fail:the worker's commits at $newhead are not a fast-forward of $sha"; return; }
-      tool="$(git -C "$MAIN" diff --name-only "$sha" "$newhead" 2>/dev/null \
-        | grep -E "(^|/)\.(cursor|grok|claude)/|(^|/)${CONTEXT_FILE//./\\.}\$" | head -3 | tr '\n' ' ')"
-      [ -z "$tool" ] || { PUB="fail:the worker's commits touch agent tool configuration (${tool% }); refusing to push"; return; }
-      # Commit messages and added lines go public with the push; nothing secret may ride along.
-      scan="$RUNS/push-scan-$JOB_PR-${ATTEMPT:0:8}.txt"
-      { git -C "$MAIN" log --format=%B "$sha..$newhead"; git -C "$MAIN" diff "$sha" "$newhead" | grep '^+' | grep -v '^+++ '; } \
-        > "$scan" 2>/dev/null
-      if ! python3 "$SCRIPTS/report.py" scan --file "$scan" >/dev/null; then
-        rm -f "$scan"
-        PUB="fail:the worker's commits contain a credential or token-shaped string; refusing to push"; return
-      fi
-      rm -f "$scan"
-      run_gates "$p" "$sha" "$newhead" "$base" || return
       remote="$(git -C "$MAIN" ls-remote origin "refs/heads/$headref" 2>/dev/null | cut -f1)"
       [ "$remote" = "$sha" ] || { PUB="requeue:origin/$headref is at ${remote:-nothing}, not $sha; the branch moved during the run"; return; }
       gate_config_intact || { PUB="gateinfra:the main clone's git config changed before the push; refusing to push"; return; }
@@ -814,7 +945,9 @@ prepare_worktree() { # sha headref -> JOB_WT
   JOB_WT="$(wt_for "$CURRENT_PROVIDER")"
   git -C "$MAIN" fetch origin --quiet "refs/heads/$2" 2>/dev/null || { jlog "fetch $2 failed"; return 1; }
   [ -d "$JOB_WT" ] && git -C "$MAIN" worktree remove --force "$JOB_WT" >/dev/null 2>&1
-  git -C "$MAIN" worktree add --detach "$JOB_WT" "$1" >/dev/null 2>&1 || { jlog "worktree add failed"; return 1; }
+  # Checked out by gate_git, as controller_commit reads it back: no global or env filter (lfs
+  # smudge included) may rewrite a file the worker never touched into a change the controller commits.
+  gate_git worktree add --detach "$JOB_WT" "$1" >/dev/null 2>&1 || { jlog "worktree add failed"; return 1; }
   exclude_tool_config "$JOB_WT"
 }
 
@@ -876,6 +1009,9 @@ attempt() {
     gateinfra:*)
       setup_fault gates "${PUB#*:}"
       VERDICT=requeue; DETAIL="the controller's gate run could not complete (${PUB#*:})"; return ;;
+    signinfra:*)
+      setup_fault signing "${PUB#*:}"
+      VERDICT=requeue; DETAIL="the controller could not sign the commit (${PUB#*:})"; return ;;
     published)  v="$(verify "$JOB_KIND" "$JOB_PR" "$sha" "$headref" "$PUSHED")" ;;
     nomarker:*) v="fail-nomarker:${PUB#*:}" ;;
     *)          v="$PUB" ;;
@@ -1003,6 +1139,7 @@ git -C "$MAIN" fetch origin --quiet --prune 2>/dev/null || log "warning: fetch f
 MAIN_GITDIR="$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
   || die "cannot find the git directory of $MAIN"
 MAIN_CONFIG_SUM="$(sha256sum < "$MAIN_GITDIR/config")" || die "cannot read $MAIN_GITDIR/config"
+mkdir -p "$STATE/empty-home"
 
 # Candidates carry agent:ready or agent:claimed, or have a claim record here to reconcile.
 CLAIM_PRS="$(cd "$STATE/claims" 2>/dev/null && for f in "$(slug "$REPO")"__*.json; do [ -e "$f" ] && { f="${f##*__}"; printf '%s ' "${f%.json}"; }; done)"

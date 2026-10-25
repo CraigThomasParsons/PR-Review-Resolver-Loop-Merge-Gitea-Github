@@ -5,7 +5,13 @@ Usage:
   report.py review  --marker-module F --file R --sha S
   report.py resolve --marker-module F --file R --review-head H --findings N
   report.py scan    --file F      exit 1 ("leak") if F holds a credential; the controller runs it
-                                  over the commit messages and added lines it is about to push
+                                  over the commit message and added lines it is about to push
+  report.py summary --file R --fallback TEXT
+                                  print the report's `Summary: <subject>` line, the subject of
+                                  the controller's commit, or TEXT when there is no usable one
+  report.py stamp-head --file R --head NEWHEAD
+                                  rewrite head=pending in R's resolve marker to head=NEWHEAD, in
+                                  place; exit 1 if R has no pending resolve marker
 
 Prints "ok<TAB><head><TAB><fixed>" when the report carries a marker the loop can verify
 (review: a pulse-review marker naming S; resolve: a pulse-resolve marker whose reviewed= is H,
@@ -14,12 +20,18 @@ and "invalid<TAB><reason>" when a resolve marker does not account for exactly N 
 the controller refuses it before pushing anything. A report that contains the adapter's token or
 anything token-shaped is "invalid" too: it would be posted as a PR comment. The marker grammar
 comes from skills/pr-loops-common/marker.py so there is one parser.
+
+Workers never commit, so a resolve worker that changed files cannot know the head its work will
+land at: its marker says head=pending, and <head> is printed as "pending". The controller makes
+the commit (prod-common.sh controller_commit) and then stamps the real head into the report with
+stamp-head before posting it, so every posted marker still carries a 40-hex head.
 """
 import argparse
 import importlib.util
 import os
 import re
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -39,6 +51,12 @@ TOKEN_SHAPES = re.compile(
     r"|\b[\w.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|access[_-]?key|private[_-]?key)[\"']?"
     r"\s*[:=]\s*[\"']?(?=[A-Za-z_\-+/]*\d)[A-Za-z0-9+/_\-]{16,}",
     re.IGNORECASE)
+RESOLVE_ENVELOPE = re.compile(r"<!--\s*pulse-resolve:v1\s+.*?-->", re.S)
+PENDING = re.compile(r"(?<!\S)head=pending(?!\S)")
+# Never a real SHA: marker.parse_resolve only reads 40-hex heads, so pending is parsed as this.
+PENDING_STANDIN = "0" * 40
+SUMMARY = re.compile(r"^Summary:[ \t]*(.+?)[ \t]*$", re.M)
+SUMMARY_MAX = 100
 
 
 def live_tokens() -> list[str]:
@@ -66,15 +84,76 @@ def load_marker(path: str) -> types.ModuleType:
     return module
 
 
+def with_pending(body: str, head: str) -> str:
+    """body with head=pending inside every resolve marker replaced by head=<head>."""
+    return RESOLVE_ENVELOPE.sub(lambda m: PENDING.sub("head=" + head, m.group(0)), body)
+
+
+def parse_resolve(marker: types.ModuleType, body: str) -> tuple[str, str, int, int, int] | None:
+    literal = marker.parse_resolve(body)
+    if literal and literal[0] == PENDING_STANDIN:
+        return None
+    parsed = marker.parse_resolve(with_pending(body, PENDING_STANDIN))
+    if parsed and parsed[0] == PENDING_STANDIN:
+        return ("pending",) + tuple(parsed[1:])
+    return parsed
+
+
+def summary(body: str) -> str:
+    """The first `Summary:` line, if it can be a commit subject: one printable line, no markup."""
+    m = SUMMARY.search(body)
+    if not m:
+        return ""
+    text = m.group(1)
+    if len(text) > SUMMARY_MAX or not text.isprintable() or "<!--" in text or leaks_secret(text):
+        return ""
+    return text
+
+
+def write_atomic(path: str, text: str) -> None:
+    target = Path(path)
+    descriptor, temporary = tempfile.mkstemp(dir=target.parent, prefix="." + target.name + ".")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", errors="surrogateescape") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def stamp_head(path: str, head: str) -> int:
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        print(f"stamp-head: --head must be a 40-hex commit SHA, not {head!r}", file=sys.stderr)
+        return 2
+    try:
+        body = Path(path).read_text(errors="surrogateescape")
+    except OSError as error:
+        print(f"stamp-head: cannot read {path}: {error.strerror}", file=sys.stderr)
+        return 2
+    if not any(PENDING.search(m.group(0)) for m in RESOLVE_ENVELOPE.finditer(body)):
+        print("stamp-head: the report has no resolve marker with head=pending", file=sys.stderr)
+        return 1
+    write_atomic(path, with_pending(body, head))
+    print(f"stamped\t{head}")
+    return 0
+
+
 def main() -> int | None:
     p = argparse.ArgumentParser()
-    p.add_argument("job", choices=["review", "resolve", "scan"])
+    p.add_argument("job", choices=["review", "resolve", "scan", "summary", "stamp-head"])
     p.add_argument("--marker-module")
     p.add_argument("--file", required=True)
     p.add_argument("--sha", default="")
     p.add_argument("--review-head", default="")
     p.add_argument("--findings", type=int)
+    p.add_argument("--head", default="")
+    p.add_argument("--fallback", default="")
     a = p.parse_args()
+    if a.job == "stamp-head":
+        return stamp_head(a.file, a.head)
     try:
         body = open(a.file, errors="replace").read()
     except OSError:
@@ -84,6 +163,9 @@ def main() -> int | None:
             print("leak\tcontains a credential or token-shaped string")
             return 1
         print("clean")
+        return 0
+    if a.job == "summary":
+        print(summary(body) or a.fallback)
         return 0
     if not a.marker_module:
         p.error("--marker-module is required for review and resolve")
@@ -101,7 +183,7 @@ def main() -> int | None:
             return
         print(f"ok\t{a.sha}\t0")
         return
-    parsed = marker.parse_resolve(body)
+    parsed = parse_resolve(marker, body)
     if not parsed:
         print("nomarker\tthe report carries no parseable resolve marker")
         return

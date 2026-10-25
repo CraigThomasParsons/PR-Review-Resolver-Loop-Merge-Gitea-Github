@@ -603,8 +603,9 @@ python3 - "$PROJECT/agent-pool/scripts/policy.py" <<'PY'
 import sys
 path = sys.argv[1]
 text = open(path).read()
-assert '"edit": CURSOR_EDIT_DENY' in text
-open(path, "w").write(text.replace('"edit": CURSOR_EDIT_DENY', '"edit": []'))
+history_denies = '*[f"git {sub}" for sub in HISTORY_SUBS],'
+assert text.count(history_denies) == 1
+open(path, "w").write(text.replace(history_denies, ''))
 PY
 git -C "$PROJECT" commit -qam "weaken the edit policy"
 rm -f "$STUB_STATE/argv"

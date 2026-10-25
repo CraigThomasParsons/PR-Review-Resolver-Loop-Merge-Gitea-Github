@@ -35,7 +35,9 @@ An alternate form of this I would like to enable are long living feature branche
   provider can take to `agent:needs-human`; `bin/install-systemd-units.sh`, which copies
   `systemd/agent-pool-*` into the user unit dir without enabling anything;
   `scripts/agent-labels.py`, which creates the `agent:*` labels on one repo; helper scripts
-  and offline tests. Design in `docs/plans/agent-pool-worker-pool.md`. `scripts/conduit_registry.py`
+  and offline tests. Design in `docs/plans/agent-pool-worker-pool.md`. Workers never commit: the
+  controller makes one SSH-signed commit per resolve run with `Agent-Pool-*` trailers, and resolve
+  needs a controller-only signing key (setup and rotation: `docs/agent-pool-commit-signing.md`). `scripts/conduit_registry.py`
   and `scripts/conduit-registry.py` are the Conduit configuration registry (Slice 1: a versioned,
   configuration-only SQLite schema, the Charlie and Chase examples and a pure deny-by-default
   matcher, wired into nothing yet); see `docs/plans/conduit-registry.md`.

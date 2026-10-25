@@ -29,6 +29,11 @@ BIN="$HOME/.local/bin"
 mkdir -p "$BIN" "$TMP/common" "$TMP/calls" "$TMP/behave"
 export PATH="$BIN:$PATH"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
+# A throwaway controller signing key, made for this run only and deleted with $TMP (#30).
+mkdir -p "$TMP/signing"; chmod 700 "$TMP/signing"
+ssh-keygen -q -t ed25519 -N '' -C agent-pool-test -f "$TMP/signing/key" </dev/null >/dev/null
+printf 'agent-pool@localhost namespaces="git" %s\n' "$(cut -d' ' -f1,2 "$TMP/signing/key.pub")" > "$TMP/signing/allowed_signers"
+export AGENT_POOL_SIGNING_KEY="$TMP/signing/key"
 R=owner/repo
 ORIGIN="$TMP/origin.git"
 ODD_REF='feature/a|b&c'
@@ -188,8 +193,13 @@ for kind in ("allow", "deny"):
 behave="$(cat "$STUB_BEHAVE/$name" 2>/dev/null || echo ok)"
 here() { git rev-parse HEAD; }
 review_text() { printf '## Automated review\n1. [suggestion] something\n<!-- pulse-review:v1 head=%s findings=%s -->\n' "$(here)" "$1"; }
-resolve_text() { printf '## Automated resolve\nFixed: see commits\n<!-- pulse-resolve:v1 head=%s reviewed=%s fixed=%s noted=%s deferred=%s -->\n' \
-  "$(here)" "$review_head" "$1" "$2" "$3"; }
+# Workers never commit (#30): a resolve that changed files says head=pending, unless the
+# behaviour passes a head of its own as $4.
+resolve_text() { # fixed noted deferred [head]
+  local h="${4:-}"
+  [ -n "$h" ] || { if [ "$1" -gt 0 ]; then h=pending; else h="$(here)"; fi; }
+  printf '## Automated resolve\nSummary: %s\nFixed: see the diff\n<!-- pulse-resolve:v1 head=%s reviewed=%s fixed=%s noted=%s deferred=%s -->\n' \
+    "${SUMMARY:-fix: something}" "$h" "$review_head" "$1" "$2" "$3"; }
 success() { # [final text]
   python3 - "$name" "${1:-done}" <<'PY'
 import json, sys
@@ -207,7 +217,8 @@ else:
     print(text)
 PY
 }
-commit_fix() { echo "fix $RANDOM" >> f.txt; git add f.txt; git commit -q -m "fix: something"; }
+commit_fix() { echo "fix $RANDOM" >> f.txt; }
+trap 'echo "HEAD_AFTER=$(git rev-parse HEAD 2>/dev/null)" >> "$STUB_CALLS/$name.log"' EXIT
 case "$behave" in
   ok)        review_text 2 > "$report"; success ;;
   clean)     review_text 0 > "$report"; success ;;
@@ -223,34 +234,53 @@ case "$behave" in
     printf 'gitdir: /nonexistent/worker-owned-gitdir\n' > .git; success ;;
   resolve-toolconf-cursor)
     commit_fix; mkdir -p .cursor; echo '{"permissions":{"allow":["Shell(*)"]}}' > .cursor/cli.json
-    git add -f .cursor/cli.json; git commit -q -m "chore: tool config"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-toolconf-claude)
     commit_fix; mkdir -p .claude; echo '{}' > .claude/settings.json
-    git add .claude/settings.json; git commit -q -m "chore: tool config"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-context)
-    commit_fix; git add -f .agent-pool-context.md; git commit -q -m "chore: context"
+    commit_fix; echo "worker note" >> .agent-pool-context.md
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-secret-msg)
-    echo "fix $RANDOM" >> f.txt; git add f.txt
-    git commit -q -m "fix: something" -m "token: 3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901"
-    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+    commit_fix
+    SUMMARY="fix: something token: 3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901" resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-secret-diff)
-    echo "GITEA_TOKEN=3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901" >> f.txt; git add f.txt; git commit -q -m "fix: config"
+    echo "GITEA_TOKEN=3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901" >> f.txt
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-commit)
+    # The old worker-side commit #30 removed: the policy denies it, and the controller refuses it.
+    commit_fix; git add f.txt; git commit -q -m "fix: a worker's own commit"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 "$(here)" > "$report"; success ;;
+  resolve-oldhead)
+    commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 "$(here)" > "$report"; success ;;
+  resolve-credfile)
+    commit_fix; echo "API_URL=http://x" > .env; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-nested)
+    commit_fix; mkdir -p vendored; git -C vendored init -q; echo x > vendored/a.txt
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-delete)
+    rm -f f.txt; mkdir -p src; echo new > src/new.txt
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-nosummary)
+    commit_fix; printf '## Automated resolve\n<!-- pulse-resolve:v1 head=pending reviewed=%s fixed=1 noted=%s deferred=0 -->\n' \
+      "$review_head" $(( ${findings:-1} - 1 )) > "$report"; success ;;
+  resolve-pending-nochange)
+    resolve_text 0 "${findings:-1}" 0 pending > "$report"; success ;;
+  resolve-stealkey)
+    commit_fix; mv "$AGENT_POOL_SIGNING_KEY" "$AGENT_POOL_SIGNING_KEY.moved"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-lag)
     commit_fix; cat "$STUB_BEHAVE/lag" > "$STUB_GITEA.lag"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-gatefile)
     commit_fix; sed -i 's/"just", "gate"/"just", "evil"/' .agent-pool/gates.toml
-    git commit -q -am "chore: loosen the gate"; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-gatescript)
     commit_fix; printf 'gate:\n\texit 0\n' > justfile
-    git commit -q -am "chore: simplify the gate"; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
-  resolve-docs)
-    mkdir -p docs; echo "note $RANDOM" >> docs/notes.md; git add docs/notes.md; git commit -q -m "docs: note"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-docs)
+    mkdir -p docs; echo "note $RANDOM" >> docs/notes.md
+    SUMMARY="docs: note" resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-plant)
     commit_fix; echo planted > planted.txt; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-gitconfig)
@@ -259,11 +289,11 @@ case "$behave" in
   resolve-unclaimed) commit_fix; resolve_text 0 "${findings:-1}" 0 > "$report"; success ;;
   resolve-push)
     commit_fix
-    git push -q origin HEAD:refs/heads/feature/x >/dev/null 2>&1
+    git push -q origin "$(git commit-tree "$(git write-tree)" -p HEAD -m sneaky):refs/heads/feature/x" >/dev/null 2>&1
     echo "PUSH_RC=$?" >> "$STUB_CALLS/$name.log"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-nonff)
-    git checkout -q --detach HEAD~1; commit_fix; resolve_text 1 0 0 > "$report"; success ;;
+    git checkout -q --detach HEAD~1; commit_fix; resolve_text 1 0 0 "$(here)" > "$report"; success ;;
   resolve-race)
     commit_fix
     ( unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
@@ -507,7 +537,7 @@ expect "the resolve prompt carries the reviewed head" "$(cat "$TMP/state/runs/pr
 expect "the worker's own push failed" "$(calls claude)" "PUSH_RC=1"
 expect_not "the worker's push never reached the remote" "$(calls claude)" "PUSH_RC=0"
 newhead="$(origin_head)"
-expect_not "the controller pushed the worker's commit" "$newhead" "$SHA"
+expect_not "the controller pushed its own commit of the worker's edits" "$newhead" "$SHA"
 expect "as a fast-forward of the reviewed head" "$(git --git-dir "$ORIGIN" merge-base --is-ancestor "$SHA" "$newhead" && echo ff)" "ff"
 expect "and posted the resolve report" "$(comments)" "pulse-resolve:v1 head=$newhead reviewed=$SHA fixed=1"
 expect "a verified resolve is agent:done" "$(labels)" "agent:done"
@@ -523,9 +553,9 @@ expect "a worker that could only answer in its final text is still published" "$
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave claude resolve-nonff
 tick
-expect "a non-fast-forward resolve is never pushed" "$(origin_head)" "$SHA"
+expect "a worker that moves its own HEAD is never pushed" "$(origin_head)" "$SHA"
 expect "it goes to agent:needs-human" "$(labels)" "agent:needs-human"
-expect "with a comment saying why" "$(comments)" "not a fast-forward"
+expect "with a comment saying why" "$(comments)" "workers never commit"
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave claude resolve-miscount
 tick
@@ -548,26 +578,28 @@ behave claude resolve-repoint
 tick
 expect "S2: a worker that repoints its .git still has its commit read through the main clone" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
 expect "S2: and the resolve is done" "$(labels)" "agent:done"
+pushed_paths() { git --git-dir "$ORIGIN" show --name-only --format= "refs/heads/${1:-feature/x}"; }
 for tc in cursor claude; do
   reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
   behave claude "resolve-toolconf-$tc"
   tick
-  expect "S3: commits touching .$tc/ are never pushed" "$(origin_head)" "$SHA"
-  expect "S3: and go to needs-human (.$tc/)" "$(labels)" "agent:needs-human"
-  expect "S3: with the reason (.$tc/)" "$(comments)" "touch agent tool configuration"
+  expect_not "S3: the worker's real fix is pushed (.$tc/)" "$(origin_head)" "$SHA"
+  expect "S3: as the controller's commit of f.txt (.$tc/)" "$(pushed_paths)" "f.txt"
+  expect_not "S3: tool configuration under .$tc/ never reaches the commit" "$(pushed_paths)" ".$tc/"
+  expect "S3: and the resolve is done (.$tc/)" "$(labels)" "agent:done"
 done
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave claude resolve-context
 tick
-expect "r4#5: a commit adding the context file is never pushed" "$(origin_head)" "$SHA"
-expect "r4#5: and the reason is given" "$(comments)" "touch agent tool configuration"
+expect_not "r4#5: a worker's edit to the context file never reaches the commit" "$(pushed_paths)" ".agent-pool-context.md"
+expect "r4#5: while its real fix does" "$(pushed_paths)" "f.txt"
 for leak in msg diff; do
   reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
   behave claude "resolve-secret-$leak"
   tick
   expect "r4#2: a credential in the commit $leak is never pushed" "$(origin_head)" "$SHA"
   expect "r4#2: and goes to needs-human ($leak)" "$(labels)" "agent:needs-human"
-  expect "r4#2: with the reason ($leak)" "$(comments)" "contain a credential or token-shaped string"
+  expect "r4#2: with the reason ($leak)" "$(comments)" "a credential or token-shaped string"
   expect_not "r4#2: and the secret itself is not repeated in the comment ($leak)" "$(comments)" "3f9a0c1d2e4b"
 done
 for lag in 3 99; do
@@ -718,7 +750,9 @@ rm -f "$HOME/.gitconfig" "$TMP/main/.git/hooks/post-checkout"
 expect "the gate checkout honours no global-config filter" "$(gate_seen)" "PAYLOAD=ORIGINAL"
 expect_not "nor one from the tick's GIT_CONFIG_* env" "$(gate_seen)" "PWNED"
 expect "only committed content reaches the gate" "$(gate_seen | grep '^LS=')" "payload.txt"
-expect_not "never the worker's untracked files" "$(gate_seen | grep '^LS=')" "planted.txt"
+expect "#30: a new file the worker left is part of the controller's commit, so the gate sees it" "$(gate_seen | grep '^LS=')" "planted.txt"
+expect_not "never the pool's own context file" "$(gate_seen | grep '^LS=')" ".agent-pool-context.md"
+expect_not "#30: the worktree is checked out without the tick's filters, so payload.txt is no change" "$(pushed_paths feature/attr)" "payload.txt"
 expect "no hook in the main clone ran on the gate checkout" "$([ -e "$TMP/calls/hook-ran" ] && echo ran || echo none)" "none"
 expect "and the fix is pushed" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/attr)" "fix: something"
 
@@ -757,40 +791,151 @@ expect "and the controller pushes to exactly that branch" "$(git --git-dir "$ORI
 expect "and the job is done" "$(labels)" "agent:done"
 
 echo
-echo "commit rules: resolve may commit only with git commit -m (no --trailer, #29), review may not commit at all"
+echo "commit rules (#30): no worker may stage or commit, whatever the job or provider"
 claude_allows() { calls claude | sed -n '/^ARG --allowedTools$/,/^ARG --disallowedTools$/p'; }
 claude_denies() { calls claude | sed -n '/^ARG --disallowedTools$/,/^[^A]/p'; }
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave cursor-agent resolve-fix
 PROVIDER_ORDER=cursor tick
-expect_not "cursor resolve cli.json does not allow git commit --trailer" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git commit --trailer"
-expect "cursor resolve cli.json still allows git commit -m" "$(calls cursor-agent)" "CURSOR_ALLOW Shell(git commit -m)"
-for rule in 'git push' 'git push --force' 'git commit -a' 'git commit --all' 'git commit --amend' 'git commit -F' 'git commit --file'; do
-  expect "cursor resolve cli.json still denies $rule" "$(calls cursor-agent)" "CURSOR_DENY Shell($rule)"
+expect_not "#30: cursor resolve cli.json allows no git commit" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git commit"
+expect_not "#30: cursor resolve cli.json allows no git add" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git add"
+for rule in 'git add' 'git commit' 'git commit-tree' 'git push' 'git push --force' 'git stash'; do
+  expect "#30: cursor resolve cli.json denies $rule" "$(calls cursor-agent)" "CURSOR_DENY Shell($rule)"
 done
 expect_not "cursor resolve cli.json allows no push" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git push"
-expect "a commit from cursor is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "cursor's edits reach the branch as the controller's commit" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "#30: carrying cursor as the provider" "$(git --git-dir "$ORIGIN" log -1 --format='%(trailers:key=Agent-Pool-Provider,valueonly)' feature/x)" "cursor"
 expect "and the resolve is done" "$(labels)" "agent:done"
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave claude resolve-fix
 tick
-expect_not "claude resolve does not allow git commit --trailer" "$(claude_allows)" "git commit --trailer"
-expect "claude resolve still allows git commit -m" "$(claude_allows)" "ARG Bash(git commit -m *)"
+expect_not "#30: claude resolve allows no git commit" "$(claude_allows)" "git commit"
+expect_not "#30: claude resolve allows no git add" "$(claude_allows)" "git add"
 expect_not "claude resolve allows no push" "$(claude_allows)" "git push"
-for rule in 'git push*' 'git push --force*' 'git commit -a*' 'git commit --amend*' 'git commit -F*' 'git commit *--file*'; do
-  expect "claude resolve still denies $rule" "$(claude_denies)" "ARG Bash($rule)"
+for rule in 'git add*' 'git commit*' 'git push*' 'git push --force*' 'git stash*'; do
+  expect "#30: claude resolve denies $rule" "$(claude_denies)" "ARG Bash($rule)"
 done
-expect "a commit from claude is pushed by the controller" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "claude's edits reach the branch as the controller's commit" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
 reset '["agent:ready"]'
 behave cursor-agent ok
 PROVIDER_ORDER=cursor tick
-expect_not "cursor review cli.json does not allow git commit --trailer" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git commit"
+expect_not "cursor review cli.json allows no git commit" "$(calls cursor-agent | grep '^CURSOR_ALLOW')" "git commit"
 expect "cursor review cli.json denies git commit" "$(calls cursor-agent)" "CURSOR_DENY Shell(git commit)"
 reset '["agent:ready"]'
 behave claude ok
 tick
-expect_not "claude review does not allow git commit --trailer" "$(claude_allows)" "git commit"
+expect_not "claude review allows no git commit" "$(claude_allows)" "git commit"
 expect "claude review denies git commit" "$(claude_denies)" "ARG Bash(git commit*)"
+
+echo
+echo "controller commits (#30): one SSH-signed commit per run, made by the controller, with trailers"
+trailer() { git --git-dir "$ORIGIN" log -1 --format="%(trailers:key=$1,valueonly)" "refs/heads/${2:-feature/x}"; }
+verify_sig() { git --git-dir "$ORIGIN" -c gpg.ssh.allowedSignersFile="$TMP/signing/allowed_signers" verify-commit "$1" >/dev/null 2>&1 && echo good || echo bad; }
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix
+tick
+newhead="$(origin_head)"
+attempt_id="$(basename "$(ls "$TMP/state/gates/owner_repo__7__"*.json)" .json)"; attempt_id="${attempt_id##*__}"
+expect_not "#30: a resolve run is pushed" "$newhead" "$SHA"
+expect "#30: as exactly one commit on top of the reviewed head" "$(git --git-dir "$ORIGIN" rev-list --count "$SHA..$newhead")" "1"
+expect "#30: whose only parent is the reviewed head" "$(git --git-dir "$ORIGIN" rev-parse "$newhead^@")" "$SHA"
+expect "#30: the worker never moved its HEAD (it made no commit)" "$(calls claude | grep '^HEAD_AFTER=')" "HEAD_AFTER=$SHA"
+expect "#30: the commit is SSH-signed" "$(git --git-dir "$ORIGIN" cat-file commit "$newhead")" "gpgsig -----BEGIN SSH SIGNATURE-----"
+expect "#30: by the controller's key (git verify-commit)" "$(verify_sig "$newhead")" "good"
+expect "#30: git reports a good signature" "$(git --git-dir "$ORIGIN" -c gpg.ssh.allowedSignersFile="$TMP/signing/allowed_signers" log -1 --format=%G? "$newhead")" "G"
+expect "#30: committed as the controller, not the worker's git identity" "$(git --git-dir "$ORIGIN" log -1 --format='%an <%ae> / %cn <%ce>' "$newhead")" "agent-pool <agent-pool@localhost> / agent-pool <agent-pool@localhost>"
+expect "#30: the subject is the report's Summary line" "$(git --git-dir "$ORIGIN" log -1 --format=%s "$newhead")" "fix: something"
+expect "#30: trailer Agent-Pool-Provider" "$(trailer Agent-Pool-Provider)" "claude"
+expect "#30: trailer Agent-Pool-Ability" "$(trailer Agent-Pool-Ability)" "resolve"
+expect "#30: trailer Agent-Pool-Worker" "$(trailer Agent-Pool-Worker)" "test-worker"
+expect "#30: trailer Agent-Pool-Attempt names the attempt the gate receipt is bound to" "$(trailer Agent-Pool-Attempt)" "$attempt_id"
+expect "#30: trailer Agent-Pool-Model" "$(trailer Agent-Pool-Model)" "opus"
+expect "#30: all five trailers, each once" "$(git --git-dir "$ORIGIN" log -1 --format='%(trailers:only,unfold)' "$newhead" | grep -c '^Agent-Pool-')" "5"
+expect "#30: the posted marker carries the stamped head" "$(comments)" "pulse-resolve:v1 head=$newhead reviewed=$SHA"
+expect_not "#30: never head=pending" "$(comments)" "head=pending"
+expect "#30: the resolve is done" "$(labels)" "agent:done"
+expect "#30: the commit is logged as signed" "$(cat "$TMP/out.txt")" "committed $SHA..$newhead for claude (resolve, 1 path(s), signed)"
+expect "#30: the controller's private index is gone" "$(ls "$TMP/state/runs" | grep -c '^index-')" "0"
+expect_not "#30: no key material reaches the log" "$(cat "$TMP/state/pool.log" "$TMP/out.txt")" "$(sed -n 2p "$TMP/signing/key")"
+expect_not "#30: nor the public key" "$(cat "$TMP/state/pool.log" "$TMP/out.txt")" "$(cut -d' ' -f2 "$TMP/signing/key.pub")"
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-delete
+tick
+newhead="$(origin_head)"
+expect "#30: a deletion and a new file in a new directory are both committed" "$(git --git-dir "$ORIGIN" show --name-status --format= "$newhead" | tr '\t\n' ' ')" "D f.txt A src/new.txt"
+expect "#30: and signed" "$(verify_sig "$newhead")" "good"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-nosummary
+tick
+expect "#30: with no Summary line the controller writes the subject" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "chore(resolve): automated resolve for #7"
+expect "#30: and still all five trailers" "$(git --git-dir "$ORIGIN" log -1 --format='%(trailers:only,unfold)' feature/x | grep -c '^Agent-Pool-')" "5"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-pending-nochange
+tick
+expect "#30: head=pending with no change is stamped with the PR head, nothing committed" "$(comments)" "pulse-resolve:v1 head=$SHA reviewed=$SHA"
+expect "#30: and nothing is pushed" "$(origin_head)" "$SHA"
+expect "#30: it is done" "$(labels)" "agent:done"
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-commit
+tick
+expect "#30: a worker that commits itself is never pushed" "$(origin_head)" "$SHA"
+expect "#30: it goes to needs-human" "$(labels)" "agent:needs-human"
+expect "#30: saying workers never commit" "$(comments)" "workers never commit"
+expect_not "#30: no resolve report is posted" "$(comments)" "pulse-resolve"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-oldhead
+tick
+expect "#30: changes under a marker that says head=<sha>, not pending, are never pushed" "$(origin_head)" "$SHA"
+expect "#30: and the reason is given" "$(comments)" "not head=pending"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-credfile
+tick
+expect "#30: a credential-named file is never committed or pushed" "$(origin_head)" "$SHA"
+expect "#30: it goes to needs-human naming the file" "$(comments)" "credential-named files (.env)"
+expect "#30: and no gate ran" "$(gate_ran)" "none"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-nested
+tick
+expect "#30: a nested repository is never committed (no gitlink sneaks in)" "$(origin_head)" "$SHA"
+expect "#30: and the reason is given" "$(comments)" "nested git repository (vendored/)"
+
+echo "  (the signing key is required: no key is a setup fault, never an unsigned commit)"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix
+AGENT_POOL_SIGNING_KEY= tick
+expect "#30: no signing key: a setup fault [signing]" "$(cat "$TMP/out.txt")" "SETUP FAULT [signing]: no commit signing key is configured"
+expect "#30: the tick exits 2" "$TICK_RC" "2"
+expect "#30: resolve jobs are not claimed" "$(cat "$TMP/out.txt")" "resolve jobs are paused: the controller cannot sign commits"
+expect "#30: so no provider ran" "$(ncalls claude)" "0"
+expect "#30: nothing is pushed" "$(origin_head)" "$SHA"
+expect "#30: the PR stays queued" "$(labels)" "agent:ready"
+expect "#30: the fault is recorded" "$(cat "$TMP/state/faults/signing.json" 2>/dev/null)" "no commit signing key"
+AGENT_POOL_SIGNING_KEY="$TMP/signing/no-such-key" tick
+expect "#30: a missing key file is a setup fault" "$(cat "$TMP/out.txt")" "SETUP FAULT [signing]: the signing key $TMP/signing/no-such-key is missing or unreadable"
+AGENT_POOL_SIGNING_KEY="signing/key" tick
+expect "#30: a relative key path is a setup fault" "$(cat "$TMP/out.txt")" "is not an absolute path"
+ssh-keygen -q -t ed25519 -N 'a-passphrase-for-test' -f "$TMP/signing/locked" </dev/null >/dev/null
+AGENT_POOL_SIGNING_KEY="$TMP/signing/locked" tick
+expect "#30: a passphrase-protected key is a setup fault" "$(cat "$TMP/out.txt")" "is not a passphrase-less SSH private key"
+cp "$TMP/signing/key" "$TMP/signing/loose"; chmod 644 "$TMP/signing/loose"
+AGENT_POOL_SIGNING_KEY="$TMP/signing/loose" tick
+expect "#30: a key others can read is a setup fault" "$(cat "$TMP/out.txt")" "SETUP FAULT [signing]: the signing key $TMP/signing/loose is not"
+expect "#30: still nothing ran" "$(ncalls claude)" "0"
+python3 -c 'import json,sys; p=sys.argv[1]; s=json.load(open(p)); s["prs"]["7"]["comments"]=[]; json.dump(s, open(p,"w"))' "$STUB_GITEA"
+behave claude ok
+AGENT_POOL_SIGNING_KEY= tick
+expect "#30: reviews need no key and still run" "$(comments)" "pulse-review:v1 head=$SHA"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-stealkey
+tick
+mv "$TMP/signing/key.moved" "$TMP/signing/key"
+expect "#30: a key gone by commit time: nothing is committed or pushed" "$(origin_head)" "$SHA"
+expect "#30: it is a setup fault [signing]" "$(cat "$TMP/out.txt")" "SETUP FAULT [signing]: the signing key $TMP/signing/key is missing or unreadable"
+expect "#30: the job is requeued, not needs-human" "$(labels)" "agent:ready"
+expect "#30: and the provider is not cooled down" "$(cooldown_doc claude)" "none"
+expect_not "#30: no unsigned commit was pushed or posted" "$(comments)" "pulse-resolve"
 
 echo
 echo "fencing: a superseded attempt publishes nothing and its process group dies"
@@ -1060,8 +1205,11 @@ expect "codex adapter shape" "$(calls codex | tr '\n' ' ')" "ARG exec ARG --ephe
 
 echo
 echo "prompts"
-expect "the generic resolve prompt names files to stage" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "git add path/to/first/file"
-expect "the generic resolve prompt puts Refs: #N in the -m message, not a --trailer" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "end the -m message with a Refs: #N line"
+expect_not "#30: the generic resolve prompt no longer tells a worker to stage" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "git add path/"
+expect_not "#30: nor to commit" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" 'git commit -m "'
+expect "#30: it says the controller commits" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "Leave your changes in the worktree, uncommitted"
+expect "#30: it asks for head=pending" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "head=<the word pending if you changed any file"
+expect "#30: and for the Summary line the commit subject comes from" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" '"Summary: "'
 expect "G5: the resolve prompt has the final-response fallback" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "If you cannot write files, make the complete report your final response instead"
 expect "L3: the resolve count covers only the review's numbered findings" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "thread replies are never counted"
 expect "L3: thread replies are listed separately" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "list Thread replies"
