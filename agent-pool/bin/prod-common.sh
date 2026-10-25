@@ -739,7 +739,7 @@ run_gates() {
     gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" protected "$why"
     PUB="fail:$why"; return 1
   fi
-  if grep -q '"source": "none"' "$manifest"; then
+  if [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source"))' "$manifest" 2>/dev/null)" = none ]; then
     if python3 "$SCRIPTS/gates.py" docs-only --changed "$raw.changed"; then
       gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" none-needed "no gate manifest, and only documentation changed"
       [ -n "$GATE_RECEIPT" ] || { PUB="gateinfra:could not write the gate receipt"; return 1; }
@@ -758,6 +758,8 @@ run_gates() {
   fi
   left="$(claim_secs_left)"; budget=$(( ${left:-0} - 60 ))
   [ "$budget" -gt "$GATE_BUDGET" ] && budget="$GATE_BUDGET"
+  # No time left, or the claim could not be read: a controller fault, not a red gate.
+  [ "$budget" -ge 1 ] || { PUB="gateinfra:no time left on the claim to run the gates (budget ${budget}s)"; return 1; }
   gate_config_intact || { PUB="gateinfra:the main clone's git config changed during the job; refusing to gate or push"; return 1; }
   gate_checkout "$newhead" || { gate_cleanup; PUB="gateinfra:could not check out $newhead for the gates"; return 1; }
   printf '%s\n' "$names" > "$raw.select"
