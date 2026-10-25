@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """policy.py: the one worker permission policy, translated per provider CLI.
 
-Workers never publish. They read, edit and commit locally (resolve), read and edit without
-touching git history (edit), or only read (review), and write a report file. The controller does
-every push and comment through the claim guard, so the policy denies all of `git push` and every
-gitea-pr.py write to every worker. An edit worker's commits are the controller's too: it gets
-resolve's writes and gate commands, and `git add`, `git commit` and every other history-writing
-git subcommand are denied by name.
+Workers never publish and never commit. They read and edit the worktree (resolve, edit) or only
+read (review), and write a report file. The controller builds the one signed commit per run from
+the worktree (prod-common.sh controller_commit, docs/plans/controller-commits-everything.md) and
+does every push and comment through the claim guard, so the policy denies all of `git push`,
+`git add`, `git commit` and every other history-writing git subcommand, and every gitea-pr.py
+write, to every worker. Every job gets the same read-only git command set.
 
 The policy is deny-by-default at the ARGUMENT level (`check`). An unquoted `{` or `}` anywhere
 denies the whole command before anything else is read: bash brace expansion would otherwise
@@ -19,8 +19,6 @@ denied segment. Every remaining command must be one of:
         difftool, no --output, no --ext-diff/--textconv, no global options such as -C/-c)
   cat ls head tail wc grep rg                              with vetted options only
   python3 <adapter> head|comments|threads --repo R --pr N  the adapter's reads, absolute path
-  git add <named paths> / git commit -m                    resolve only; no -A/-u/-f/., no
-        tool configuration paths, no --amend/-a, no -F (a file would become the message)
   the named gate commands                                  resolve and edit (their arguments
         are not vetted; the controller will run gates itself from a pinned list, see D1)
 
@@ -28,7 +26,8 @@ Paths are normalised (~ expanded, //, /./ and .. collapsed, symlinks resolved) b
 checked. Every path a reader or git is given must stay inside the worktree or the runs folder;
 a wildcard is expanded and every match must stay inside the worktree. Option values and gate
 arguments may not name a credential path (~/.ssh, ~/.config/tea, ~/.config/pulse, ~/.netrc,
-~/.git-credentials, /proc ...).
+~/.git-credentials, /proc ..., and the controller's commit signing key, AGENT_POOL_SIGNING_KEY,
+wherever it lives).
 
 The emitted rules follow the same policy as far as each CLI's syntax allows:
   claude  Bash(<glob>) allow/deny per subcommand ("git diff" and "git diff *"), plus denies
@@ -42,11 +41,8 @@ The emitted rules follow the same policy as far as each CLI's syntax allows:
           particular a prefix cannot deny an option at an arbitrary position (`git log -p -n 3
           --output=/tmp/x` starts with the allowed `git log`; only the common leading options
           are spelled out), cannot see redirection (`cat a > /tmp/x`), and cannot see through a
-          symlink or a brace, and the allowed `git commit -m` prefix admits a later
-          --amend/-a/-F or a path (only leading ones are denied). `check` denies all of these;
-          Cursor's own CLI does not. Cursor is not contained by cli.json alone and must not run
-          unattended on an untrusted repo. No `git commit --trailer` prefix is allowed (#29): it
-          would widen that gap to every commit Cursor rewrites with its attribution trailer.
+          symlink or a brace. `check` denies all of these; Cursor's own CLI does not. Cursor is
+          not contained by cli.json alone and must not run unattended on an untrusted repo.
 Writes: review may write only its report; resolve and edit may write the worktree and its report.
 `.git` (the worktree's pointer file and any .git directory) is never writable.
 
@@ -199,12 +195,19 @@ def resolved(arg: str, a: argparse.Namespace) -> str:
     return os.path.normpath(os.path.join(a.worktree or os.getcwd(), p))
 
 
+def signing_key() -> str:
+    """The controller's commit signing key, normalised, or "" when none is configured."""
+    key = os.environ.get("AGENT_POOL_SIGNING_KEY", "").strip()
+    return os.path.realpath(os.path.expanduser(key)) if key else ""
+
+
 def sensitive(arg: str, a: argparse.Namespace) -> bool:
     """The argument names a credential: literally, once normalised, or once symlinks are followed
     (a PR can commit notes.txt -> ~/.ssh/id_ed25519)."""
     p = resolved(arg, a)
     forms = (arg, p + "/", os.path.realpath(p) + "/")
-    return any(frag in form for form in forms for frag in SENSITIVE)
+    frags = SENSITIVE + ((signing_key() + "/",) if signing_key() else ())
+    return any(frag in form for form in forms for frag in frags)
 
 
 def roots(a: argparse.Namespace, wildcard: bool = False) -> list[str]:
@@ -276,19 +279,6 @@ def reader_check(args: list[str], spec: dict, a: argparse.Namespace, pattern_fir
     return options_ok(args, spec, lambda t, n: n < skip or contained(t, a), lambda v: not sensitive(v, a))
 
 
-def add_positional(tok: str, a: argparse.Namespace) -> bool:
-    if tok.startswith(":") or sensitive(tok, a):
-        return False
-    wt = os.path.realpath(a.worktree or os.getcwd())
-    p = os.path.realpath(resolved(tok, a))
-    if not p.startswith(wt + "/"):
-        return False
-    rel = os.path.relpath(p, wt)
-    if rel in (".", "*") or WILDCARDS.fullmatch(rel) or rel.split("/")[0] == ".git":
-        return False
-    return not any((rel + "/").startswith(t) for t in TOOL_CONFIG)
-
-
 def segment_ok(seg: list[str], a: argparse.Namespace) -> bool:
     head = seg[0]
     if head == "git":
@@ -297,13 +287,6 @@ def segment_ok(seg: list[str], a: argparse.Namespace) -> bool:
         sub, args = seg[1], seg[2:]
         if sub in GIT_SPECS:
             return reader_check(args, GIT_SPECS[sub], a, pattern_first=(sub == "grep"))
-        if a.job == "resolve" and sub == "add":
-            none = dict(flags=set(), eq=set(), valued=set(), attached=[])
-            return bool(args) and options_ok(args, none, lambda t, n: add_positional(t, a), lambda v: False)
-        if a.job == "resolve" and sub == "commit":
-            spec = dict(flags={"-q", "--quiet", "-s", "--signoff"}, eq={"--message"}, valued={"-m"}, attached=[])
-            has_message = any(t == "-m" or t.startswith("--message=") for t in args)
-            return has_message and options_ok(args, spec, lambda t, n: False, lambda v: not sensitive(v, a))
         return False
     if head in TOOL_SPECS:
         return reader_check(seg[1:], TOOL_SPECS[head], a, pattern_first=head in ("grep", "rg"))
@@ -341,18 +324,16 @@ GATE_SHELL = ["npm run *", "npm test", "npm test *", "dotnet build", "dotnet bui
               "composer lint *", "php artisan test", "php artisan test *", "vendor/bin/pint", "vendor/bin/pint *",
               "vendor/bin/phpunit", "vendor/bin/phpunit *", "./vendor/bin/pint", "./vendor/bin/pint *",
               "./vendor/bin/phpunit", "./vendor/bin/phpunit *"]
-COMMIT_SHELL = ["git add *", "git commit -m *"]
+# Workers never write history: the controller makes the one commit per run (controller_commit).
+HISTORY_SUBS = ["add", "commit", "commit-tree", "cherry-pick", "revert", "am", "stash", "tag", "notes",
+                "apply", "checkout", "switch", "restore", "rm", "mv"]
 DENY_SHELL = [
     "git push*", "*git push*", "git push --force*", "git reset --hard*", "git merge*", "git rebase*",
     "git difftool*", "*--output*", "*>*", "*<*", "*--ext-diff*", "*--textconv*", "* -x *",
-    "*{*,*}*", "*{*..*}*", "git commit -F*", "git commit * -F*", "git commit *--file*",
-    "git add *.agent-pool-context.md*",
+    "*{*,*}*", "*{*..*}*",
     "git branch -D*", "git config*", "git -C*", "git -c*", "git --*", "git remote*", "git update-ref*",
-    "git add -A*", "git add --all*", "git add -u*", "git add .", "git add . *", "git add :/*",
-    "git add -f*", "git add --force*", "git add * -f*", "git add * --force*",
-    "git add *.cursor/*", "git add *.grok/*", "git add *.claude/*",
-    "git commit -a*", "git commit --all*", "git commit --amend*", "git commit * -a*", "git commit * --all*",
-    "git commit * --amend*", "*gitea-pr.py comment", "*gitea-pr.py comment *", "*gitea-pr.py label",
+    *[f"git {sub}*" for sub in HISTORY_SUBS if sub != "commit-tree"],
+    "*gitea-pr.py comment", "*gitea-pr.py comment *", "*gitea-pr.py label",
     "*gitea-pr.py label *", "*gitea-pr.py merge*",
     "tea", "tea *", "gh", "gh *", "curl*", "wget*", "sudo*", "rm -rf*", "rm -fr*", "systemctl*", "crontab*",
     "python3 -c*", "python3 -", "python3 - *", "node*", "npx*", "bash*", "sh *", "env*", "eval *",
@@ -360,17 +341,11 @@ DENY_SHELL = [
     "tail *-f*", "tail *-F*", "*.ssh*", "*.config/tea*", "*.config/pulse*", "*.netrc*", "*.git-credentials*",
     "*/proc/*", "*gitea_token*",
 ]
-REVIEW_DENY_SHELL = ["git add*", "git commit*"]
-EDIT_DENY_SHELL = REVIEW_DENY_SHELL + ["git cherry-pick*", "git revert*", "git am*", "git stash*",
-                                       "git tag*", "git notes*", "git apply*", "git checkout*",
-                                       "git switch*", "git restore*", "git rm*", "git mv*"]
 CURSOR_DENY = ["git push", "git push --force", "git reset --hard", "git merge", "git rebase", "git branch -D",
                "git difftool", "git diff --output", "git log --output", "git show --output",
                "git diff --ext-diff", "git log --ext-diff", "git show --ext-diff",
-               "git config", "git -C", "git -c", "git remote", "git update-ref", "git add -A", "git add --all",
-               "git add -u", "git add .", "git add -f", "git add --force", "git add .cursor", "git add .grok",
-               "git add .claude", "git add .agent-pool-context.md", "git commit -a", "git commit --all",
-               "git commit --amend", "git commit -F", "git commit --file",
+               "git config", "git -C", "git -c", "git remote", "git update-ref",
+               *[f"git {sub}" for sub in HISTORY_SUBS],
                "tea", "gh", "curl", "wget", "sudo", "rm -rf", "rm -fr", "systemctl", "crontab",
                "python3 -c", "python3 -", "node", "npx", "bash", "sh", "env", "eval",
                "rg --pre", "rg -z", "rg --search-zip", "git grep -O", "git grep --open-files-in-pager",
@@ -381,10 +356,6 @@ CURSOR_DENY += [f"git {sub} {lead}--output" for sub in ("diff", "log", "show")
                 for lead in ("", "-p ", "--patch ", "--stat ", "--oneline ", "--name-only ", "-p --stat ",
                              "--stat -p ", "--format=%H ", "-1 ", "-n 1 ")]
 CURSOR_DENY = list(dict.fromkeys(CURSOR_DENY))
-CURSOR_REVIEW_DENY = ["git add", "git commit"]
-CURSOR_EDIT_DENY = CURSOR_REVIEW_DENY + [
-    "git commit-tree", "git cherry-pick", "git revert", "git am", "git stash", "git tag", "git notes",
-    "git apply", "git checkout", "git switch", "git restore", "git rm", "git mv"]
 
 
 def home() -> str:
@@ -394,26 +365,20 @@ def home() -> str:
 def credential_globs() -> list[str]:
     h = home()
     return [f"{h}/.ssh/**", f"{h}/.config/tea/**", f"{h}/.config/pulse/**", f"{h}/.netrc",
-            f"{h}/.git-credentials", f"{h}/.config/gh/**", "/proc/**"]
+            f"{h}/.git-credentials", f"{h}/.config/gh/**", "/proc/**"] + \
+        ([signing_key()] if signing_key() else [])
 
 
 def shell_rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
     allow = list(READ_SHELL) + [f"python3 {a.adapter} {sub} *" for sub in ADAPTER_READS]
-    deny = list(DENY_SHELL)
-    if a.job == "resolve":
-        allow += COMMIT_SHELL + GATE_SHELL
-    elif a.job == "edit":
+    if a.job in WRITING_JOBS:
         allow += GATE_SHELL
-        deny += EDIT_DENY_SHELL
-    else:
-        deny += REVIEW_DENY_SHELL
-    return allow, deny
+    return allow, list(DENY_SHELL)
 
 
 def cursor_deny(a: argparse.Namespace) -> list[str]:
-    extra = {"review": CURSOR_REVIEW_DENY, "edit": CURSOR_EDIT_DENY}.get(a.job, [])
     adapter_writes = [f"python3 {a.adapter} {sub}" for sub in ("comment", "label", "merge")]
-    return list(dict.fromkeys(CURSOR_DENY + extra + adapter_writes))
+    return list(dict.fromkeys(CURSOR_DENY + adapter_writes))
 
 
 def git_paths(a: argparse.Namespace) -> list[str]:
@@ -456,7 +421,7 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
 
 
 def prefix_of(rule: str) -> str:
-    """A glob's literal lead as a Cursor command prefix: `git commit -m *` becomes `git commit -m`."""
+    """A glob's literal lead as a Cursor command prefix: `git diff *` becomes `git diff`."""
     return rule.split(" *", 1)[0].rstrip("*").rstrip()
 
 

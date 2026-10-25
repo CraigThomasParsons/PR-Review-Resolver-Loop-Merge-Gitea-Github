@@ -315,6 +315,47 @@ python3 "$SCRIPTS/report.py" scan --file "$TMP/scan.txt" >/dev/null
 expect_rc "r4#2: report.py scan passes clean commit text" "$?" 0
 
 echo
+echo "#30: head=pending resolve markers, stamp-head and the commit summary"
+REVIEWED=fedcba9876543210fedcba9876543210fedcba98
+NEWHEAD40=aaaabbbbccccddddeeeeffff0000111122223333
+resrep() { # head fixed -> report.py resolve output for a report whose marker says head=<head>
+  printf '## Automated resolve\nSummary: fix: guard the empty list\n<!-- pulse-resolve:v1 head=%s reviewed=%s fixed=%s noted=0 deferred=0 -->\n' \
+    "$1" "$REVIEWED" "$2" > "$TMP/res.md"
+  HOME="$TMP/home" env -u GITEA_TOKEN python3 "$SCRIPTS/report.py" resolve --marker-module "$MARKER_PY" \
+    --file "$TMP/res.md" --review-head "$REVIEWED" --findings "$2"
+}
+expect "#30: a resolve marker may say head=pending before the controller commits" "$(resrep pending 1)" $'ok\tpending\t1'
+expect "#30: a 40-hex head still parses as before" "$(resrep "$SHA40" 0)" $'ok\t'"$SHA40"$'\t0'
+expect "#30: any other non-hex head is still no marker" "$(resrep later 1)" "nomarker"
+expect "#30: the all-zero stand-in is never accepted as a real head" "$(resrep 0000000000000000000000000000000000000000 1)" "nomarker"
+printf 'x\n<!-- pulse-review:v1 head=pending findings=0 -->\n' > "$TMP/rev.md"
+expect "#30: a review marker may not say head=pending" \
+  "$(HOME="$TMP/home" python3 "$SCRIPTS/report.py" review --marker-module "$MARKER_PY" --file "$TMP/rev.md" --sha "$SHA40" | cut -f1)" "nomarker"
+resrep pending 1 >/dev/null
+python3 "$SCRIPTS/report.py" stamp-head --file "$TMP/res.md" --head "$NEWHEAD40" >/dev/null
+expect_rc "#30: stamp-head succeeds on a pending marker" "$?" 0
+expect "#30: stamp-head writes the real head into the marker" "$(cat "$TMP/res.md")" "pulse-resolve:v1 head=$NEWHEAD40 reviewed=$REVIEWED"
+expect_not "#30: no pending is left after stamping" "$(cat "$TMP/res.md")" "head=pending"
+expect "#30: the stamped marker is one marker.py reads" \
+  "$(python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("m", sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.parse_resolve(open(sys.argv[2]).read())[0])' "$MARKER_PY" "$TMP/res.md")" "$NEWHEAD40"
+expect "#30: the rest of the report is untouched" "$(sed -n 2p "$TMP/res.md")" "Summary: fix: guard the empty list"
+python3 "$SCRIPTS/report.py" stamp-head --file "$TMP/res.md" --head "$NEWHEAD40" >/dev/null 2>&1
+expect_rc "#30: stamp-head refuses a report with no pending marker" "$?" 1
+resrep pending 1 >/dev/null
+python3 "$SCRIPTS/report.py" stamp-head --file "$TMP/res.md" --head pending >/dev/null 2>&1
+expect_rc "#30: stamp-head refuses a head that is not 40-hex" "$?" 2
+printf 'Summary: pending work\nhead=pending outside any marker\n' > "$TMP/res2.md"
+python3 "$SCRIPTS/report.py" stamp-head --file "$TMP/res2.md" --head "$NEWHEAD40" >/dev/null 2>&1
+expect_rc "#30: stamp-head touches only resolve markers" "$?" 1
+expect "#30: so text outside the marker is never rewritten" "$(cat "$TMP/res2.md")" "head=pending outside any marker"
+summ() { printf '%b' "$1" > "$TMP/sum.md"; python3 "$SCRIPTS/report.py" summary --file "$TMP/sum.md" --fallback "chore(resolve): automated resolve for #7"; }
+expect "#30: the commit subject is the report's Summary: line" "$(summ '## Automated resolve\nSummary: fix: guard the empty list\n')" "fix: guard the empty list"
+expect "#30: no Summary: line falls back to the controller's subject" "$(summ '## Automated resolve\n')" "chore(resolve): automated resolve for #7"
+expect "#30: an over-long summary falls back" "$(summ "Summary: $(printf 'x%.0s' $(seq 120))\n")" "chore(resolve)"
+expect "#30: a summary carrying a marker falls back" "$(summ 'Summary: x <!-- pulse-resolve:v1 -->\n')" "chore(resolve)"
+expect "#30: a token-shaped summary falls back" "$(summ 'Summary: token: 3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901\n')" "chore(resolve)"
+
+echo
 echo "worker permission policy"
 AD_ABS=/opt/pool/skills/pr-loops-common/gitea-pr.py
 pol() { # family job command
@@ -346,8 +387,14 @@ for fam in glob prefix; do
   expect "$fam/review: staging is denied" "$(pol $fam review 'git add src/a.php')" deny
   expect "$fam/review: committing is denied" "$(pol $fam review 'git commit -m x')" deny
   expect "$fam/review: running the gate is not allowed" "$(pol $fam review 'npm test')" deny
-  expect "$fam/resolve: staging a named path is allowed" "$(pol $fam resolve 'git add src/a.php tests/b.php')" allow
-  expect "$fam/resolve: a commit -m is allowed" "$(pol $fam resolve 'git commit -m "fix: x"')" allow
+  # #30: workers never stage or commit, whatever the job; the controller makes the one commit.
+  expect "$fam/resolve: #30 staging a named path is denied" "$(pol $fam resolve 'git add src/a.php tests/b.php')" deny
+  expect "$fam/resolve: #30 a commit -m is denied" "$(pol $fam resolve 'git commit -m "fix: x"')" deny
+  expect "$fam/resolve: #30 a commit --message= is denied" "$(pol $fam resolve 'git commit --message=x')" deny
+  expect "$fam/resolve: #30 git commit-tree is denied" "$(pol $fam resolve 'git commit-tree 4b825dc -p HEAD -m x')" deny
+  expect "$fam/resolve: #30 a commit after a read is denied" "$(pol $fam resolve 'git status && git commit -m x')" deny
+  expect "$fam/resolve: #30 git stash is denied" "$(pol $fam resolve 'git stash')" deny
+  expect "$fam/resolve: #30 git checkout is denied" "$(pol $fam resolve 'git checkout -b other')" deny
   expect "$fam/resolve: the gate is allowed" "$(pol $fam resolve 'npm run test')" allow
   expect "$fam/resolve: git commit --amend is denied" "$(pol $fam resolve 'git commit --amend -m x')" deny
   expect "$fam/resolve: git commit -a is denied" "$(pol $fam resolve 'git commit -a -m x')" deny
@@ -544,7 +591,7 @@ for prov in claude grok; do
   expect "$prov denies git difftool" "$r" "Bash(git difftool*)"
   expect "$prov denies --output" "$r" "Bash(*--output*)"
   expect "$prov denies redirection" "$r" "Bash(*>*)"
-  expect "$prov denies git add -f" "$(rules_of $prov resolve)" "Bash(git add -f*)"
+  expect "$prov denies every git add, -f included (#30)" "$(rules_of $prov resolve)" "Bash(git add*)"
   expect "$prov denies credential reads" "$r" "Read("
 done
 # Review G2 and L1: writes scoped per job, .git never writable.
@@ -617,18 +664,24 @@ expect "grok r4#2: Read is scoped" "$(rules_of grok review)" $'allow\tRead(/wt/*
 expect "cursor r4#2: Read is scoped" "$(rules_of cursor review)" $'allow\tRead(/wt/**)'
 expect_not "cursor r4#2: no Read(**)" "$(rules_of cursor review)" $'allow\tRead(**)'
 expect "claude r4#1: brace expansion is denied in the emitted globs" "$r" 'Bash(*{*,*}*)'
-expect "claude r4#2: git commit -F is denied in the emitted globs" "$(rules_of claude resolve)" 'Bash(git commit -F*)'
+expect "claude r4#2: git commit -F is denied in the emitted globs (every git commit is, #30)" "$(rules_of claude resolve)" $'deny\tBash(git commit*)'
 expect_not "claude r4#2: git commit -F is no longer allowed" "$(rules_of claude resolve | grep '^allow')" 'git commit -F'
-expect "cursor r4#2: git commit -F is a deny prefix" "$(rules_of cursor resolve)" 'Shell(git commit -F)'
+expect "cursor r4#2: git commit -F is a deny prefix (git commit is, #30)" "$(rules_of cursor resolve)" $'deny\tShell(git commit)'
 expect_not "cursor resolve does not allow git commit --trailer" "$(rules_of cursor resolve | grep '^allow')" 'git commit --trailer'
-# Bracketed so the substring match is exact and a failure prints the whole commit allow list.
-expect "cursor resolve's only commit prefix is git commit -m" \
-  "[$(rules_of cursor resolve | grep '^allow' | grep 'git commit')]" $'[allow\tShell(git commit -m)]'
+# Bracketed so the substring match is exact and a failure prints any commit or add allow.
+expect "cursor resolve has no commit or add prefix at all (#30)" \
+  "[$(rules_of cursor resolve | grep '^allow' | grep -E 'git (commit|add)')]" '[]'
+for d in 'git add' 'git commit' 'git commit-tree'; do
+  expect "cursor resolve denies $d explicitly (#30)" "$(rules_of cursor resolve)" $'deny\tShell('"$d"')'
+done
 expect_not "cursor review does not allow git commit --trailer" "$(rules_of cursor review | grep '^allow')" 'git commit'
 expect "cursor review denies git commit" "$(rules_of cursor review)" $'deny\tShell(git commit)'
 for prov in claude grok; do
   expect_not "$prov resolve does not allow git commit --trailer" "$(rules_of $prov resolve | grep '^allow')" 'git commit --trailer'
-  expect "$prov resolve still allows git commit -m" "$(rules_of $prov resolve)" $'allow\tBash(git commit -m *)'
+  expect_not "$prov resolve allows no git commit (#30)" "$(rules_of $prov resolve | grep '^allow')" 'git commit'
+  expect_not "$prov resolve allows no git add (#30)" "$(rules_of $prov resolve | grep '^allow')" 'git add'
+  expect "$prov resolve denies git commit (#30)" "$(rules_of $prov resolve)" $'deny\tBash(git commit*)'
+  expect "$prov resolve denies git add (#30)" "$(rules_of $prov resolve)" $'deny\tBash(git add*)'
   expect_not "$prov review does not allow git commit --trailer" "$(rules_of $prov review | grep '^allow')" 'git commit'
   expect "$prov review denies git commit" "$(rules_of $prov review)" $'deny\tBash(git commit*)'
 done
@@ -641,7 +694,8 @@ globs = lambda k: [r[5:-1] for kind, r in rules if kind == k and r.startswith("B
 ok = any(fnmatch.fnmatchcase(cmd, g) for g in globs("allow")) and not any(fnmatch.fnmatchcase(cmd, g) for g in globs("deny"))
 print("allow" if ok else "deny")' "$2"
 }
-expect "grok globs: a commit -m is allowed" "$(glob_only resolve 'git commit -m x')" allow
+expect "grok globs: #30 a commit -m is denied" "$(glob_only resolve 'git commit -m x')" deny
+expect "grok globs: #30 staging a named path is denied" "$(glob_only resolve 'git add src/a.php')" deny
 expect "grok globs: a commit --trailer -m is denied" "$(glob_only resolve 'git commit --trailer Made-with:Cursor -m x')" deny
 expect "grok globs: a commit --trailer with no -m is denied" "$(glob_only resolve 'git commit --trailer Made-with:Cursor')" deny
 expect "grok globs: review commit --trailer -m is denied" "$(glob_only review 'git commit --trailer T -m x')" deny
@@ -706,7 +760,7 @@ p = json.load(sys.stdin)["permissions"]
 grants = [r for r in p["allow"] if re.match(r"Shell\(git (add|commit|push)\b", r)]
 print(len(grants), all(f"Shell(git {s})" in p["deny"] for s in ("add", "commit", "push")))')"
 expect "cursor-json --job edit grants no stage/commit/push and denies all three" "$edit_json" "0 True"
-expect "cursor resolve still allows git commit -m (agent-pool workers unchanged)" "$(rules_of cursor resolve)" $'allow\tShell(git commit -m)'
+expect_not "cursor resolve allows no git commit either (#30)" "$(rules_of cursor resolve | grep '^allow')" 'git commit'
 hk edit '{"tool_name":"Edit","tool_input":{"file_path":"/wt/src/a.php"}}'
 expect_rc "claude hook: edit may edit the worktree" "$?" 0
 hk edit '{"tool_name":"Edit","tool_input":{"file_path":"/wt/.cursor/cli.json"}}'
