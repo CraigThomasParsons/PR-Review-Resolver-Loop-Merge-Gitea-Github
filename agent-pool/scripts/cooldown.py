@@ -9,7 +9,8 @@ once a provider has gone a full cap length past its last cooldown without a new 
 Setup faults (a permission the pool's own configuration denied, a missing binary or
 model) are NOT limits: retrying later will fail the same way until a person fixes the
 setup, and a cooldown would only hide that. They go to faults/<provider>.json instead,
-which nothing reads to gate selection.
+which nothing reads to gate selection, except faults/gates.json (the controller's gate
+sandbox): while it exists, prod-common.sh claims no resolve job.
 
 Subcommands:
   record   --provider P --reason R [--seconds S]   add a strike; print "<until>\t<seconds>".
