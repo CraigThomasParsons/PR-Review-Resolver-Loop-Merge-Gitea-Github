@@ -377,6 +377,11 @@ def _write_atomic(path: Path, text: str) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -700,6 +705,8 @@ def cmd_receipt(a: argparse.Namespace) -> int:
         try:
             run = json.loads(Path(a.run).read_text() or "{}")
         except ValueError:
+            run = {}
+        if not isinstance(run, dict):
             run = {}
     doc = {"version": 1, "repo": a.repo, "pr": int(a.pr), "attempt_id": a.attempt, "provider": a.provider,
            "base_sha": a.base_sha, "pr_head": a.pr_head, "head": a.head,
