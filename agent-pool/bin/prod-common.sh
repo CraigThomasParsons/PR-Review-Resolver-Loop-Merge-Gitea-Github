@@ -94,6 +94,11 @@
 #   CLAUDE_PERMISSION_MODE=default  GROK_PERMISSION_MODE=dontAsk  CODEX_SANDBOX_MODE=workspace-write
 #   AGY_AUTO_APPROVE=1             let agy take resolve jobs (--dangerously-skip-permissions)
 #   AGY_PRINT_TIMEOUT=0            agy's own print timeout; 0 leaves WORKER_TIMEOUT as the only limit
+#   AGENT_POOL_GATE_BUDGET=1200    cap (s) on any manifest's gate budget; a job's gates also stop
+#                                  60s before its claim deadline
+#   AGENT_POOL_GATES_DIR           controller-owned manifest overrides (~/.config/agent-pool/gates)
+#   AGENT_POOL_GATE_RO_BINDS       colon list of toolchain dirs bound read-only into the gate sandbox
+#   AGENT_POOL_GATE_SANDBOX AGENT_POOL_GATE_SCOPE   bwrap and systemd-run paths (default: /usr/bin)
 #   AGENT_POOL_ABILITIES           comma list of the abilities this repo grants (plan, review,
 #                                  prototype, test-author, resolve); a job kind runs only if its
 #                                  ability is listed, and agy never resolves, AGY_AUTO_APPROVE or
@@ -105,6 +110,16 @@
 # AGY_AUTO_APPROVE unset, AGENT_POOL_WORKER_ID defaulting to <host>-<provider>, and
 # AGENT_POOL_NIGHTCREW_HOLD=1 where the repo sets nightcrew_hold. With AGENT_POOL_REPO set, only
 # that repo is ticked.
+#
+# Gates (scripts/gates.py, docs/plans/controller-gates.md): workers run no gate. After a resolve
+# worker has exited and before anything is pushed, the controller loads the gate manifest from
+# the PR's base branch by blob (or a controller-owned override), refuses commits that change
+# gate-defining files, checks the worker's commit out by SHA into a fresh directory with no
+# .git, and runs the selected gates there in a sandbox with no network, home, ssh agent or
+# tokens. The result is a write-once receipt bound to the attempt and the exact head; the push
+# goes ahead only for a receipt that passed. A red gate is a needs-human with nothing pushed; a
+# broken sandbox or manifest is a setup fault [gates] that requeues the job and pauses resolve
+# jobs until a person fixes it and deletes faults/gates.json.
 #
 # Exit codes: 0 for a normal tick (including nothing to do); 2 for a setup fault.
 
@@ -197,6 +212,8 @@ MAX_JOBS="${AGENT_POOL_MAX_JOBS:-2}"
 WORKER_TIMEOUT="${WORKER_TIMEOUT:-2400}"
 HEAD_SETTLE="${AGENT_POOL_HEAD_SETTLE:-1 2 3 4}"
 TIMEOUT_COOLDOWN="${AGENT_POOL_TIMEOUT_COOLDOWN:-900}"
+GATE_BUDGET="${AGENT_POOL_GATE_BUDGET:-1200}"
+export AGENT_POOL_GATE_BUDGET="$GATE_BUDGET"
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_HOLD="${AGENT_POOL_HOLD_LABELS-status: in-progress}"
 BOT="${AGENT_POOL_BOT:-}"
@@ -300,6 +317,11 @@ job_providers() { # job
   local p
   JOB_PROVIDERS=()
   ability_enabled "$1" || return 0
+  # Another provider would only hit the same broken sandbox after a full WORKER_TIMEOUT.
+  if [ "$1" = resolve ] && [ -e "$STATE/faults/gates.json" ]; then
+    log "$REPO: resolve jobs are paused: the gate sandbox has a recorded fault ($STATE/faults/gates.json); fix it, then delete that file"
+    return 0
+  fi
   for p in "${PROVIDERS[@]}"; do
     [ "$1" = resolve ] && [ "$p" = agy ] && { [ "${AGY_AUTO_APPROVE:-0}" != 1 ] || [ "$ABILITIES_SET" = 1 ]; } && continue
     JOB_PROVIDERS+=("$p")
@@ -550,6 +572,7 @@ remove_worktree() { # wt
 end_job() {
   kill_worker_group; watch_stop
   remove_worktree "$JOB_WT"
+  gate_cleanup
   rm -f "$JOB_LOSTFILE"
   JOB_PR=""; ATTEMPT=""; JOB_KIND=""; JOB_WT=""; JOB_LOST=0; JOB_LOSTFILE=""
 }
@@ -580,11 +603,150 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# ---------------------------------------------------------------- controller-run gates
+MAIN_GITDIR=""; MAIN_CONFIG_SUM=""; GATE_DIR=""; GATE_RECEIPT=""
+
+# Every controller git call on the gate path. Nothing inherited reaches git: no GIT_* from the
+# tick's env, no global or system config (aliases, filters, textconv, insteadOf), no hooks, no
+# replace refs or grafts. MAIN's own config is the only one read; it is controller-owned and its
+# checksum is re-checked before the checkout and before the push.
+gate_git() { # [GIT_INDEX_FILE=path] git-args...
+  local idx=()
+  case "${1:-}" in GIT_INDEX_FILE=*) idx=("$1"); shift ;; esac
+  env -i PATH=/usr/bin:/bin HOME="$STATE/empty-home" LANG=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_DIR="$MAIN_GITDIR" \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null GIT_TERMINAL_PROMPT=0 "${idx[@]}" \
+    git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false \
+      -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false \
+      -c core.symlinks=true -c core.autocrlf=false "$@"
+}
+
+gate_config_intact() {
+  [ -n "$MAIN_CONFIG_SUM" ] && [ "$(sha256sum < "$MAIN_GITDIR/config" 2>/dev/null)" = "$MAIN_CONFIG_SUM" ]
+}
+
+# gate_checkout commit -> GATE_DIR: the commit's tracked content only, through a private index,
+# in a fresh directory that is not a git worktree. No .git, no untracked or ignored files from
+# the worker's worktree, no export-ignore/export-subst (that would be git archive).
+gate_checkout() {
+  mkdir -p "$STATE/gate-work" "$STATE/empty-home"
+  GATE_DIR="$(mktemp -d "$STATE/gate-work/$(slug "$REPO")-$JOB_PR-XXXXXX")" || return 1
+  gate_git "GIT_INDEX_FILE=$GATE_DIR.index" read-tree "$1" || return 1
+  ( cd "$GATE_DIR" && gate_git "GIT_INDEX_FILE=$GATE_DIR.index" --work-tree="$GATE_DIR" checkout-index -a -f ) || return 1
+  rm -f "$GATE_DIR.index"
+}
+
+gate_cleanup() {
+  [ -n "$GATE_DIR" ] || return 0
+  chmod -R u+w "$GATE_DIR" 2>/dev/null
+  rm -rf "$GATE_DIR" "$GATE_DIR.index"
+  GATE_DIR=""
+}
+
+claim_secs_left() {
+  claim show 2>/dev/null | python3 -c '
+import datetime, json, os, sys, time
+d = json.load(sys.stdin).get("expected_deadline_at")
+now = float(os.environ.get("AGENT_POOL_NOW") or time.time())
+print(int(datetime.datetime.strptime(d, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp() - now) if d else 0)'
+}
+
+# gate_receipt provider sha newhead base-sha manifest-json result reason [run-json] -> GATE_RECEIPT
+gate_receipt() {
+  local src blob
+  read -r src blob < <(python3 -c 'import json,sys
+try: d = json.load(open(sys.argv[1]))
+except (OSError, ValueError): d = {}
+print(d.get("source") or "none", d.get("blob") or "-")' "$5")
+  [ "$blob" = - ] && blob=""
+  GATE_RECEIPT="$(python3 "$SCRIPTS/gates.py" receipt --state "$STATE" --repo "$REPO" --pr "$JOB_PR" \
+    --attempt "$ATTEMPT" --provider "$1" --base-sha "$4" --pr-head "$2" --head "$3" --source "$src" \
+    --blob "$blob" --result "$6" --reason "$7" ${8:+--run "$8"} 2>>"$LOG")"
+}
+
+# run_gates provider sha newhead base -> 0 with GATE_RECEIPT naming a passing receipt, else 1
+# with PUB set: fail:<why> (a red gate, protected paths, no manifest), gateinfra:<why> or lost.
+# The worker's process group is already dead; nothing here reads the worker's worktree.
+run_gates() {
+  local p="$1" sha="$2" newhead="$3" base="$4" tag base_sha manifest raw hits names budget left run res why
+  tag="$JOB_PR-${ATTEMPT:0:8}"; manifest="$RUNS/gates-manifest-$tag.json"; raw="$RUNS/gates-diff-$tag"
+  run="$RUNS/gates-run-$tag.json"; GATE_RECEIPT=""
+  gate_config_intact || { PUB="gateinfra:the main clone's git config changed during the job; refusing to gate or push"; return 1; }
+  [ "$(gate_git rev-parse --verify -q "$newhead^{commit}")" = "$newhead" ] \
+    || { PUB="gateinfra:the worker's head $newhead is not a commit in the main clone"; return 1; }
+  gate_git merge-base --is-ancestor "$sha" "$newhead" 2>/dev/null \
+    || { PUB="fail:the worker's commits at $newhead are not a fast-forward of $sha"; return 1; }
+  base_sha="$(gate_git rev-parse --verify -q "refs/remotes/origin/$base^{commit}")" \
+    || { PUB="gateinfra:cannot resolve origin/$base in the main clone"; return 1; }
+  if ! python3 "$SCRIPTS/gates.py" load --main "$MAIN" --base-sha "$base_sha" --repo "$REPO" > "$manifest" 2>"$raw.err"; then
+    why="the gate manifest for $REPO at $base_sha is unreadable or invalid: $(head -c 300 "$raw.err" | tr '\n' ' ')"
+    gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" infra "$why"
+    PUB="gateinfra:$why"; return 1
+  fi
+  gate_git diff-tree -r -z --no-renames --raw "$sha" "$newhead" > "$raw" \
+    && python3 "$SCRIPTS/gates.py" changes --raw "$raw" --changed-out "$raw.changed" --gitlinks-out "$raw.gitlinks" \
+    || { PUB="gateinfra:could not list the paths the worker changed"; return 1; }
+  hits="$(python3 "$SCRIPTS/gates.py" protected --manifest "$manifest" --changed "$raw.changed" --gitlinks "$raw.gitlinks")" \
+    || { PUB="gateinfra:could not check the worker's changes against the protected paths"; return 1; }
+  if [ "$hits" != none ]; then
+    why="the worker's commits change gate-defining files ($(printf '%s\n' "$hits" | head -5 | tr '\n' ' ' | sed 's/ $//')); a human must review them"
+    gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" protected "$why"
+    PUB="fail:$why"; return 1
+  fi
+  if grep -q '"source": "none"' "$manifest"; then
+    if python3 "$SCRIPTS/gates.py" docs-only --changed "$raw.changed"; then
+      gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" none-needed "no gate manifest, and only documentation changed"
+      [ -n "$GATE_RECEIPT" ] || { PUB="gateinfra:could not write the gate receipt"; return 1; }
+      jlog "gates: none needed (no manifest, documentation only) at $newhead"; return 0
+    fi
+    why="$REPO has no gate manifest (.agent-pool/gates.toml on $base or a controller override), so the worker's code changes cannot be gated"
+    gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" no-manifest "$why"
+    PUB="fail:$why"; return 1
+  fi
+  names="$(python3 "$SCRIPTS/gates.py" select --manifest "$manifest" --changed "$raw.changed")" \
+    || { PUB="gateinfra:could not select the gates for the worker's changes"; return 1; }
+  if [ "$names" = none ]; then
+    gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" none-needed "no gate applies to the changed paths"
+    [ -n "$GATE_RECEIPT" ] || { PUB="gateinfra:could not write the gate receipt"; return 1; }
+    jlog "gates: none apply to the changed paths at $newhead"; return 0
+  fi
+  left="$(claim_secs_left)"; budget=$(( ${left:-0} - 60 ))
+  [ "$budget" -gt "$GATE_BUDGET" ] && budget="$GATE_BUDGET"
+  gate_config_intact || { PUB="gateinfra:the main clone's git config changed during the job; refusing to gate or push"; return 1; }
+  gate_checkout "$newhead" || { gate_cleanup; PUB="gateinfra:could not check out $newhead for the gates"; return 1; }
+  printf '%s\n' "$names" > "$raw.select"
+  jlog "gates: running $(printf '%s' "$names" | tr '\n' ' ')at $newhead (budget ${budget}s)"
+  # Its own process group, watched like a worker: a superseded claim kills the gate run too.
+  setsid python3 "$SCRIPTS/gates.py" run --manifest "$manifest" --gate-dir "$GATE_DIR" --select "$raw.select" \
+    --runs "$RUNS" --tag "$tag" --budget "$budget" --lock "$STATE/gates.lock" > "$run" 2>>"$LOG" &
+  WORKER_PG=$!
+  watch_start
+  wait "$WORKER_PG"
+  watch_stop; kill_worker_group
+  gate_cleanup
+  if ! still_held; then PUB=lost; return 1; fi
+  IFS=$'\t' read -r res why < <(python3 -c 'import json,sys
+try: d = json.load(open(sys.argv[1]))
+except (OSError, ValueError): d = {"result": "infra", "reason": "the gate runner left no result"}
+print(d.get("result") or "infra", (d.get("reason") or "-").replace("\t", " ").replace("\n", " "), sep="\t")' "$run")
+  [ "$why" = - ] && why=""
+  gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" "$res" "$why" "$run"
+  [ -n "$GATE_RECEIPT" ] || { PUB="gateinfra:could not write the gate receipt for $newhead (one may already exist for this attempt)"; return 1; }
+  jlog "gates: $res at $newhead${why:+ ($why)}"
+  case "$res" in
+    pass) return 0 ;;
+    gate-fail|gate-timeout|gate-resource)
+      PUB="fail:the controller's gates are red at $newhead: $why; nothing was pushed (gate logs are on the pool host)"; return 1 ;;
+    *) PUB="gateinfra:${why:-the gate run failed}"; return 1 ;;
+  esac
+}
+
 # ---------------------------------------------------------------- controller-side publication
-# publish provider sha headref report result -> PUB: published | nomarker:<why> | requeue:<why> |
-# fail:<why> | lost. The only path by which a worker's work reaches Gitea.
+# publish provider sha headref report result base -> PUB: published | nomarker:<why> |
+# requeue:<why> | fail:<why> | gateinfra:<why> | lost. The only path by which a worker's work
+# reaches Gitea.
 publish() {
-  local p="$1" sha="$2" headref="$3" report="$4" result="$5" chk alt head fixed newhead remote rc tool scan
+  local p="$1" sha="$2" headref="$3" report="$4" result="$5" base="$6" chk alt head fixed newhead remote rc tool scan
   local args=(--marker-module "$MARKER")
   PUSHED=""
   if [ "$JOB_KIND" = review ]; then args+=(--sha "$sha")
@@ -622,8 +784,15 @@ publish() {
         PUB="fail:the worker's commits contain a credential or token-shaped string; refusing to push"; return
       fi
       rm -f "$scan"
+      run_gates "$p" "$sha" "$newhead" "$base" || return
       remote="$(git -C "$MAIN" ls-remote origin "refs/heads/$headref" 2>/dev/null | cut -f1)"
       [ "$remote" = "$sha" ] || { PUB="requeue:origin/$headref is at ${remote:-nothing}, not $sha; the branch moved during the run"; return; }
+      gate_config_intact || { PUB="gateinfra:the main clone's git config changed before the push; refusing to push"; return; }
+      python3 "$SCRIPTS/gates.py" check-receipt --state "$STATE" --repo "$REPO" --pr "$JOB_PR" --attempt "$ATTEMPT" \
+        --head "$newhead" 2>>"$LOG" || { PUB="gateinfra:no passing gate receipt for this attempt at $newhead; refusing to push"; return; }
+      python3 "$SCRIPTS/gates.py" annotate --report "$report" --receipt "$GATE_RECEIPT" --out "$report.gated" \
+        || { PUB="gateinfra:could not add the gate section to the report"; return; }
+      report="$report.gated"
       # No hooks and no force: the server refuses anything that is not a fast-forward.
       guarded "push" git -C "$MAIN" -c core.hooksPath=/dev/null push --quiet --no-verify origin "$newhead:refs/heads/$headref"
       rc=$?
@@ -697,10 +866,14 @@ attempt() {
   if ! still_held; then VERDICT=lost; DETAIL="$p ran ${elapsed}s but its attempt was superseded"; return; fi
   cls="$(python3 "$SCRIPTS/classify.py" --provider "$p" --exit "$rc" --stdout "$out" --stderr "$err" --result-out "$result")"
   session="${cls##*$'\t'}"; cls="${cls%$'\t'*}"
-  publish "$p" "$sha" "$headref" "$report" "$result"
+  publish "$p" "$sha" "$headref" "$report" "$result" "$base"
   case "$PUB" in
     lost)       VERDICT=lost; DETAIL="$p's attempt was superseded before its work was published"; return ;;
     requeue:*)  VERDICT=requeue; DETAIL="${PUB#*:}"; return ;;
+    # Before the provider's own verdict: this is the controller's fault, not the provider's.
+    gateinfra:*)
+      setup_fault gates "${PUB#*:}"
+      VERDICT=requeue; DETAIL="the controller's gate run could not complete (${PUB#*:})"; return ;;
     published)  v="$(verify "$JOB_KIND" "$JOB_PR" "$sha" "$headref" "$PUSHED")" ;;
     nomarker:*) v="fail-nomarker:${PUB#*:}" ;;
     *)          v="$PUB" ;;
@@ -825,6 +998,9 @@ if [ "${#PROVIDERS[@]}" -eq 0 ]; then
 fi
 
 git -C "$MAIN" fetch origin --quiet --prune 2>/dev/null || log "warning: fetch failed; continuing with what is local"
+MAIN_GITDIR="$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+  || die "cannot find the git directory of $MAIN"
+MAIN_CONFIG_SUM="$(sha256sum < "$MAIN_GITDIR/config")" || die "cannot read $MAIN_GITDIR/config"
 
 # Candidates carry agent:ready or agent:claimed, or have a claim record here to reconcile.
 CLAIM_PRS="$(cd "$STATE/claims" 2>/dev/null && for f in "$(slug "$REPO")"__*.json; do [ -e "$f" ] && { f="${f##*__}"; printf '%s ' "${f%.json}"; }; done)"

@@ -37,6 +37,26 @@ ODD_REF='feature/a|b&c'
 git init -q --bare "$ORIGIN"
 git clone -q "$ORIGIN" "$TMP/main" 2>/dev/null
 git -C "$TMP/main" commit -q --allow-empty -m base
+# A base branch with no gate manifest at all.
+git -C "$TMP/main" push -q origin HEAD:refs/heads/bare
+# The pinned gate manifest lives on the base branch; every resolve below is gated by it.
+mkdir -p "$TMP/main/.agent-pool"
+cat > "$TMP/main/.agent-pool/gates.toml" <<'EOF'
+version = 1
+protect = ["justfile"]
+
+[defaults]
+timeout = 4
+budget  = 30
+
+[[gate]]
+name  = "unit"
+argv  = ["just", "gate"]
+paths = ["*.txt", "src/**"]
+EOF
+printf 'gate:\n\ttrue\n' > "$TMP/main/justfile"
+git -C "$TMP/main" add .agent-pool/gates.toml justfile
+git -C "$TMP/main" commit -q -m "gates manifest"
 git -C "$TMP/main" push -q origin HEAD:master
 git -C "$TMP/main" checkout -q -b feature/x
 echo change > "$TMP/main/f.txt"
@@ -49,6 +69,20 @@ git -C "$TMP/main" checkout -q --detach
 git -C "$TMP/main" commit -q --allow-empty -m "fix: an earlier resolve"
 RESOLVED="$(git -C "$TMP/main" rev-parse HEAD)"
 git -C "$TMP/main" push -q origin HEAD:refs/heads/resolved-fixture
+# A PR whose own (human) commit rewrites the manifest: gates still come from its base.
+git -C "$TMP/main" checkout -q --detach "$SHA"
+sed -i 's/"just", "gate"/"just", "evil"/' "$TMP/main/.agent-pool/gates.toml"
+git -C "$TMP/main" commit -q -am "human: change the gates in the PR"
+git -C "$TMP/main" push -q origin HEAD:refs/heads/feature/gatepr
+GATEPR_SHA="$(git -C "$TMP/main" rev-parse HEAD)"
+# A PR whose own commit adds a filter attribute that global config or the env would define.
+git -C "$TMP/main" checkout -q --detach "$SHA"
+echo ORIGINAL > "$TMP/main/payload.txt"
+echo 'payload.txt filter=evil' > "$TMP/main/.gitattributes"
+git -C "$TMP/main" add payload.txt .gitattributes
+git -C "$TMP/main" commit -q -m "human: attributes"
+git -C "$TMP/main" push -q origin HEAD:refs/heads/feature/attr
+ATTR_SHA="$(git -C "$TMP/main" rev-parse HEAD)"
 git -C "$TMP/main" checkout -q --detach "$SHA"
 
 # ---------------------------------------------------------------- stub Gitea adapter
@@ -69,7 +103,7 @@ def head(p):
 cmd = a[0]
 if cmd == "list":
     print(json.dumps([{"number": int(n), "title": "t", "draft": False, "head_sha": head(p),
-                       "head_ref": p["head_ref"], "base_ref": "master", "author": "human",
+                       "head_ref": p["head_ref"], "base_ref": p.get("base_ref", "master"), "author": "human",
                        "is_bot": False, "labels": p["labels"], "assignees": p.get("assignees", []),
                        "url": ""} for n, p in st["prs"].items()]))
 elif cmd == "labels":
@@ -208,6 +242,19 @@ case "$behave" in
   resolve-lag)
     commit_fix; cat "$STUB_BEHAVE/lag" > "$STUB_GITEA.lag"
     resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-gatefile)
+    commit_fix; sed -i 's/"just", "gate"/"just", "evil"/' .agent-pool/gates.toml
+    git commit -q -am "chore: loosen the gate"; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-gatescript)
+    commit_fix; printf 'gate:\n\texit 0\n' > justfile
+    git commit -q -am "chore: simplify the gate"; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-docs)
+    mkdir -p docs; echo "note $RANDOM" >> docs/notes.md; git add docs/notes.md; git commit -q -m "docs: note"
+    resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-plant)
+    commit_fix; echo planted > planted.txt; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-gitconfig)
+    commit_fix; git config pool.tampered yes; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
   resolve-miscount) commit_fix; resolve_text 1 "${findings:-1}" 0 > "$report"; success ;;
   resolve-unclaimed) commit_fix; resolve_text 0 "${findings:-1}" 0 > "$report"; success ;;
   resolve-push)
@@ -260,22 +307,110 @@ SH
 chmod +x "$BIN/stub-provider"
 for cli in claude cursor-agent grok agy codex; do ln -s stub-provider "$BIN/$cli"; done
 
+# ---------------------------------------------------------------- stub gate sandbox
+# The controller's gate runner always goes through systemd-run and bwrap. These stubs keep the
+# suite hermetic: they record their arguments and emulate only what the controller relies on
+# (bwrap's --clearenv/--setenv, the /work bind and --chdir, and the --json-status-fd protocol).
+# verify-gates.sh runs the same runner against the real bwrap and systemd-run.
+cat > "$BIN/stub-systemd-run" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "@CALLS@/scope.log"
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+exec "$@"
+SH
+cat > "$BIN/stub-bwrap" <<'PY'
+#!/usr/bin/env python3
+import json, os, signal, subprocess, sys
+calls, behave = "@CALLS@", "@BEHAVE@"
+args = sys.argv[1:]
+open(calls + "/bwrap.log", "a").write("--- call\n" + "".join(f"ARG {x}\n" for x in args))
+if os.path.exists(behave + "/sandbox") and open(behave + "/sandbox").read().strip() == "broken":
+    sys.exit("bwrap: setting up uid map: Permission denied")
+two = {"--ro-bind", "--ro-bind-try", "--bind", "--bind-try", "--dev-bind", "--symlink", "--setenv"}
+one = {"--tmpfs", "--dir", "--proc", "--dev", "--chdir", "--json-status-fd", "--unsetenv"}
+env, binds, chdir, status, clear, i = {}, {}, "/", None, False, 0
+while args[i] != "--":
+    if args[i] in two:
+        if args[i] == "--setenv":
+            env[args[i + 1]] = args[i + 2]
+        elif args[i] in ("--bind", "--ro-bind"):
+            binds[args[i + 2]] = args[i + 1]
+        i += 3
+    elif args[i] in one:
+        if args[i] == "--chdir":
+            chdir = args[i + 1]
+        elif args[i] == "--json-status-fd":
+            status = int(args[i + 1])
+        i += 2
+    else:
+        clear = clear or args[i] == "--clearenv"
+        i += 1
+if not clear:
+    env = {**os.environ, **env}
+emit = lambda doc: os.write(status, (json.dumps(doc) + "\n").encode())
+try:
+    child = subprocess.Popen(args[i + 1:], env=env, cwd=chdir.replace("/work", binds["/work"], 1), start_new_session=True)
+except OSError as error:
+    emit({"child-pid": 0})
+    sys.exit(f"bwrap: execvp {args[i + 1]}: {error.strerror}")
+# Stand-in for --die-with-parent: whoever stops this stub stops the gate with it.
+signal.signal(signal.SIGTERM, lambda *_: (os.killpg(child.pid, signal.SIGKILL), sys.exit(143)))
+emit({"child-pid": child.pid})
+rc = child.wait()
+rc = rc if rc >= 0 else 128 - rc
+emit({"exit-code": rc})
+sys.exit(rc)
+PY
+sed -i "s|@CALLS@|$TMP/calls|; s|@BEHAVE@|$TMP/behave|" "$BIN/stub-systemd-run" "$BIN/stub-bwrap"
+chmod +x "$BIN/stub-systemd-run" "$BIN/stub-bwrap"
+# The only gate runner the fixture manifest names. The sandbox env is cleared, so every path it
+# needs is baked in here.
+mkdir -p "$TMP/toolchain/bin"
+cat > "$TMP/toolchain/bin/just" <<'SH'
+#!/bin/sh
+T="@TMP@"
+echo "$*" >> "$T/calls/gate-ran"
+{ echo "--- gate $*"; env | sort; echo "PWD=$PWD"; echo "LS=$(ls -A | tr '\n' ' ')"
+  [ -f payload.txt ] && echo "PAYLOAD=$(cat payload.txt)"; } >> "$T/calls/gate-seen"
+[ "$1" = evil ] && : > "$T/calls/gate-evil"
+case "$(cat "$T/behave/gate" 2>/dev/null || echo pass)" in
+  pass)  echo "all green" ;;
+  fail)  echo "3 tests red"; echo "FAILED: test_secret_detail" >&2; exit 1 ;;
+  sleep) sleep 30 & echo $! >> "$T/stub-pids"; wait $! ;;
+  steal)
+    export STUB_GITEA="$T/gitea.json" STUB_ORIGIN="$T/origin.git" AGENT_POOL_STATE="$T/state"
+    attempt="$(python3 "@CLAIMREC@" show --repo owner/repo --pr 7 | python3 -c 'import json,sys; print(json.load(sys.stdin)["attempt_id"])')"
+    AGENT_POOL_NOW=$(( $(date +%s) + 100000 )) python3 "@CLAIMREC@" requeue --repo owner/repo --pr 7 \
+      --attempt "$attempt" --adapter "$T/common/gitea-pr.py" >/dev/null
+    python3 "@CLAIMREC@" claim --repo owner/repo --pr 7 --worker thief --provider grok \
+      -- python3 "$T/common/gitea-pr.py" label --repo owner/repo --pr 7 --remove agent:ready --add agent:claimed >/dev/null
+    sleep 300 & echo $! > "$T/calls/gate-sleep.pid"; echo $! >> "$T/stub-pids"; wait $! ;;
+esac
+SH
+sed -i "s|@TMP@|$TMP|; s|@CLAIMREC@|$CLAIMREC|g" "$TMP/toolchain/bin/just"
+chmod +x "$TMP/toolchain/bin/just"
+
 # ---------------------------------------------------------------- harness
 export AGENT_POOL_MAIN="$TMP/main" AGENT_POOL_REPO="$R" AGENT_POOL_STATE="$TMP/state"
 export AGENT_POOL_WORKTREES="$TMP/wt" AGENT_POOL_ADAPTER="$TMP/common/gitea-pr.py"
 export AGENT_POOL_MARKER="$TMP/common/marker.py" AGENT_POOL_WORKER_ID=test-worker AGENT_POOL_WATCH_SECS=1
 export ANTHROPIC_API_KEY=stale-key-for-test PR_LOOP_SKIP_PATTERN=""
+export AGENT_POOL_GATE_SANDBOX="$BIN/stub-bwrap" AGENT_POOL_GATE_SCOPE="$BIN/stub-systemd-run"
+export AGENT_POOL_GATE_RO_BINDS="$TMP/toolchain" AGENT_POOL_GATES_DIR="$TMP/gates-override"
 unset PROVIDER_ORDER AGY_AUTO_APPROVE
 
-reset() { # labels-json [assignees-json] [comments-json] [head-ref]
+reset() { # labels-json [assignees-json] [comments-json] [head-ref] [base-ref]
   rm -rf "$TMP/state" "$TMP/calls"/* "$TMP/behave"/* "$STUB_GITEA.writes" "$STUB_GITEA.race" "$STUB_GITEA.lag" \
     "$STUB_GITEA.faildone"
   git --git-dir "$ORIGIN" update-ref refs/heads/feature/x "$SHA"
   git --git-dir "$ORIGIN" update-ref "refs/heads/$ODD_REF" "$SHA"
-  python3 - "$STUB_GITEA" "$1" "${2:-[]}" "${3:-[]}" "${4:-feature/x}" "$SHA" <<'PY'
+  git --git-dir "$ORIGIN" update-ref refs/heads/feature/gatepr "$GATEPR_SHA"
+  git --git-dir "$ORIGIN" update-ref refs/heads/feature/attr "$ATTR_SHA"
+  python3 - "$STUB_GITEA" "$1" "${2:-[]}" "${3:-[]}" "${4:-feature/x}" "$SHA" "${5:-master}" <<'PY'
 import json, sys
-path, labels, assignees, comments, ref, sha = sys.argv[1:]
-json.dump({"prs": {"7": {"head_ref": ref, "head_sha": sha, "labels": json.loads(labels),
+path, labels, assignees, comments, ref, sha, base = sys.argv[1:]
+json.dump({"prs": {"7": {"head_ref": ref, "head_sha": sha, "base_ref": base, "labels": json.loads(labels),
                          "assignees": json.loads(assignees), "comments": json.loads(comments)}}}, open(path, "w"))
 PY
 }
@@ -442,6 +577,169 @@ for lag in 3 99; do
   expect "S6: a resolve is verified against the pushed head while Gitea lags ($lag reads)" "$(labels)" "agent:done"
   expect_not "S6: not 'head never moved' ($lag reads)" "$(cat "$TMP/out.txt")" "never moved"
 done
+
+echo
+echo "controller gates: pinned on the base branch, run after the worker in a sandbox, before any push"
+gate_ran() { cat "$TMP/calls/gate-ran" 2>/dev/null || echo none; }
+gate_seen() { cat "$TMP/calls/gate-seen" 2>/dev/null; }
+receipt() { cat "$TMP/state/gates/owner_repo__7__"*.json 2>/dev/null || echo none; }
+last_comment() { comments | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c[-1]["body"] if c else "")'; }
+marker_for() { printf '[{"id":1,"user":"bot","created_at":"","body":"## Automated review\\n1. x\\n<!-- pulse-review:v1 head=%s findings=1 -->"}]' "$1"; }
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix
+GITEA_TOKEN=gitea-token-for-test SSH_AUTH_SOCK="$TMP/agent.sock" tick
+newhead="$(origin_head)"
+expect_not "a green gate lets the controller push" "$newhead" "$SHA"
+expect "and the resolve is done" "$(labels)" "agent:done"
+expect "the base manifest's gate ran" "$(gate_ran)" "gate"
+expect "the gate ran in a checkout of the tracked files only, with no .git" "$(gate_seen | grep '^LS=')" "LS=.agent-pool f.txt justfile "
+expect_not "the gate never sees the Gitea token" "$(gate_seen)" "GITEA_TOKEN"
+expect_not "nor the ssh agent" "$(gate_seen)" "SSH_AUTH_SOCK"
+expect_not "nor a provider key" "$(gate_seen)" "ANTHROPIC_API_KEY"
+expect "the gate has a sandbox home" "$(gate_seen)" "HOME=/home/gate"
+expect "the gate runs in a systemd scope with cgroup limits" "$(cat "$TMP/calls/scope.log")" "-p MemoryMax=4G -p MemorySwapMax=0 -p TasksMax=512"
+expect "which never expands \$VARs in the gate's argv" "$(cat "$TMP/calls/scope.log")" "--expand-environment=no"
+expect "inside bwrap with every namespace unshared" "$(cat "$TMP/calls/bwrap.log")" "ARG --unshare-all"
+expect "a cleared env" "$(cat "$TMP/calls/bwrap.log")" "ARG --clearenv"
+expect "and a tmpfs /home" "$(tr '\n' ' ' < "$TMP/calls/bwrap.log")" "ARG --tmpfs ARG /home"
+expect "a receipt keyed by the attempt records the pass" "$(receipt)" '"result": "pass"'
+expect "bound to the pushed head" "$(receipt)" "\"head\": \"$newhead\""
+expect "naming the base manifest's blob" "$(receipt)" "\"blob\": \"$(git --git-dir "$ORIGIN" rev-parse master:.agent-pool/gates.toml)\""
+expect "the receipt is read-only" "$(stat -c %a "$TMP/state/gates/owner_repo__7__"*.json)" "444"
+expect "with a by-head copy" "$(ls "$TMP/state/gates/by-head")" "owner_repo__7__$newhead.json"
+body="$(last_comment)"
+expect "the posted report carries the controller's gate section" "$body" "### Gates (run by the pool controller)"
+expect "with the gate marker before the resolve marker" "${body%%pulse-resolve:v1*}" "agent-pool-gates:v1 head=$newhead manifest="
+expect "and the resolve marker still last" "$(printf '%s\n' "$body" | sed '/^$/d' | tail -1)" "pulse-resolve:v1 head=$newhead"
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix; behave gate fail
+tick
+expect "a red gate is never pushed" "$(origin_head)" "$SHA"
+expect "it goes to needs-human" "$(labels)" "agent:needs-human"
+expect "the comment names the gate and its exit" "$(comments)" "gate 'unit' exited 1"
+expect "and says nothing was pushed" "$(comments)" "nothing was pushed"
+expect_not "no resolve report is posted" "$(comments)" "pulse-resolve"
+expect_not "the gate's output is never posted" "$(comments)" "FAILED: test_secret_detail"
+expect "both its fds land in one host log, in order" "$(tr '\n' '|' < "$(ls "$TMP/state/runs/gate-7-"*-unit.log)")" "3 tests red|FAILED: test_secret_detail|"
+expect "a red gate costs the provider no cooldown" "$(cooldown_doc claude)" "none"
+expect "the receipt records the failure" "$(receipt)" '"result": "gate-fail"'
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix; behave gate sleep
+tick
+expect "a gate past its timeout is never pushed" "$(origin_head)" "$SHA"
+expect "it goes to needs-human" "$(labels)" "agent:needs-human"
+expect "saying it timed out" "$(comments)" "gate 'unit' timed out after 4s"
+expect "the receipt records the timeout" "$(receipt)" '"result": "gate-timeout"'
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix
+AGENT_POOL_GATE_SANDBOX=/nonexistent/bwrap tick
+expect "no sandbox: nothing is pushed" "$(origin_head)" "$SHA"
+expect "the job is requeued" "$(labels)" "agent:ready"
+expect "as a setup fault of the gates, not the provider" "$(cat "$TMP/out.txt")" "SETUP FAULT [gates]: bwrap is unavailable"
+expect "the tick exits 2" "$TICK_RC" "2"
+expect "the provider is not cooled down" "$(cooldown_doc claude)" "none"
+expect_not "no comment is posted" "$(comments)" "pool stopped"
+expect_not "and no report" "$(comments)" "pulse-resolve"
+expect "no gate ran" "$(gate_ran)" "none"
+tick
+expect "while the fault stands, resolve jobs are not claimed" "$(cat "$TMP/out.txt")" "resolve jobs are paused"
+expect "so the provider is not run again" "$(ncalls claude)" "1"
+python3 -c 'import json,sys; p=sys.argv[1]; s=json.load(open(p)); s["prs"]["7"]["comments"]=[]; json.dump(s, open(p,"w"))' "$STUB_GITEA"
+behave claude ok
+tick
+expect "but reviews still run" "$(comments)" "pulse-review:v1 head=$SHA"
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix; behave sandbox broken
+tick
+expect "a sandbox that cannot start pushes nothing" "$(origin_head)" "$SHA"
+expect "and is a gates setup fault" "$(cat "$TMP/out.txt")" "SETUP FAULT [gates]: gate 'unit': the sandbox did not start"
+expect "the job is requeued" "$(labels)" "agent:ready"
+rm -f "$TMP/state/faults/gates.json" "$TMP/behave/sandbox"
+AGENT_POOL_GATE_RO_BINDS="$HOME" tick
+expect "a toolchain bind of \$HOME itself is refused" "$(cat "$TMP/out.txt")" "is \$HOME or a parent of it"
+
+for change in gatefile:.agent-pool/gates.toml gatescript:justfile; do
+  reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+  behave claude "resolve-${change%%:*}"
+  tick
+  expect "a worker change to ${change#*:} is never pushed" "$(origin_head)" "$SHA"
+  expect "it goes to needs-human (${change#*:})" "$(labels)" "agent:needs-human"
+  expect "naming the protected path (${change#*:})" "$(comments)" "change gate-defining files (${change#*:})"
+  expect "and no gate ran (${change#*:})" "$(gate_ran)" "none"
+done
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-docs
+tick
+expect "a docs-only fix no gate covers is pushed" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "docs: note"
+expect "and done" "$(labels)" "agent:done"
+expect "without running a gate" "$(gate_ran)" "none"
+expect "the report says no gate applies" "$(comments)" "No gate applies to the changed paths"
+expect "the receipt says none-needed" "$(receipt)" '"result": "none-needed"'
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER" feature/x bare
+behave claude resolve-fix
+tick
+expect "a base with no manifest: a code fix is never pushed" "$(origin_head)" "$SHA"
+expect "it goes to needs-human" "$(labels)" "agent:needs-human"
+expect "saying there is no manifest" "$(comments)" "has no gate manifest"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER" feature/x bare
+behave claude resolve-docs
+tick
+expect "a base with no manifest: a docs-only fix is pushed" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "docs: note"
+
+reset '["agent:ready"]' '[]' "$(marker_for "$GATEPR_SHA")" feature/gatepr
+behave claude resolve-fix
+tick
+expect "a PR that rewrites its own manifest is gated by its base's" "$(gate_ran)" "gate"
+expect "the PR's gate never runs" "$([ -e "$TMP/calls/gate-evil" ] && echo ran || echo absent)" "absent"
+expect "and the fix is pushed" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/gatepr)" "fix: something"
+
+mkdir -p "$TMP/gates-override"
+printf 'version = 1\n[[gate]]\nname = "pinned"\nargv = ["just", "override"]\npaths = ["**"]\n' > "$TMP/gates-override/owner__repo.toml"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix
+tick
+rm -rf "$TMP/gates-override"
+expect "a controller-owned override wins over the base manifest" "$(gate_ran)" "override"
+expect "and the receipt says so" "$(receipt)" '"source": "override"'
+
+reset '["agent:ready"]' '[]' "$(marker_for "$ATTR_SHA")" feature/attr
+printf '[filter "evil"]\n\tsmudge = sed s/ORIGINAL/PWNED-GLOBAL/\n\tclean = cat\n' > "$HOME/.gitconfig"
+printf '#!/bin/sh\ncase "$PWD" in *gate-work*) : > "%s/calls/hook-ran" ;; esac\n' "$TMP" > "$TMP/main/.git/hooks/post-checkout"
+chmod +x "$TMP/main/.git/hooks/post-checkout"
+behave claude resolve-plant
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=filter.evil.smudge GIT_CONFIG_VALUE_0="sed s/ORIGINAL/PWNED-ENV/" tick
+rm -f "$HOME/.gitconfig" "$TMP/main/.git/hooks/post-checkout"
+expect "the gate checkout honours no global-config filter" "$(gate_seen)" "PAYLOAD=ORIGINAL"
+expect_not "nor one from the tick's GIT_CONFIG_* env" "$(gate_seen)" "PWNED"
+expect "only committed content reaches the gate" "$(gate_seen | grep '^LS=')" "payload.txt"
+expect_not "never the worker's untracked files" "$(gate_seen | grep '^LS=')" "planted.txt"
+expect "no hook in the main clone ran on the gate checkout" "$([ -e "$TMP/calls/hook-ran" ] && echo ran || echo none)" "none"
+expect "and the fix is pushed" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/attr)" "fix: something"
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-gitconfig
+tick
+git -C "$TMP/main" config --unset pool.tampered
+expect "a worker that rewrites the main clone's git config gets nothing pushed" "$(origin_head)" "$SHA"
+expect "it is an infra fault" "$(cat "$TMP/out.txt")" "SETUP FAULT [gates]: the main clone's git config changed"
+expect "and the job is requeued" "$(labels)" "agent:ready"
+
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix; behave gate steal
+t0=$(date +%s); tick; took=$(( $(date +%s) - t0 ))
+expect "a claim superseded during the gate run is noticed" "$(cat "$TMP/out.txt")" "superseded before its work was published"
+expect "and stops the gate long before it finishes" "$([ "$took" -lt 60 ] && echo fast || echo "slow ${took}s")" "fast"
+gs="$(cat "$TMP/calls/gate-sleep.pid" 2>/dev/null)"
+expect "the gate's processes are killed" "$(kill -0 "$gs" 2>/dev/null && echo alive || echo dead)" "dead"
+expect "nothing is pushed" "$(origin_head)" "$SHA"
+expect_not "nothing is posted" "$(comments)" "pulse-resolve"
+expect "the new holder's claim stands" "$(record)" "\"worker_id\": \"thief\""
 
 echo
 echo "push target safety"

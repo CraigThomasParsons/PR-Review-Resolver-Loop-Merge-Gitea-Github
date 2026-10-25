@@ -1,6 +1,13 @@
 # Controller-run gates: moving resolve gates out of the worker
 
-Status: plan only. Nothing here is built. Written 2026-10-17 against `feature/agent-pool-core` at
+Status: partly built (issue #14). Built: Section 1 (`gates.py` load/validate/select/protected);
+Sections 2.1 to 2.4 and 2.6's log capture (`gate_git`, the by-SHA checkout, `gates.py run`); the
+receipt, the comment section and the verdict mapping from Section 3, with the push refused unless
+this attempt's receipt passed at the exact head. Not built yet: the `[[deps]]` cache (2.5; a
+manifest declaring deps is refused as infra), posting sanitized log tails (`report.py
+sanitize`), the re-run at the PR head for a pre-existing red gate, the `verify()`/`derive_job()`
+receipt check (step 5), the deadline startup check (Q2 is open; gates stop 60s before the claim
+deadline instead), and Sections 4 and 5. Written 2026-10-17 against `feature/agent-pool-core` at
 `90d9fbf` (PR #2), after review rounds 10491, 10507, 10510 and 10511.
 
 **Superseded in part by `docs/plans/controller-commits-everything.md`.** That later plan moves
