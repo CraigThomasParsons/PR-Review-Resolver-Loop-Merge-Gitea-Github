@@ -21,6 +21,9 @@ if args[0] == "list":
 elif args[0] == "merge":
     print("ok") if $mergeable else sys.exit("not mergeable")
 else:
+    if args[0] == "label":
+        with open("$TMP/label-calls.log", "a") as log:
+            log.write(" ".join(args) + "\n")
     print("ok")
 PY
 }
@@ -111,6 +114,62 @@ check "agent:needs-human blocks" "no eligible open PR"
 
 write_adapter '["agent:ready", "review:clean", "review:automerge"]' true
 check "agent:ready blocks even with review:clean" "no eligible open PR"
+
+echo "#31: ability requirement labels"
+expect() { # name got wanted-substring
+  if [[ "$2" == *"$3"* ]]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail+1)); printf '  FAIL  %s\n         wanted *%s*\n         got %s\n' "$1" "$3" "$2"; fi
+}
+ABILITY_LABELS=(agent:plan agent:review agent:prototype agent:test-author agent:resolve agent:promote)
+write_marker "$SHA"
+for l in "${ABILITY_LABELS[@]}"; do
+  write_adapter "[\"$l\", \"agent:ready\", \"review:clean\", \"review:automerge\"]" true
+  check "#31: $l beside agent:ready blocks" "no eligible open PR"
+done
+write_adapter '["agent:resolve", "agent:claimed", "review:clean", "review:automerge"]' true
+check "#31: an ability label beside agent:claimed blocks" "no eligible open PR"
+write_marker_split "" "$SHA 0"
+write_adapter '["agent:done", "agent:resolve", "agent:test-author", "review:automerge"]' true
+: > "$TMP/label-calls.log"
+check "#31: a leftover ability label beside agent:done does not block the merge" "merged head"
+merged_call="$(grep -- '--add review:merged' "$TMP/label-calls.log")"
+claim_call="$(grep -- '--add review:merging' "$TMP/label-calls.log")"
+for l in "${ABILITY_LABELS[@]}"; do
+  expect "#31: the claim strips $l" "$claim_call" "$l"
+  expect "#31: the merged relabel strips $l" "$merged_call" "$l"
+done
+write_adapter '["agent:done", "agent:prototype", "review:automerge"]' false
+: > "$TMP/label-calls.log"
+check "#31: a failed merge with a leftover ability label still fails closed" "FAILED: not mergeable"
+expect "#31: the failure relabel strips the ability labels too" \
+  "$(grep -- '--add review:needs-human' "$TMP/label-calls.log")" "agent:prototype"
+
+echo "#31: one label vocabulary across gitea-labels.py, pr-merge.sh and capabilities.py"
+POOL_SCRIPTS="$ROOT/../../agent-pool/scripts"
+vocab="$(python3 - "$ROOT/gitea-labels.py" "$POOL_SCRIPTS" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gitea_labels", sys.argv[1])
+labels = importlib.util.module_from_spec(spec); spec.loader.exec_module(labels)
+sys.path.insert(0, sys.argv[2])
+import capabilities
+want = set(capabilities.ABILITY_LABELS) | {"agent:promote"}
+print("missing:" + ",".join(sorted(want - set(labels.LABELS))))
+PY
+)"
+expect "#31: gitea-labels.py LABELS carries every ability label and agent:promote" "[$vocab]" "[missing:]"
+for l in "${ABILITY_LABELS[@]}"; do
+  expect "#31: pr-merge.sh knows $l" "$(cat "$ROOT/pr-merge.sh")" "$l"
+done
+
+echo "#31: capability acceptance (agent-pool/scripts/capabilities.py)"
+capq() { AGENT_POOL_STATE="$TMP/capstate" env -u AGENT_POOL_ROSTER python3 "$POOL_SCRIPTS/capabilities.py" "$@"; }
+expect "#31: match --order claude --requires resolve returns claude" "$(capq match --order claude --requires resolve)" "claude"
+expect "#31: match --order agy --requires resolve returns nothing" "[$(capq match --order agy --requires resolve)]" "[]"
+cq_json="$(capq check-queue --order agy --requires resolve --roster agy,claude)"
+expect "#31 roster: check-queue --order agy --roster agy,claude reports resolve satisfiable" "$cq_json" '"satisfiable": true'
+expect "#31 roster: and leaves it to claude's tick rather than needs-human" "$cq_json" '"verdict": "elsewhere"'
+expect "#31 roster: with roster agy alone the same job is unsatisfiable" \
+  "$(capq check-queue --order agy --requires resolve --roster agy)" '"verdict": "unsatisfiable"'
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

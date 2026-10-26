@@ -56,11 +56,17 @@ import json, re, sys
 blocked = {"review:needs-human", "review:in-progress", "review:resolving",
            "review:findings", "review:requested", "review:merging",
            "agent:ready", "agent:claimed", "agent:needs-human"}
+# Ability requirement labels (and agent:promote) are a pending job only beside agent:ready or
+# agent:claimed. Left over beside agent:done they do not block, and the merge strips them.
+queued = {"agent:ready", "agent:claimed"}
+ability = {"agent:plan", "agent:review", "agent:prototype", "agent:test-author",
+           "agent:resolve", "agent:promote"}
 skip = re.compile(r"docblock-backfill|^chore\(#152\)")
 for pr in json.load(sys.stdin):
     labels = set(pr["labels"])
     if "review:automerge" not in labels: continue
     if labels & blocked: continue
+    if labels & ability and labels & queued: continue
     if pr["draft"] or pr["is_bot"]: continue
     if skip.search(pr["title"]) or skip.search(pr["head_ref"]): continue
     # review:resolved/review:clean come from pr-loop.sh; agent:done comes from
@@ -80,6 +86,7 @@ if [ "${#CANDIDATES[@]}" -eq 0 ]; then
   exit 0
 fi
 
+ABILITY_LABELS="agent:plan,agent:review,agent:prototype,agent:test-author,agent:resolve,agent:promote"
 labels() { # pr remove add
   python3 "$ADAPTER" label --repo "$REPO" --pr "$1" --remove "$2" --add "$3" >/dev/null
 }
@@ -92,7 +99,7 @@ comment() { # pr body
 }
 fail_pr() { # pr reason; called only after a real claim
   local pr="$1" reason="$2"
-  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,agent:ready,agent:claimed,agent:done" "review:needs-human"; then
+  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,agent:ready,agent:claimed,agent:done,$ABILITY_LABELS" "review:needs-human"; then
     log "#$pr FAILED: $reason; additionally failed to move claim to review:needs-human"
   else
     comment "$pr" "Automated merge stopped: $reason" || log "warning: failed to comment on #$pr"
@@ -151,7 +158,7 @@ for row in "${CANDIDATES[@]}"; do
     continue
   fi
 
-  if ! labels "$pr" "review:automerge,review:clean,review:resolved,agent:ready,agent:done" "review:merging"; then
+  if ! labels "$pr" "review:automerge,review:clean,review:resolved,agent:ready,agent:done,$ABILITY_LABELS" "review:merging"; then
     log "#$pr claim failed; leaving labels unchanged where possible"
     continue
   fi
@@ -171,7 +178,7 @@ for row in "${CANDIDATES[@]}"; do
     fail_pr "$pr" "$merge_out"
     continue
   fi
-  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,review:requested,review:findings,review:in-progress,review:resolving,review:needs-human,agent:ready,agent:claimed,agent:done" "review:merged"; then
+  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,review:requested,review:findings,review:in-progress,review:resolving,review:needs-human,agent:ready,agent:claimed,agent:done,$ABILITY_LABELS" "review:merged"; then
     log "#$pr merged but terminal relabel failed; manual label repair required"
     continue
   fi

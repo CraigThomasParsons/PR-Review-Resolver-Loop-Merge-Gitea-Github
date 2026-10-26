@@ -4,6 +4,9 @@
 Usage:
   report.py review  --marker-module F --file R --sha S
   report.py resolve --marker-module F --file R --review-head H --findings N
+  report.py plan        --marker-module F --file R --sha S
+  report.py prototype   --marker-module F --file R --sha S
+  report.py test-author --marker-module F --file R --sha S
   report.py scan    --file F      exit 1 ("leak") if F holds a credential; the controller runs it
                                   over the commit message and added lines it is about to push
   report.py summary --file R --fallback TEXT
@@ -15,14 +18,17 @@ Usage:
 
 Prints "ok<TAB><head><TAB><fixed>" when the report carries a marker the loop can verify
 (review: a pulse-review marker naming S; resolve: a pulse-resolve marker whose reviewed= is H,
-with <head> the head it claims). Prints "nomarker<TAB><reason>" when there is no such marker
+with <head> the head it claims; plan: a pulse-plan marker naming S, printing S and 0; prototype:
+a pulse-prototype marker whose base= is S, printing its commit and files; test-author: a
+pulse-test-author marker whose base= is S, printing its head (or pending) and tests_changed).
+Prints "nomarker<TAB><reason>" when there is no such marker
 and "invalid<TAB><reason>" when a resolve marker does not account for exactly N findings, so
 the controller refuses it before pushing anything. A report that contains the adapter's token or
 anything token-shaped is "invalid" too: it would be posted as a PR comment. The marker grammar
 comes from skills/pr-loops-common/marker.py so there is one parser.
 
-Workers never commit, so a resolve worker that changed files cannot know the head its work will
-land at: its marker says head=pending, and <head> is printed as "pending". The controller makes
+Workers never commit, so a resolve or test-author worker that changed files cannot know the head
+its work will land at: its marker says head=pending, and <head> is printed as "pending". The controller makes
 the commit (prod-common.sh controller_commit) and then stamps the real head into the report with
 stamp-head before posting it, so every posted marker still carries a 40-hex head.
 """
@@ -52,6 +58,7 @@ TOKEN_SHAPES = re.compile(
     r"\s*[:=]\s*[\"']?(?=[A-Za-z_\-+/]*\d)[A-Za-z0-9+/_\-]{16,}",
     re.IGNORECASE)
 RESOLVE_ENVELOPE = re.compile(r"<!--\s*pulse-resolve:v1\s+.*?-->", re.S)
+TEST_AUTHOR_ENVELOPE = re.compile(r"<!--\s*pulse-test-author:v1\s+.*?-->", re.S)
 PENDING = re.compile(r"(?<!\S)head=pending(?!\S)")
 # Never a real SHA: marker.parse_resolve only reads 40-hex heads, so pending is parsed as this.
 PENDING_STANDIN = "0" * 40
@@ -84,9 +91,9 @@ def load_marker(path: str) -> types.ModuleType:
     return module
 
 
-def with_pending(body: str, head: str) -> str:
-    """body with head=pending inside every resolve marker replaced by head=<head>."""
-    return RESOLVE_ENVELOPE.sub(lambda m: PENDING.sub("head=" + head, m.group(0)), body)
+def with_pending(body: str, head: str, envelope: re.Pattern = RESOLVE_ENVELOPE) -> str:
+    """body with head=pending inside every `envelope` marker replaced by head=<head>."""
+    return envelope.sub(lambda m: PENDING.sub("head=" + head, m.group(0)), body)
 
 
 def parse_resolve(marker: types.ModuleType, body: str) -> tuple[str, str, int, int, int] | None:
@@ -97,6 +104,34 @@ def parse_resolve(marker: types.ModuleType, body: str) -> tuple[str, str, int, i
     if parsed and parsed[0] == PENDING_STANDIN:
         return ("pending",) + tuple(parsed[1:])
     return parsed
+
+
+def parse_test_author(marker: types.ModuleType, body: str) -> tuple[str, str, int] | None:
+    literal = marker.parse_test_author(body)
+    if literal and literal[0] == PENDING_STANDIN:
+        return None
+    parsed = marker.parse_test_author(with_pending(body, PENDING_STANDIN, TEST_AUTHOR_ENVELOPE))
+    if parsed and parsed[0] == PENDING_STANDIN:
+        return ("pending",) + tuple(parsed[1:])
+    return parsed
+
+
+def check_ability(job: str, marker: types.ModuleType, body: str, sha: str) -> str:
+    """The verdict line for a plan, prototype or test-author report built on head `sha`."""
+    if job == "plan":
+        found = marker.parse_plan(body)
+        if not found or found[0] != sha:
+            return f"nomarker\tthe report carries no plan marker for {sha}"
+        return f"ok\t{sha}\t0"
+    if job == "prototype":
+        found = marker.parse_prototype(body)
+        if not found or found[0] != sha:
+            return f"nomarker\tthe report carries no prototype marker built on {sha}"
+        return f"ok\t{found[1]}\t{found[3]}"
+    found = parse_test_author(marker, body)
+    if not found or found[1] != sha:
+        return f"nomarker\tthe report carries no test-author marker built on {sha}"
+    return f"ok\t{found[0]}\t{found[2]}"
 
 
 def summary(body: str) -> str:
@@ -143,7 +178,8 @@ def stamp_head(path: str, head: str) -> int:
 
 def main() -> int | None:
     p = argparse.ArgumentParser()
-    p.add_argument("job", choices=["review", "resolve", "scan", "summary", "stamp-head"])
+    p.add_argument("job", choices=["review", "resolve", "plan", "prototype", "test-author", "scan", "summary",
+                                   "stamp-head"])
     p.add_argument("--marker-module")
     p.add_argument("--file", required=True)
     p.add_argument("--sha", default="")
@@ -168,13 +204,16 @@ def main() -> int | None:
         print(summary(body) or a.fallback)
         return 0
     if not a.marker_module:
-        p.error("--marker-module is required for review and resolve")
+        p.error(f"--marker-module is required for {a.job}")
     marker = load_marker(a.marker_module)
     if not body.strip():
         print("nomarker\tthe worker left no report")
         return
     if leaks_secret(body):
         print("invalid\tthe report contains a credential or token-shaped string; refusing to post it")
+        return
+    if a.job in ("plan", "prototype", "test-author"):
+        print(check_ability(a.job, marker, body, a.sha))
         return
     if a.job == "review":
         found = marker.MARKER.findall(body)

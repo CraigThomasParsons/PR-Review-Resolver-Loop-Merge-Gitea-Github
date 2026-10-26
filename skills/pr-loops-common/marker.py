@@ -27,11 +27,24 @@ three fixed and five of them preferences, landed on review:needs-human although 
 wrong. Only `deferred` (a blocking problem the resolver could not fix) stops a PR now. `noted` is
 optional so markers written before the split still parse, as noted=0.
 
+The agent pool's other abilities (docs/plans/provider-capabilities.md Section 1) leave their own
+markers, parsed the same way (envelope first, key=value fields, extra keys ignored):
+
+    <!-- pulse-plan:v1 head=<40 hex sha> -->
+    <!-- pulse-prototype:v1 base=<40 hex sha> commit=<40 hex sha> attempt=<id> files=<int> -->
+    <!-- pulse-test-author:v1 head=<40 hex sha> base=<40 hex sha> tests_changed=<int> -->
+
+A prototype's commit lives only under a local controller ref and is never pushed; base is the
+head it was built on.
+
 Usage:
   marker.py latest  <pr>       prints "<head> <findings>" for the newest review marker
   marker.py count   <pr>       prints how many review markers the PR carries (round count)
   marker.py resolve <pr>       prints "<head> <reviewed> <fixed> <deferred> <noted>" for the
                                newest resolve marker, or nothing
+  marker.py plan <pr>          prints "<head>" for the newest plan marker, or nothing
+  marker.py prototype <pr>     prints "<base> <commit> <attempt> <files>", or nothing
+  marker.py test-author <pr>   prints "<head> <base> <tests_changed>", or nothing
 
 Shells out to the authenticated gh CLI; no token handling here.
 """
@@ -69,6 +82,55 @@ def parse_resolve(body: str):
     return None
 
 
+_SHA = re.compile(r"[0-9a-f]{40}")
+_ATTEMPT = re.compile(r"[A-Za-z0-9._-]+")
+ENVELOPES = {kind: re.compile(r"<!--\s*pulse-" + kind + r":v1\s+(.*?)-->", re.S)
+             for kind in ("plan", "prototype", "test-author")}
+
+
+def _fields(kind: str, body: str):
+    for env in ENVELOPES[kind].finditer(body or ""):
+        yield dict(_FIELD.findall(env.group(1)))
+
+
+def parse_plan(body: str):
+    """Return (head,) for the first valid plan marker, else None."""
+    for f in _fields("plan", body):
+        if _SHA.fullmatch(f.get("head", "")):
+            return (f["head"],)
+    return None
+
+
+def parse_prototype(body: str):
+    """Return (base, commit, attempt, files) for the first valid prototype marker, else None."""
+    for f in _fields("prototype", body):
+        base, commit, attempt = f.get("base", ""), f.get("commit", ""), f.get("attempt", "")
+        if not (_SHA.fullmatch(base) and _SHA.fullmatch(commit) and _ATTEMPT.fullmatch(attempt)):
+            continue
+        try:
+            return base, commit, attempt, int(f["files"])
+        except (KeyError, ValueError):
+            continue
+    return None
+
+
+def parse_test_author(body: str):
+    """Return (head, base, tests_changed) for the first valid test-author marker, else None."""
+    for f in _fields("test-author", body):
+        head, base = f.get("head", ""), f.get("base", "")
+        if not (_SHA.fullmatch(head) and _SHA.fullmatch(base)):
+            continue
+        try:
+            return head, base, int(f["tests_changed"])
+        except (KeyError, ValueError):
+            continue
+    return None
+
+
+PARSERS = {"resolve": parse_resolve, "plan": parse_plan, "prototype": parse_prototype,
+           "test-author": parse_test_author}
+
+
 def comments(pr: int) -> list[dict]:
     # Gitea, via the loops' adapter: one JSON array, already paginated there.
     adapter = str(Path(__file__).with_name("gitea-pr.py"))
@@ -90,24 +152,28 @@ def markers(pr: int) -> list[tuple[str, int]]:
     return found
 
 
-def resolve_markers(pr: int) -> list[tuple[str, str, int, int, int]]:
+def kind_markers(pr: int, kind: str) -> list[tuple]:
     found = []
     for c in comments(pr):
-        parsed = parse_resolve(c.get("body") or "")
+        parsed = PARSERS[kind](c.get("body") or "")
         if parsed:
             found.append(parsed)
     return found
 
 
+def resolve_markers(pr: int) -> list[tuple[str, str, int, int, int]]:
+    return kind_markers(pr, "resolve")
+
+
 def main() -> None:
-    if len(sys.argv) != 3 or sys.argv[1] not in ("latest", "count", "resolve"):
+    if len(sys.argv) != 3 or sys.argv[1] not in ("latest", "count", *PARSERS):
         print(__doc__, file=sys.stderr)
         sys.exit(2)
     pr = int(sys.argv[2])
-    if sys.argv[1] == "resolve":
-        got = resolve_markers(pr)
+    if sys.argv[1] in PARSERS:
+        got = kind_markers(pr, sys.argv[1])
         if got:
-            print("{} {} {} {} {}".format(*got[-1]))
+            print(" ".join(str(x) for x in got[-1]))
         return
     found = markers(pr)
     if sys.argv[1] == "count":

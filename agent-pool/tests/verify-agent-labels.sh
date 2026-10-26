@@ -85,24 +85,25 @@ names() { python3 -c 'import json,sys; print(",".join(sorted(l["name"] for l in 
 count() { python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))[sys.argv[2]]))' "$FAKE_STATE" "$1"; }
 run() { rm -f "$TEA_CALLS"; python3 "$LABELS_PY" "$@" > "$TMP/out" 2> "$TMP/err"; RC=$?; }
 tea_calls() { cat "$TEA_CALLS" 2>/dev/null || echo none; }
-ALL="agent:claimed,agent:done,agent:needs-human,agent:ready"
+ALL="agent:claimed,agent:done,agent:needs-human,agent:plan,agent:promote,agent:prototype,agent:ready,agent:resolve,agent:review,agent:test-author"
+N=10
 
 echo "a repo with none of the labels"
 repo_state o/r '[{"name": "bug", "color": "ee0701", "description": ""}]'
 run --repo o/r --dry-run
 expect "--dry-run exits 0" "$RC" "0"
-expect "it lists what it would create" "$(grep -c 'would create' "$TMP/out")" "4"
-expect "and says nothing was created" "$(cat "$TMP/out")" "4 of 4 agent:* label(s) missing; dry run"
+expect "it lists what it would create" "$(grep -c 'would create' "$TMP/out")" "$N"
+expect "and says nothing was created" "$(cat "$TMP/out")" "$N of $N agent:* label(s) missing; dry run"
 expect "without calling tea" "$(tea_calls)" "none"
 expect "or changing the repo" "$(names o/r)" "bug"
 run --repo o/r
 expect "a real run exits 0" "$RC" "0"
-expect "it creates the four agent:* labels" "$(names o/r)" "$ALL,bug"
-expect "through tea, one call each" "$(tea_calls | wc -l)" "4"
+expect "it creates every agent:* label" "$(names o/r)" "$ALL,bug"
+expect "through tea, one call each" "$(tea_calls | wc -l)" "$N"
 expect "with the repo and login" "$(tea_calls)" "labels create --repo o/r --login test-login --name agent:ready --color #1f77b4"
 expect "and gitea-labels.py's description" "$(tea_calls)" "--description Queued for the agent pool to claim"
 expect "needs-human in red" "$(tea_calls)" "--name agent:needs-human --color #b10026"
-expect "it confirms all four are present" "$(cat "$TMP/out")" "created 4, all 4 agent:* labels present"
+expect "it confirms all are present" "$(cat "$TMP/out")" "created $N, all $N agent:* labels present"
 expect_not "it never creates a review:* label" "$(tea_calls)" "review:"
 expect_not "nor night-crew: approved" "$(tea_calls)" "night-crew"
 expect_not "nor ready-for-agent" "$(tea_calls)" "ready-for-agent"
@@ -119,8 +120,8 @@ echo "idempotent"
 run --repo o/r
 expect "a second run exits 0" "$RC" "0"
 expect "it creates nothing" "$(tea_calls)" "none"
-expect "and says all are present" "$(cat "$TMP/out")" "all 4 agent:* labels present"
-expect "the repo is unchanged" "$(count o/r)" "5"
+expect "and says all are present" "$(cat "$TMP/out")" "all $N agent:* labels present"
+expect "the repo is unchanged" "$(count o/r)" "$((N + 1))"
 repo_state o/half '[{"name": "agent:ready", "color": "1f77b4", "description": "Queued for the agent pool to claim"},
                     {"name": "agent:done", "color": "#000000", "description": "ours"}]'
 run --repo o/half
@@ -128,7 +129,7 @@ expect "a half-labelled repo gets only what it lacks" "$(tea_calls | grep -o -- 
   "--name agent:claimed --name agent:needs-human "
 expect "a label with another colour is reported" "$(cat "$TMP/out")" "agent:done (colour or description differs"
 expect "but left as it is" "$(python3 -c 'import json,sys; print([l["color"] for l in json.load(open(sys.argv[1]))["o/half"] if l["name"]=="agent:done"])' "$FAKE_STATE")" "#000000"
-expect "and not duplicated" "$(count o/half)" "4"
+expect "and not duplicated" "$(count o/half)" "$N"
 
 echo
 echo "every page is read"
@@ -142,7 +143,7 @@ PY
 rm -f "$FAKE_STATE.pages"
 run --repo o/big
 expect "a label on page 3 counts as present" "$(tea_calls | grep -c -- '--name agent:ready')" "0"
-expect "so only the other three are created" "$(tea_calls | wc -l)" "3"
+expect "so only the others are created" "$(tea_calls | wc -l)" "$((N - 1))"
 expect "it read pages 1 to 3" "$(grep -c '^o/big ' "$FAKE_STATE.pages")" "6"
 
 echo
@@ -166,7 +167,7 @@ repo_state o/new '[]'
 touch "$FAKE_STATE.fail-tea"
 run --repo o/new
 expect "a failing tea exits 1" "$RC" "1"
-expect "and reports each failure" "$(grep -c FAILED "$TMP/err")" "4"
+expect "and reports each failure" "$(grep -c FAILED "$TMP/err")" "$N"
 rm -f "$FAKE_STATE.fail-tea"
 touch "$FAKE_STATE.tea-lies"
 run --repo o/new

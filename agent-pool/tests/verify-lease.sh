@@ -356,6 +356,148 @@ expect "#30: a summary carrying a marker falls back" "$(summ 'Summary: x <!-- pu
 expect "#30: a token-shaped summary falls back" "$(summ 'Summary: token: 3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901\n')" "chore(resolve)"
 
 echo
+echo "#31: capability manifest and matching"
+CAPSTATE="$TMP/capstate"
+caps() { AGENT_POOL_STATE="$CAPSTATE" env -u AGENT_POOL_ROSTER python3 "$SCRIPTS/capabilities.py" "$@"; }
+expect "#31: match --order claude --requires resolve returns claude" "$(caps match --order claude --requires resolve)" "claude"
+out="$(caps match --order agy --requires resolve)"; rc=$?
+expect "#31: match --order agy --requires resolve returns nothing" "[$out]" "[]"
+expect_rc "#31: and exits 1, like cooldown.py eligible with nobody" "$rc" 1
+expect "#31: match keeps --order's order and drops agy" "$(caps match --order agy,grok,claude --requires resolve | tr '\n' ' ')" "grok claude "
+expect "#31: a composite requires needs every ability on one provider" "$(caps match --order agy,claude --requires test-author,resolve | tr '\n' ' ')" "claude "
+expect "#31: agy takes test-author alone" "$(caps match --order agy --requires test-author)" "agy"
+expect "#31: agy's ceiling has no resolve" "$(caps ceiling --provider agy)" "plan,review,prototype,test-author"
+expect "#31: claude's ceiling has all five" "$(caps ceiling --provider claude)" "plan,review,prototype,test-author,resolve"
+expect "#31: AGENT_POOL_CEILING_GROK narrows grok" "$(AGENT_POOL_CEILING_GROK=review,plan caps abilities --provider grok)" "plan,review"
+expect "#31: a narrowed grok no longer matches resolve" "[$(AGENT_POOL_CEILING_GROK=review caps match --order grok --requires resolve)]" "[]"
+expect "#31: ceiling ignores the narrowing" "$(AGENT_POOL_CEILING_GROK=review caps ceiling --provider grok)" "plan,review,prototype,test-author,resolve"
+out="$(AGENT_POOL_CEILING_AGY=review,resolve caps abilities --provider agy 2>"$TMP/caps.err")"
+expect "#31: AGENT_POOL_CEILING_AGY cannot widen agy to resolve" "$out" "review"
+expect_not "#31: so resolve is not among its abilities" "$out" "resolve"
+expect "#31: and the widening attempt is warned about" "$(cat "$TMP/caps.err")" "lists resolve, which agy can never take"
+expect "#31: so agy never matches resolve, even when its env lists it" \
+  "[$(AGENT_POOL_CEILING_AGY=resolve caps match --order agy --requires resolve 2>/dev/null)]" "[]"
+AGENT_POOL_CEILING_CLAUDE=reveiw caps abilities --provider claude >/dev/null 2>&1
+expect_rc "#31: an unknown ability in AGENT_POOL_CEILING_<P> is an error" "$?" 2
+expect "#31: a blank AGENT_POOL_CEILING_<P> narrows nothing" "$(AGENT_POOL_CEILING_CLAUDE=' ' caps abilities --provider claude)" "plan,review,prototype,test-author,resolve"
+caps match --order claude --requires reslove >/dev/null 2>&1
+expect_rc "#31: an unknown required ability is an error" "$?" 2
+caps match --order claude --requires '' >/dev/null 2>&1
+expect_rc "#31: an empty requires is an error, not match-everyone" "$?" 2
+caps match --order claud --requires review >/dev/null 2>&1
+expect_rc "#31: an unknown provider is an error" "$?" 2
+
+echo
+echo "#31: host-wide roster (C_roster is checked against the roster, never the tick's order)"
+cq() { caps check-queue "$@" | field "$CQ_FIELD"; }
+CQ_FIELD=satisfiable
+expect "#31 roster: agy-only tick, roster agy,claude, resolve is satisfiable" "$(cq --order agy --requires resolve --roster agy,claude)" "True"
+CQ_FIELD=verdict
+expect "#31 roster: agy-only tick, roster agy,claude, resolve is another tick's job (not needs-human)" \
+  "$(cq --order agy --requires resolve --roster agy,claude)" "elsewhere"
+expect "#31 roster: C_roster names claude even though the tick runs only agy" \
+  "$(caps check-queue --order agy --requires resolve --roster agy,claude | field c_roster)" "['claude']"
+expect "#31 roster: agy-only tick, roster agy, resolve is unsatisfiable" "$(cq --order agy --requires resolve --roster agy)" "unsatisfiable"
+expect "#31 roster: a provider in --order but not the roster does not count" "$(cq --order claude --requires resolve --roster agy 2>/dev/null)" "unsatisfiable"
+caps check-queue --order agy --requires resolve >/dev/null 2>&1
+expect_rc "#31 roster: with no --roster and no AGENT_POOL_ROSTER it refuses, never falling back to --order" "$?" 2
+expect "#31 roster: AGENT_POOL_ROSTER is read when --roster is omitted" \
+  "$(AGENT_POOL_STATE="$CAPSTATE" AGENT_POOL_ROSTER=agy,claude python3 "$SCRIPTS/capabilities.py" check-queue --order agy --requires resolve | field verdict)" "elsewhere"
+expect "#31 roster: an explicit empty --roster is unsatisfiable" "$(cq --order claude --requires review --roster '')" "unsatisfiable"
+expect "#31 roster: an ability combination no single roster provider has is unsatisfiable" \
+  "$(cq --order agy --requires test-author,resolve --roster agy)" "unsatisfiable"
+expect "#31: a capable provider in the order is claimable" "$(cq --order agy,claude --requires resolve --roster agy,claude)" "claimable"
+expect "#31: C_eligible lists only the capable providers" "$(caps check-queue --order agy,claude --requires resolve --roster agy,claude | field c_eligible)" "['claude']"
+expect "#31: a capable provider that failed preflight is a setup fault" \
+  "$(cq --order claude --requires resolve --roster claude --unconfigured claude)" "setup-fault"
+AGENT_POOL_STATE="$CAPSTATE" at 50000 cooldown record --provider claude --reason x >/dev/null
+expect "#31: every capable provider cooling down is waiting-cooldown" "$(at 50000 caps check-queue --order claude --requires resolve --roster claude | field verdict)" "waiting-cooldown"
+expect "#31: and says how long" "$(at 50000 caps check-queue --order claude --requires resolve --roster claude | field wait_secs)" "3600"
+expect "#31: once the cooldown lapses it is claimable again" "$(at 60000 caps check-queue --order claude --requires resolve --roster claude | field verdict)" "claimable"
+mkdir -p "$CAPSTATE/faults"; echo '{}' > "$CAPSTATE/faults/gates.json"
+expect "#31: a gate sandbox fault pauses resolve" "$(at 60000 caps check-queue --order claude --requires resolve --roster claude | field verdict)" "gates-paused"
+expect "#31: and test-author" "$(at 60000 caps check-queue --order claude --requires test-author --roster claude | field verdict)" "gates-paused"
+expect "#31: but not review" "$(at 60000 caps check-queue --order claude --requires review --roster claude | field verdict)" "claimable"
+rm -f "$CAPSTATE/faults/gates.json"
+
+echo
+echo "#31: repoconfig roster (AGENT_POOL_ROSTER = [pool].providers) and per-repo REPO_ROSTER"
+cat > "$TMP/repos.toml" <<'TOML'
+[pool]
+providers = ["agy", "claude"]
+[repos."owner/a"]
+abilities = ["review", "resolve"]
+[repos."owner/b"]
+abilities = ["review"]
+TOML
+rcfg() { AGENT_POOL_CONFIG="$TMP/repos.toml" python3 "$SCRIPTS/repoconfig.py" "$@"; }
+expect "#31 roster: repoconfig roster prints AGENT_POOL_ROSTER from [pool].providers" "$(rcfg roster)" "agy,claude"
+expect "#31 roster: repo A's resolve roster is claude only (agy is capped)" "$(rcfg roster --repo owner/a --ability resolve)" "claude"
+expect "#31 roster: repo B grants nobody resolve, so its resolve roster is empty" "[$(rcfg roster --repo owner/b --ability resolve)]" "[]"
+expect "#31 roster: repo B's review roster is both" "$(rcfg roster --repo owner/b --ability review)" "agy,claude"
+expect "#31 roster: agy-only tick on repo A (A grants claude resolve) does NOT escalate a resolve job" \
+  "$(cq --order agy --requires resolve --roster "$(rcfg roster --repo owner/a --ability resolve)")" "elsewhere"
+expect "#31 roster: a resolve job on repo B DOES escalate although repo A grants claude resolve" \
+  "$(cq --order agy,claude --requires resolve --roster "$(rcfg roster --repo owner/b --ability resolve)")" "unsatisfiable"
+rcfg roster --repo owner/a >/dev/null 2>&1
+expect_rc "#31: roster --repo without --ability is refused" "$?" 2
+expect "#31: repoconfig's ceiling is capabilities.py's static one (agy capped on resolve)" "$(rcfg abilities --repo owner/a --provider agy 2>/dev/null)" "review"
+expect "#31: repoconfig ignores AGENT_POOL_CEILING_<P> (per-repo grants never depend on host env)" \
+  "$(AGENT_POOL_CEILING_CLAUDE=review rcfg abilities --repo owner/a --provider claude)" "review,resolve"
+
+echo
+echo "#31: parse-requires (ability labels, then a directive, then the derived job)"
+pr_req() { caps parse-requires "$@"; }
+printf 'Body\n<!-- agent-pool-job: requires=prototype -->\nlater comment\n<!-- agent-pool-job: requires=test-author test-mode=red -->\n' > "$TMP/body.md"
+expect "#31: ability labels become sorted requires" "$(pr_req --labels '["agent:ready","agent:test-author","agent:resolve"]' --default-job review)" "resolve,test-author"
+expect "#31: Gitea label objects are read too" "$(pr_req --labels '[{"name":"agent:plan"},{"name":"agent:ready"}]' --default-job review)" "plan"
+expect "#31: labels win over a directive" "$(pr_req --labels '["agent:plan"]' --body "$TMP/body.md" --default-job review)" "plan"
+expect "#31: with no ability label the last directive wins" "$(pr_req --labels '["agent:ready"]' --body "$TMP/body.md" --default-job review)" "test-author"
+expect "#31: with neither the derived job is required" "$(pr_req --labels '["agent:ready"]' --default-job resolve)" "resolve"
+expect "#31: agent:promote is an action, not a requirement" "$(pr_req --labels '["agent:promote","agent:ready"]' --default-job review)" "review"
+expect "#31: a settled job requires nothing" "[$(pr_req --labels '[]' --default-job settled)]" "[]"
+expect "#31: an ability label still overrides a settled default" "$(pr_req --labels '["agent:review"]' --default-job settled)" "review"
+printf '<!-- agent-pool-job: requires=resolve,refactor -->\n' > "$TMP/badbody.md"
+pr_req --labels '[]' --body "$TMP/badbody.md" --default-job review >/dev/null 2>&1
+expect_rc "#31: an unknown ability in a directive is an error" "$?" 2
+pr_req --labels '[]' --default-job deploy >/dev/null 2>&1
+expect_rc "#31: an unknown default job is an error" "$?" 2
+pr_req --labels 'not json' --default-job review >/dev/null 2>&1
+expect_rc "#31: --labels must be JSON" "$?" 2
+
+echo
+echo "#31: plan, prototype and test-author markers"
+PROTO40=9999888877776666555544443333222211110000
+abrep() { # job body -> report.py verdict line
+  printf '## Report\n%s\n' "$2" > "$TMP/ab.md"
+  HOME="$TMP/home" env -u GITEA_TOKEN python3 "$SCRIPTS/report.py" "$1" --marker-module "$MARKER_PY" --file "$TMP/ab.md" --sha "$SHA40"
+}
+expect "#31: a plan marker for the head is ok" "$(abrep plan "<!-- pulse-plan:v1 head=$SHA40 -->")" $'ok\t'"$SHA40"$'\t0'
+expect "#31: a plan marker for another head is no marker" "$(abrep plan "<!-- pulse-plan:v1 head=$NEWHEAD40 -->")" "nomarker"
+expect "#31: a review marker is not a plan marker" "$(abrep plan "<!-- pulse-review:v1 head=$SHA40 findings=0 -->")" "nomarker"
+expect "#31: a prototype marker prints its commit and file count" \
+  "$(abrep prototype "<!-- pulse-prototype:v1 base=$SHA40 commit=$PROTO40 attempt=0b7c-41aa files=3 -->")" $'ok\t'"$PROTO40"$'\t3'
+expect "#31: a prototype built on another base is no marker" \
+  "$(abrep prototype "<!-- pulse-prototype:v1 base=$NEWHEAD40 commit=$PROTO40 attempt=a files=3 -->")" "nomarker"
+expect "#31: a prototype marker without files= is no marker" \
+  "$(abrep prototype "<!-- pulse-prototype:v1 base=$SHA40 commit=$PROTO40 attempt=a -->")" "nomarker"
+expect "#31: a test-author marker prints its head and tests_changed" \
+  "$(abrep test-author "<!-- pulse-test-author:v1 head=$NEWHEAD40 base=$SHA40 tests_changed=2 -->")" $'ok\t'"$NEWHEAD40"$'\t2'
+expect "#31: a test-author marker may say head=pending before the controller commits" \
+  "$(abrep test-author "<!-- pulse-test-author:v1 head=pending base=$SHA40 tests_changed=2 -->")" $'ok\tpending\t2'
+expect "#31: the all-zero stand-in is never a real test-author head" \
+  "$(abrep test-author "<!-- pulse-test-author:v1 head=0000000000000000000000000000000000000000 base=$SHA40 tests_changed=2 -->")" "nomarker"
+expect "#31: a test-author marker on another base is no marker" \
+  "$(abrep test-author "<!-- pulse-test-author:v1 head=$NEWHEAD40 base=$NEWHEAD40 tests_changed=1 -->")" "nomarker"
+expect "#31: a token in an ability report is still refused" \
+  "$(abrep plan "ghp_abcdefghijklmnopqrstuvwxyz0123456789 <!-- pulse-plan:v1 head=$SHA40 -->")" "invalid"
+mk() { python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("m", sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(getattr(m, sys.argv[2])(sys.argv[3]))' "$MARKER_PY" "$@"; }
+expect "#31: marker.py parse_plan" "$(mk parse_plan "<!-- pulse-plan:v1 head=$SHA40 extra=1 -->")" "('$SHA40',)"
+expect "#31: marker.py parse_prototype" "$(mk parse_prototype "<!--pulse-prototype:v1 attempt=x1 files=0 base=$SHA40 commit=$PROTO40-->")" "('$SHA40', '$PROTO40', 'x1', 0)"
+expect "#31: marker.py parse_test_author" "$(mk parse_test_author "<!-- pulse-test-author:v1 head=$NEWHEAD40 base=$SHA40 tests_changed=4 -->")" "('$NEWHEAD40', '$SHA40', 4)"
+expect "#31: marker.py parse_test_author rejects pending" "$(mk parse_test_author "<!-- pulse-test-author:v1 head=pending base=$SHA40 tests_changed=4 -->")" "None"
+
+echo
 echo "worker permission policy"
 AD_ABS=/opt/pool/skills/pr-loops-common/gitea-pr.py
 pol() { # family job command
