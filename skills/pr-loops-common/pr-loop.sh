@@ -149,7 +149,7 @@ ALLOW_COMMON=(Read Grep Glob Agent
 ALLOW_RESOLVE=(Edit Write MultiEdit
   "Bash(git add *)" "Bash(git commit *)" "Bash(git push $PR_LOOP_REMOTE HEAD:*)"
   "Bash(npm run *)" "Bash(npm ci *)" "Bash(npx *)" "Bash(dotnet build *)" "Bash(dotnet test *)" "Bash(just *)"
-  "Bash(composer test*)" "Bash(composer lint*)" "Bash(php artisan test*)" "Bash(vendor/bin/pint *)" "Bash(vendor/bin/phpunit*)")
+  "Bash(composer test*)" "Bash(composer lint*)" "Bash(php artisan test*)" "Bash(vendor/bin/pint *)" "Bash(vendor/bin/phpunit*)" "Bash(composer --working-dir=* test*)" "Bash(composer --working-dir=* lint*)" "Bash(cd apps/game && composer *)")
 DENY=("Bash(tea pr merge *)" "Bash(tea pr approve *)" "Bash(tea pr close *)" "Bash(tea pr reject *)"
   "Bash(gh pr merge *)" "Bash(git push * --force*)" "Bash(git push * -f *)" "Bash(git push --force*)"
   "Bash(git reset --hard *)" "Bash(git branch -D *)" "Bash(git push * --delete *)" "Bash(gh api *auto*merge*)"
