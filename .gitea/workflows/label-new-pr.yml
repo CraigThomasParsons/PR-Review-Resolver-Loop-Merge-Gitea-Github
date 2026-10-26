@@ -1,0 +1,31 @@
+name: Label a brand-new PR for the review loop
+
+# Cuts the latency between opening a PR and review:requested landing on it
+# from "up to an hour" (pr-pipeline.timer's cadence) to seconds.
+#
+# Scope is deliberately narrow: this only ever touches a PR that carries NO
+# review:* or agent:* label yet, i.e. one the pipeline has genuinely never
+# seen. Every other decision (refreshing a stale verdict after a new head,
+# granting review:automerge, handling review:needs-human/night:hold) stays
+# with TheNightCrew's LabelPullRequests action (php artisan nightcrew:label-prs,
+# still running hourly via pr-pipeline.timer) so there is exactly one place
+# that owns those rules, not two that can disagree.
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+jobs:
+  label-new-pr:
+    runs-on: factory-node
+    steps:
+      - name: Add review:requested if this PR has never been labelled
+        env:
+          GITEA_API_URL: ${{ gitea.server_url }}/api/v1
+          REPO: ${{ gitea.repository }}
+          PR_NUMBER: ${{ gitea.event.pull_request.number }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_DRAFT: ${{ gitea.event.pull_request.draft }}
+          AUTHOR_LOGIN: ${{ gitea.event.pull_request.user.login }}
+          PR_TITLE: ${{ gitea.event.pull_request.title }}
+          EXISTING_LABELS: ${{ toJSON(gitea.event.pull_request.labels) }}
+        run: node .gitea/workflows/scripts/label-new-pr.js
