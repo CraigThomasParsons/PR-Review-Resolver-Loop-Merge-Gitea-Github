@@ -963,6 +963,8 @@ write_context() {
     git -C "$MAIN" diff "origin/$2...$1" 2>/dev/null
     printf '```\n\n## PR comments (JSON)\n\n```json\n'
     python3 "$ADAPTER" comments --repo "$REPO" --pr "$JOB_PR" 2>/dev/null || echo '[] (could not read the comments)'
+    printf '```\n\n## Unresolved review threads (JSON)\n\n```json\n'
+    python3 "$ADAPTER" threads --repo "$REPO" --pr "$JOB_PR" 2>/dev/null || echo '[] (could not read the threads)'
     printf '```\n'
   } > "$f"
 }

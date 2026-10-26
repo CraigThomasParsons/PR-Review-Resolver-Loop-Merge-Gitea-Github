@@ -4,7 +4,7 @@ You are in a detached worktree checked out at the PR head __SHA__ (branch __HEAD
 
 Do this, in order:
 
-1. Read the repository's AGENTS.md (or CLAUDE.md, or CONTRIBUTING.md) for its standards, frozen or reference paths, and vocabulary. Then read the change: git diff origin/__BASE__...HEAD and git log origin/__BASE__..HEAD. Existing PR discussion, including any linked issue reference: python3 __ADAPTER__ comments --repo __REPO__ --pr __PR__
+1. Read the repository's AGENTS.md (or CLAUDE.md, or CONTRIBUTING.md) for its standards, frozen or reference paths, and vocabulary. Then read the change: git diff origin/__BASE__...HEAD and git log origin/__BASE__..HEAD. Existing PR discussion, including any linked issue reference, is in __CONTEXT__'s "PR comments (JSON)" section, which the controller already gathered for you.
 
 2. Review on two axes:
    - Standards: does the change follow the repository's documented standards, conventions, ADRs and gates? Is it correct: logic errors, broken references or links, missing error handling, tests that do not test what they claim?
