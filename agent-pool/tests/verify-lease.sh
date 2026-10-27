@@ -196,6 +196,75 @@ expect "a setup fault is recorded" "$(cat "$AGENT_POOL_STATE/faults/cursor.json"
 expect "a setup fault is not a cooldown" "$(at 10001 cooldown eligible --order cursor)" "cursor"
 
 echo
+echo "#32 ability-level cooldowns"
+at 500000 cooldown clear --provider claude
+expect "#32 ability cooldown: an ability strike starts at the same 1h base" \
+  "$(at 500000 cooldown record --provider claude --ability resolve --reason "timed out on resolve")" $'\t3600'
+at 500001 cooldown eligible --order claude --ability resolve >/dev/null
+expect_rc "#32 ability cooldown: (claude, resolve) blocks eligible --order claude --ability resolve" "$?" 1
+expect "#32 ability cooldown: (claude, resolve) leaves eligible --order claude --ability review returning claude" \
+  "$(at 500001 cooldown eligible --order claude --ability review)" "claude"
+expect "#32 ability cooldown: eligible with no --ability ignores ability cooldowns" "$(at 500001 cooldown eligible --order claude)" "claude"
+at 500001 cooldown eligible --order claude --ability review,resolve >/dev/null
+expect_rc "#32 ability cooldown: eligible needs every named ability free" "$?" 1
+expect "#32 ability cooldown: active --ability resolve prints the ability's time left" \
+  "$(at 500001 cooldown active --provider claude --ability resolve)" "3599"
+at 500001 cooldown active --provider claude --ability review >/dev/null
+expect_rc "#32 ability cooldown: active --ability review is not cooling" "$?" 1
+at 500001 cooldown active --provider claude >/dev/null
+expect_rc "#32 ability cooldown: active with no --ability is not cooling" "$?" 1
+expect "#32 ability cooldown: the strike lands in the abilities map" "$(cooldown show --provider claude --ability resolve)" '"strikes": 1'
+expect "#32 ability cooldown: the top-level strikes are untouched" "$(cooldown show --provider claude | field strikes)" "0"
+expect "#32 ability cooldown: a second ability strike doubles" \
+  "$(at 500002 cooldown record --provider claude --ability resolve --reason x)" $'\t7200'
+expect "#32 ability cooldown: a fixed ability pause takes --seconds" \
+  "$(at 500003 cooldown record --provider claude --ability review --reason timeout --seconds 900)" $'\t900'
+expect "#32 ability cooldown: with no strike" "$(cooldown show --provider claude --ability review)" '"strikes": 0'
+expect "#32 ability cooldown: show --ability of an unrecorded ability is {}" "$(cooldown show --provider claude --ability plan)" "{}"
+
+expect "#32 ability cooldown: a provider-level strike is unchanged by ability strikes" \
+  "$(at 500010 cooldown record --provider claude --reason "credit wall")" $'\t3600'
+for ab in plan review resolve prototype test-author; do
+  at 500011 cooldown eligible --order claude --ability "$ab" >/dev/null
+  expect_rc "#32 ability cooldown: a provider-level cooldown on claude blocks $ab" "$?" 1
+done
+expect "#32 ability cooldown: active --ability is the longer of provider and ability (ability longer)" \
+  "$(at 500011 cooldown active --provider claude --ability resolve)" "7191"
+expect "#32 ability cooldown: active --ability is the longer of provider and ability (provider longer)" \
+  "$(at 500011 cooldown active --provider claude --ability review)" "3599"
+expect "#32 ability cooldown: a provider-level record keeps the abilities map" "$(cooldown show --provider claude)" '"resolve"'
+
+at 500020 cooldown clear --provider claude --ability resolve
+expect "#32 ability cooldown: clear --provider claude --ability resolve lifts the resolve cooldown" \
+  "$(at 500021 cooldown eligible --order claude --ability resolve)" "claude"
+expect "#32 ability cooldown: clear --ability resolve clears the top-level provider cooldown" \
+  "$(at 500021 cooldown eligible --order claude)" "claude"
+at 500021 cooldown eligible --order claude --ability review >/dev/null
+expect_rc "#32 ability cooldown: clear --ability resolve leaves review's pause alone" "$?" 1
+expect "#32 ability cooldown: clear --ability resolve reset the top-level provider strikes" \
+  "$(at 500022 cooldown record --provider claude --reason x)" $'\t3600'
+expect "#32 ability cooldown: clear --ability resolve reset resolve's strikes" \
+  "$(at 500023 cooldown record --provider claude --ability resolve --reason x)" $'\t3600'
+
+at 500030 cooldown record --provider grok --reason x >/dev/null
+expect_not "#32 ability cooldown: a provider never given an ability cooldown keeps the old shape" \
+  "$(cooldown show --provider grok)" "abilities"
+at 500031 cooldown clear --provider grok
+expect_not "#32 ability cooldown: and clearing it adds no abilities map" "$(cooldown show --provider grok)" "abilities"
+at 500032 cooldown record --provider codex --ability resolve --reason x >/dev/null
+expect "#32 ability cooldown: an ability strike on a new provider writes zeroed top-level fields" \
+  "$(cooldown show --provider codex | field until)" "0"
+at 500033 cooldown fault --provider agy --ability prototype --reason "no prototype prompt"
+expect "#32 ability cooldown: fault --ability goes to faults/<provider>__<ability>.json" \
+  "$(cat "$AGENT_POOL_STATE/faults/agy__prototype.json" 2>/dev/null)" '"ability": "prototype"'
+[ -e "$AGENT_POOL_STATE/faults/agy.json" ] && got=written || got=absent
+expect "#32 ability cooldown: and not to the provider's own fault file" "$got" "absent"
+cooldown record --provider claude --ability "" --reason x 2>/dev/null
+expect_rc "#32 ability cooldown: an empty --ability is refused, not a provider strike" "$?" 2
+cooldown record --provider claude --ability review,resolve --reason x 2>/dev/null
+expect_rc "#32 ability cooldown: record refuses a list of abilities" "$?" 2
+
+echo
 echo "classification"
 classify() { # provider rc stdout [stderr]
   printf '%s' "$3" > "$TMP/o"; printf '%s' "${4:-}" > "$TMP/e"

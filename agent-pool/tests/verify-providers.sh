@@ -129,6 +129,8 @@ elif cmd == "comment":
     save(); wlog(f"comment {arg('--pr')}")
 elif cmd == "comments":
     print(json.dumps(st["prs"][arg("--pr")]["comments"]))
+elif cmd == "threads":
+    print(json.dumps(st["prs"][arg("--pr")].get("threads", [])))
 elif cmd == "head":
     p = st["prs"][arg("--pr")]
     lag = int(open(path + ".lag").read()) if os.path.exists(path + ".lag") else 0
@@ -189,6 +191,8 @@ for kind in ("allow", "deny"):
     for rule in perms[kind]:
         print(f"CURSOR_{kind.upper()} {rule}")' "$PWD/.cursor/cli.json"
   [ -f "$PWD/.agent-pool-context.md" ] && echo "CONTEXT_DIFF_LINES=$(grep -c '^+change' "$PWD/.agent-pool-context.md")"
+  [ -f "$PWD/.agent-pool-context.md" ] && grep -q '^## Unresolved review threads' "$PWD/.agent-pool-context.md" \
+    && echo "CONTEXT_HAS_THREADS=1"
 } >> "$STUB_CALLS/$name.log"
 behave="$(cat "$STUB_BEHAVE/$name" 2>/dev/null || echo ok)"
 here() { git rev-parse HEAD; }
@@ -499,6 +503,8 @@ reset '["agent:ready"]'
 behave claude limit; behave cursor-agent ok
 PROVIDER_ORDER=claude,cursor tick
 expect "cursor finished the review claude could not" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
+expect "the context file includes unresolved review threads for claude's attempt" "$(calls claude)" "CONTEXT_HAS_THREADS=1"
+expect "and for cursor's fallback attempt too" "$(calls cursor-agent)" "CONTEXT_HAS_THREADS=1"
 expect "a review with findings goes back to agent:ready, queued for resolve" "$(labels)" "agent:ready"
 expect "the claim named cursor while cursor ran" "$(calls cursor-agent)" "CLAIM_PROVIDER=cursor"
 expect "and claude while claude ran" "$(calls claude)" "CLAIM_PROVIDER=claude"
@@ -1218,6 +1224,12 @@ expect_not "no generic or agy prompt uses an em or en dash" "$(cat "$REAL_COMMON
 expect_not "the generic prompts use no Claude-only skill" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "mattpocock-skills"
 expect_not "no prompt tells a worker to post a comment" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "__ADAPTER__ comment "
 expect_not "no prompt tells a worker to push" "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "git push origin"
+expect_not "no review/resolve prompt invokes the adapter directly for comments or threads (controller-gates.md Section 4: dropped)" \
+  "$(cat "$REAL_COMMON/prompts/review.generic.txt" "$REAL_COMMON/prompts/resolve.generic.txt")" "__ADAPTER__ comments"
+expect_not "nor for threads" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "__ADAPTER__ threads"
+expect "the review prompt reads comments from the controller's context file instead" "$(cat "$REAL_COMMON/prompts/review.generic.txt")" "__CONTEXT__'s \"PR comments (JSON)\" section"
+expect "the resolve prompt reads findings from the context file" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "read __CONTEXT__"
+expect "and unresolved threads from its own section" "$(cat "$REAL_COMMON/prompts/resolve.generic.txt")" "\"Unresolved review threads (JSON)\" section"
 expect "a rendered prompt has no unfilled placeholder" "$(cat "$TMP/state/runs/prompt-7-"*-codex.txt | grep -c '__[A-Z_]*__')" "0"
 
 echo

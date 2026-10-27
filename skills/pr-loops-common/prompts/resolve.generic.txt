@@ -4,7 +4,7 @@ You are in a detached worktree checked out at the PR head __SHA__ (branch __HEAD
 
 1. Read the repository's AGENTS.md (or CLAUDE.md, or CONTRIBUTING.md) first. It names the gate commands, frozen or reference paths you must never edit, and the vocabulary to use.
 
-2. Collect the findings: the numbered findings in the most recent PR comment headed "## Automated review" (python3 __ADAPTER__ comments --repo __REPO__ --pr __PR__). Each numbered item is one finding. That review was of head __REVIEW_HEAD__ and raised __FINDINGS__ finding(s); these, and only these, are what you count. Then read the unresolved inline review comments (python3 __ADAPTER__ threads --repo __REPO__ --pr __PR__). They are not findings and are not counted: where one makes the same point as a numbered finding, handle it under that finding; otherwise change no code for it and draft a reply for the author under Thread replies.
+2. Collect the findings: read __CONTEXT__, which the controller already gathered for you. Its "PR comments (JSON)" section has the most recent comment headed "## Automated review"; the numbered findings in it are the findings, one each. That review was of head __REVIEW_HEAD__ and raised __FINDINGS__ finding(s); these, and only these, are what you count. Its "Unresolved review threads (JSON)" section lists the inline review comments nobody has resolved. They are not findings and are not counted: where one makes the same point as a numbered finding, handle it under that finding; otherwise change no code for it and draft a reply for the author under Thread replies.
 
 3. Give every finding exactly one disposition:
    - fixed: you made the smallest correct change.
