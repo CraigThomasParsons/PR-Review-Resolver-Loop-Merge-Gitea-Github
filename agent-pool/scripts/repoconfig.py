@@ -18,9 +18,17 @@ agent-pool/config/repos.example.toml is the annotated example. Shape:
 Abilities are exactly plan, review, prototype, test-author and resolve. A repo that is absent,
 or has no abilities key, gets review only. Each provider also has a ceiling no configuration
 widens: agy never resolves (it has no deny list, and resolving would need
---dangerously-skip-permissions). A provider table that lists resolve for agy is warned about and
-the ability dropped. Only review and resolve are job kinds prod-common.sh runs today; plan,
-prototype and test-author are accepted here so the file does not change when they land.
+--dangerously-skip-permissions). The ceiling is capabilities.py's static one (capabilities.ceiling,
+never its AGENT_POOL_CEILING_<PROVIDER> narrowing, so nothing here depends on a host's
+environment). A provider table that lists resolve for agy is warned about and the ability
+dropped. Only review and resolve are job kinds prod-common.sh runs today; plan, prototype and
+test-author are accepted here so the file does not change when they land.
+
+The host-wide roster, AGENT_POOL_ROSTER, is [pool].providers: the providers whose prods run on
+this host. It is the only roster; `roster` prints it for any caller (prod-common.sh, doctor.sh)
+that must not re-read the TOML itself. For one job, `roster --repo R --ability A` prints
+REPO_ROSTER, the providers in AGENT_POOL_ROSTER whose abilities() on R include A, which is what
+capabilities.py check-queue takes as --roster to decide whether anyone can ever take the job.
 
 A missing file is an empty config: every repo is review-only and no repo is ticked. A file that
 does not parse, or names an unknown ability, provider or key, is an error (exit 2): a typo must
@@ -33,6 +41,9 @@ Subcommands:
                                     With AGENT_POOL_REPO set, only that repo (its clone from
                                     AGENT_POOL_MAIN, else the config). Nothing when P is not in
                                     the roster or has no ability on the repo.
+  roster [--repo R --ability A]     the host-wide roster AGENT_POOL_ROSTER, comma-separated; with
+                                    --repo and --ability, only the providers R grants A to
+                                    (REPO_ROSTER). Empty when nobody qualifies.
   check                             validate the file and print what each provider may do
 """
 import argparse
@@ -43,10 +54,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-ABILITIES = ("plan", "review", "prototype", "test-author", "resolve")
-PROVIDERS = ("claude", "cursor", "grok", "agy", "codex")
-CEILING = {p: set(ABILITIES) for p in PROVIDERS}
-CEILING["agy"] = set(ABILITIES) - {"resolve"}
+from capabilities import ABILITIES, PROVIDERS, ceiling
+
 DEFAULT_ABILITIES = ("review",)
 REPO_NAME = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
@@ -120,7 +129,7 @@ def load(path: Path | None = None) -> dict:
             _keys(pwhere, ptable, {"abilities"})
             narrowed = _abilities(pwhere, ptable.get("abilities", []))
             for ability in narrowed:
-                if ability not in CEILING[prov]:
+                if ability not in ceiling(prov):
                     warnings.append(f"{pwhere}: {prov} can never take {ability}; ignored")
             repo["providers"][prov] = narrowed
         repos[name] = repo
@@ -136,8 +145,16 @@ def abilities(cfg: dict, repo: str, provider: str) -> list[str]:
     granted = set(entry["abilities"]) if entry else set(DEFAULT_ABILITIES)
     if entry and provider in entry["providers"]:
         granted &= set(entry["providers"][provider])
-    granted &= CEILING[provider]
+    granted &= set(ceiling(provider))
     return [x for x in ABILITIES if x in granted]
+
+
+def roster(cfg: dict, repo: str = "", ability: str = "") -> list[str]:
+    """AGENT_POOL_ROSTER ([pool].providers); with repo and ability, only the providers whose
+    abilities on that repo include it (REPO_ROSTER). A grant on another repo never counts."""
+    if not repo:
+        return list(cfg["providers"])
+    return [p for p in cfg["providers"] if ability in abilities(cfg, repo, p)]
 
 
 def ticks(cfg: dict, provider: str) -> list[tuple[str, str, list[str], bool]]:
@@ -168,14 +185,19 @@ def ticks(cfg: dict, provider: str) -> list[tuple[str, str, list[str], bool]]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("action", choices=["abilities", "ticks", "check"])
+    p.add_argument("action", choices=["abilities", "ticks", "roster", "check"])
     p.add_argument("--repo", default="")
     p.add_argument("--provider", default="")
+    p.add_argument("--ability", default="")
     a = p.parse_args()
     if a.action in ("abilities", "ticks") and a.provider not in PROVIDERS:
         p.error(f"--provider must be one of {', '.join(PROVIDERS)}")
     if a.action == "abilities" and not a.repo:
         p.error("--repo is required")
+    if a.action == "roster" and bool(a.repo) != bool(a.ability):
+        p.error("roster takes --repo and --ability together, or neither")
+    if a.action == "roster" and a.ability and a.ability not in ABILITIES:
+        p.error(f"--ability must be one of {', '.join(ABILITIES)}")
     try:
         cfg = load()
     except ConfigError as error:
@@ -185,6 +207,8 @@ def main() -> int:
         print(f"repoconfig: warning: {warning}", file=sys.stderr)
     if a.action == "abilities":
         print(",".join(abilities(cfg, a.repo, a.provider)))
+    elif a.action == "roster":
+        print(",".join(roster(cfg, a.repo, a.ability)))
     elif a.action == "ticks":
         for name, main_dir, granted, hold in ticks(cfg, a.provider):
             print(f"{name}\t{main_dir}\t{','.join(granted)}\t{int(hold)}")

@@ -9,7 +9,11 @@
 
 [pool]
 # The providers whose prods run on this host (one agent-pool-prod@<provider>.timer each).
-# The doctor only counts these when it decides whether anyone can take a queued job.
+# This list is the host-wide roster, AGENT_POOL_ROSTER; there is no other. `repoconfig.py
+# roster` prints it, and `repoconfig.py roster --repo R --ability A` the part of it that repo R
+# grants ability A (REPO_ROSTER). The doctor, and capabilities.py check-queue (--roster), only
+# count these when they decide whether anyone can take a queued job, never one tick's own
+# PROVIDER_ORDER.
 providers = ["claude", "cursor", "grok", "agy", "codex"]
 
 [repos."craigpars/AgileMedievalPeasantBoard"]

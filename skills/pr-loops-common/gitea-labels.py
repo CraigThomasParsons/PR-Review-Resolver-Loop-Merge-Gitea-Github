@@ -2,7 +2,7 @@
 """gitea-labels.py — roll the review:* label set out across Gitea repositories.
 
 The PR review/resolve loops hand off through labels only, so every repo the loops
-run against needs the same ten. Creating them by hand across 32 repos is exactly
+run against needs the same set (LABELS below). Creating them by hand across 32 repos is exactly
 the sort of thing that ends up half-done, so this does it idempotently: it reads
 each repo's existing labels first and only creates what is missing.
 
@@ -51,6 +51,14 @@ LABELS = {
     "agent:claimed":      ("ff7f0e", "An agent-pool worker is running against this PR"),
     "agent:done":         ("2ca02c", "The agent pool finished; marker on the head names the result"),
     "agent:needs-human":  ("b10026", "The agent pool stopped and a person must look"),
+    # Ability requirements (agent-pool/scripts/capabilities.py parse-requires): alongside
+    # agent:ready, only a provider advertising every listed ability claims the job.
+    "agent:plan":         ("5319e7", "The job requires the plan ability (a plan comment, no file changes)"),
+    "agent:review":       ("5319e7", "The job requires the review ability"),
+    "agent:prototype":    ("5319e7", "The job requires the prototype ability (a throwaway, never-pushed commit)"),
+    "agent:test-author":  ("5319e7", "The job requires the test-author ability (test paths only)"),
+    "agent:resolve":      ("5319e7", "The job requires the resolve ability"),
+    "agent:promote":      ("1f77b4", "Promote the latest verified prototype onto the PR branch after gates pass"),
 }
 
 

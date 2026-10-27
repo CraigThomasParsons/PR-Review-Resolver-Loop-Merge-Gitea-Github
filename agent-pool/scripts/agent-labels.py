@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """agent-labels.py: create the agent pool's agent:* labels on one Gitea repo, idempotently.
 
-The set (agent:ready, agent:claimed, agent:done, agent:needs-human, with their colours and
-descriptions) is the agent:* part of LABELS in skills/pr-loops-common/gitea-labels.py, so the
-two never drift. Only those labels are ever created; nothing is edited or deleted. A label that
+The set (the queue states agent:ready, agent:claimed, agent:done, agent:needs-human; the ability
+requirements agent:plan, agent:review, agent:prototype, agent:test-author, agent:resolve; and the
+agent:promote action, with their colours and descriptions) is the agent:* part of LABELS in
+skills/pr-loops-common/gitea-labels.py, so the two never drift. Only those labels are ever created; nothing is edited or deleted. A label that
 exists with another colour or description is reported and left as it is.
 
 The existing labels are read through the API, every page, and the script fails closed: if they
