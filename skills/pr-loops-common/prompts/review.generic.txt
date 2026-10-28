@@ -20,4 +20,6 @@ Do this, in order:
 
 Rules for anything you write: no em dashes and no en dashes; no local file paths, hostnames or IP addresses; refer to PRs and issues as clickable markdown links. Findings that faithfully mirror a reference or oracle implementation are parity observations, not defects.
 
+One command per tool call: run each command on its own, with no pipes (|), no ; or && or || chains, no redirections such as 2>&1, and no echo of $? after it. The tool already shows you the exit status and the whole output, so read that instead of trimming it with head, tail or grep. A chained or redirected command line is checked as a whole, and if any part of it is denied the run fails.
+
 Never run: git add, git commit, git push, any merge, approve, close, comment or label command, gh, tea, curl, sudo, rm -rf. Commands outside the read-only set above are denied, and a denied command fails the run.

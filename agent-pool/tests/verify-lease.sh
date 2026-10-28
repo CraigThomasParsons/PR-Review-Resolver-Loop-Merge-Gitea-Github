@@ -683,7 +683,19 @@ for fam in glob prefix; do
   expect "$fam/resolve: git add -p is denied" "$(pol $fam resolve 'git add -p')" deny
   expect "$fam/resolve: git commit without a message is denied" "$(pol $fam resolve 'git commit')" deny
   expect "$fam/resolve: git commit with paths is denied" "$(pol $fam resolve 'git commit -m x src/a.php')" deny
-  expect "$fam/resolve: npm test 2>&1 is denied (redirection is its own segment)" "$(pol $fam resolve 'npm test 2>&1')" deny
+  expect "$fam/resolve: npm test 2>&1 is allowed (it joins stderr to stdout, writes no file)" "$(pol $fam resolve 'npm test 2>&1')" allow
+  expect "$fam/resolve: npm test 2>&1 piped into tail is allowed" "$(pol $fam resolve 'npm test 2>&1 | tail -n 20')" allow
+  expect "$fam/resolve: npm test 2>/tmp/x is denied (writes a file)" "$(pol $fam resolve 'npm test 2>/tmp/x')" deny
+  expect "$fam/resolve: 2>&1 followed by > file is denied" "$(pol $fam resolve 'npm test 2>&1 >/tmp/x')" deny
+  expect "$fam/resolve: 1>&2 is denied (only 2>&1 is the harmless idiom)" "$(pol $fam resolve 'npm test 1>&2')" deny
+  expect "$fam/review: cat then ; echo done is allowed" "$(pol $fam review 'cat README.md; echo done')" allow
+  expect "$fam/review: git status then ; echo \$? is allowed" "$(pol $fam review 'git status; echo $?')" allow
+  expect "$fam/review: echo \$HOME is denied" "$(pol $fam review 'echo $HOME')" deny
+  expect "$fam/review: echo \$(id) is denied" "$(pol $fam review 'echo $(id)')" deny
+  expect "$fam/review: echo \$?? is denied" "$(pol $fam review 'echo $??')" deny
+  expect "$fam/review: echo with an option is denied" "$(pol $fam review 'echo -e hi')" deny
+  expect "$fam/review: echo of a credential path is denied" "$(pol $fam review 'echo ~/.ssh/id_ed25519')" deny
+  expect "$fam/review: git push then ; echo \$? is denied" "$(pol $fam review 'git push; echo $?')" deny
   expect "$fam/resolve: a gate piped into tail is allowed" "$(pol $fam resolve 'npm test | tail -50')" allow
   # Review r4 #1: brace expansion.
   for job in review resolve edit; do
@@ -801,10 +813,16 @@ for prov in claude grok; do
   expect_not "$prov no longer emits a bare git diff* glob" "$r" "Bash(git diff*)"
   expect "$prov denies git difftool" "$r" "Bash(git difftool*)"
   expect "$prov denies --output" "$r" "Bash(*--output*)"
-  expect "$prov denies redirection" "$r" "Bash(*>*)"
   expect "$prov denies every git add, -f included (#30)" "$(rules_of $prov resolve)" "Bash(git add*)"
   expect "$prov denies credential reads" "$r" "Read("
 done
+# grok has no hook, so its CLI globs keep denying every redirection and $; claude's hook runs
+# the full check, so claude leaves those two decisions to it (2>&1 and $? only).
+expect "grok denies redirection" "$(rules_of grok review)" "Bash(*>*)"
+expect "grok denies \$" "$(rules_of grok review)" 'Bash(*$*)'
+expect_not "claude leaves redirection to its hook" "$(rules_of claude review)" "Bash(*>*)"
+expect_not "claude leaves \$ to its hook" "$(rules_of claude review)" 'Bash(*$*)'
+expect "claude hook settings still run the policy hook" "$(python3 "$SCRIPTS/policy.py" hook-settings --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)" "policy.py"
 # Review G2 and L1: writes scoped per job, .git never writable.
 r="$(rules_of claude review)"
 expect "claude review may write its report by absolute path" "$r" $'allow\tWrite(//runs/r.md)'
