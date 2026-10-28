@@ -16,7 +16,7 @@ name: Label a brand-new PR for the review loop
 # script is inlined below rather than pulled from the repo -- one less moving
 # part (no dependency on actions/checkout resolving) for a script this small.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review]
 
 jobs:
@@ -29,15 +29,10 @@ jobs:
           REPO: ${{ gitea.repository }}
           PR_NUMBER: ${{ gitea.event.pull_request.number }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IS_DRAFT: ${{ gitea.event.pull_request.draft }}
-          AUTHOR_LOGIN: ${{ gitea.event.pull_request.user.login }}
-          PR_TITLE: ${{ gitea.event.pull_request.title }}
-          EXISTING_LABELS: ${{ toJSON(gitea.event.pull_request.labels) }}
         run: |
           cat > /tmp/label-new-pr.js <<'JS_EOF'
-          // Mirrors the exact bot/skip criteria skills/pr-loops-common/gitea-pr.py
-          // and pr-loop.sh already use, so this agrees with the rest of the
-          // pipeline on what counts as a PR worth touching.
+          // Matches the default bot/skip criteria of gitea-pr.py and pr-loop.sh.
+          // Host-specific PR_LOOP_SKIP_PATTERN overrides belong to the host path.
           const BOT_LOGINS = new Set(["gitea-actions", "actions-user"]);
           const SKIP_TITLE_PATTERN = /docblock-backfill|^chore\(#152\)/;
           const REQUESTED_LABEL = "review:requested";
@@ -48,7 +43,17 @@ jobs:
           }
 
           async function main() {
-            const { GITEA_API_URL, REPO, PR_NUMBER, TOKEN, IS_DRAFT, AUTHOR_LOGIN, PR_TITLE, EXISTING_LABELS } = process.env;
+            const { GITEA_API_URL, REPO, PR_NUMBER, TOKEN } = process.env;
+            const headers = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };
+            // The queued event may predate a hold, claim, close or draft change.
+            const prResp = await fetch(`${GITEA_API_URL}/repos/${REPO}/pulls/${PR_NUMBER}`, { headers });
+            if (!prResp.ok) throw new Error(`reading current PR failed: ${prResp.status}`);
+            const pr = await prResp.json();
+            if (pr.state !== "open") skip("PR is no longer open");
+            const IS_DRAFT = String(pr.draft);
+            const AUTHOR_LOGIN = pr.user.login;
+            const PR_TITLE = pr.title;
+            const HEAD_REF = pr.head.ref;
 
             if (IS_DRAFT === "true") skip("draft PR");
 
@@ -56,20 +61,24 @@ jobs:
             if (BOT_LOGINS.has(login) || login.endsWith("[bot]")) skip(`bot author ${AUTHOR_LOGIN}`);
 
             if (SKIP_TITLE_PATTERN.test(PR_TITLE || "")) skip(`title matches the skip pattern: ${PR_TITLE}`);
+            if (SKIP_TITLE_PATTERN.test(HEAD_REF || "")) skip(`branch matches the skip pattern: ${HEAD_REF}`);
 
-            const existing = JSON.parse(EXISTING_LABELS || "[]").map((l) => l.name);
-            if (existing.some((name) => name.startsWith("review:") || name.startsWith("agent:"))) {
+            const existing = pr.labels.map((l) => l.name);
+            if (existing.some((name) => name.startsWith("review:") || name.startsWith("agent:") || name === "night:hold")) {
               skip(`already labelled (${existing.join(", ")}); the pipeline already knows about this PR`);
             }
 
-            const headers = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };
-
-            const labelsResp = await fetch(`${GITEA_API_URL}/repos/${REPO}/labels?limit=50`, { headers });
-            if (!labelsResp.ok) {
-              throw new Error(`listing labels failed: ${labelsResp.status} ${await labelsResp.text()}`);
+            let requested;
+            const seen = new Set();
+            for (let page = 1; page <= 100; page++) {
+              const labelsResp = await fetch(`${GITEA_API_URL}/repos/${REPO}/labels?limit=50&page=${page}`, { headers });
+              if (!labelsResp.ok) throw new Error(`listing labels failed: ${labelsResp.status}`);
+              const labels = await labelsResp.json();
+              requested = labels.find((l) => l.name === REQUESTED_LABEL);
+              if (requested || labels.length === 0) break;
+              if (labels.every((l) => seen.has(l.id))) throw new Error("label pagination repeated a page");
+              labels.forEach((l) => seen.add(l.id));
             }
-            const labels = await labelsResp.json();
-            const requested = labels.find((l) => l.name === REQUESTED_LABEL);
             if (!requested) {
               throw new Error(`repo has no "${REQUESTED_LABEL}" label defined -- run the label roller first`);
             }

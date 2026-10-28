@@ -109,6 +109,18 @@ unit runs `pr-drain`, which takes that one PR through label, review and resolve
 under the same locks and markers as the timer. Contract, queue semantics,
 Gitea checks and troubleshooting: `skills/pr-loops-common/docs/EVENT-TRIGGER.md`.
 
+This repository also has `.gitea/workflows/label-new-pr.yml`, a container-only
+alternative for initial labeling on `factory-node`. It uses the trusted target
+branch's workflow on `pull_request_target`, without checking out PR code. Once
+merged into the target branch, it labels newly opened, reopened or ready PRs;
+it cannot bootstrap itself by opening the PR that first introduces it. It checks
+current PR state, preserves existing pipeline labels and `night:hold`, and uses
+the default title/branch skip pattern (host-specific overrides remain with
+`pr-loop.sh`). Repository labels must first exist via the label roller.
+It does not run review workers. Where the host event trigger is also installed,
+its resulting `labeled` event joins the same deduplicated PR queue. Use the host
+path when custom host label policy is required.
+
 ## Tests
 
 ```sh
