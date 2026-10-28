@@ -5,6 +5,8 @@
 # unprivileged bwrap and a systemd user manager; without them (or with
 # AGENT_POOL_TEST_REAL_SANDBOX=0) they are reported as SKIP and counted, never passed. They talk
 # only to a loopback listener this script opens and to fixture credentials in a temp HOME.
+# The MemoryMax case deliberately OOM-kills a scope (desktop low-memory notification), so it
+# is SKIP unless AGENT_POOL_TEST_OOM=1.
 # The end-to-end controller path (prod-common.sh run_gates) is in verify-providers.sh.
 set -uo pipefail
 
@@ -473,9 +475,15 @@ SH
   expect "after its own timeout" "$out" "timed out after 3s"
   expect "promptly" "$([ "$took" -lt 15 ] && echo prompt || echo "slow ${took}s")" "prompt"
 
-  gate_manifest '["just", "hog"]'
-  out="$(run_gate hog)"
-  expect "a gate over MemoryMax is gate-resource" "$out" '"result": "gate-resource"'
+  # Deliberately OOM-kills a capped scope, which makes desktops pop a "system is low on
+  # memory" notification. Opt in with AGENT_POOL_TEST_OOM=1 (issue #56).
+  if [ "${AGENT_POOL_TEST_OOM:-0}" = "1" ]; then
+    gate_manifest '["just", "hog"]'
+    out="$(run_gate hog)"
+    expect "a gate over MemoryMax is gate-resource" "$out" '"result": "gate-resource"'
+  else
+    skipped=$((skipped + 1)); printf '  SKIP  a gate over MemoryMax is gate-resource: set AGENT_POOL_TEST_OOM=1 to run (it OOM-kills a scope on purpose)\n'
+  fi
 
   gate_manifest '["vendor/bin/phpunit"]'
   out="$(run_gate missing)"
