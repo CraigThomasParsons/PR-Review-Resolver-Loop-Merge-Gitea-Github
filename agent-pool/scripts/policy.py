@@ -167,8 +167,21 @@ def unquoted_brace(command: str) -> bool:
     return False
 
 
+# Read-only shell idioms workers reach for out of habit. Each is neutralised before the command
+# is checked, so it cannot hide anything: `2>&1` only joins stderr to stdout (it writes no file),
+# and `$?` is the previous exit status, a number nothing can expand into code. Every other `$`,
+# redirection and file write is still denied.
+STDERR_TO_STDOUT = re.compile(r"(?<!\S)2>&1(?!\S)")
+EXIT_STATUS = re.compile(r"(?<![\w$])\$\?(?![\w?])")
+
+
+def harmless_idioms_removed(command: str) -> str:
+    return EXIT_STATUS.sub("0", STDERR_TO_STDOUT.sub(" ", command))
+
+
 def tokenize(command: str) -> list[list[str]] | None:
     """Return a list of segments (token lists), or None if any denied construct appears."""
+    command = harmless_idioms_removed(command)
     if unquoted_brace(command) or "`" in command or "$" in command:
         return None
     lex = shlex.shlex(command, posix=True, punctuation_chars=OPERATOR_CHARS)
@@ -288,6 +301,9 @@ def segment_ok(seg: list[str], a: argparse.Namespace) -> bool:
         if sub in GIT_SPECS:
             return reader_check(args, GIT_SPECS[sub], a, pattern_first=(sub == "grep"))
         return False
+    if head == "echo":
+        # Literal text only (quotes and $ are settled by tokenize); echo writes to stdout only.
+        return not any(t.startswith("-") or sensitive(t, a) for t in seg[1:])
     if head in TOOL_SPECS:
         return reader_check(seg[1:], TOOL_SPECS[head], a, pattern_first=head in ("grep", "rg"))
     if head == "python3":
@@ -318,7 +334,7 @@ def argument_check(command: str, a: argparse.Namespace) -> bool:
 # ---------------------------------------------------------------- emitted rules
 READ_SUBS = ["diff", "log", "show", "status", "rev-parse", "ls-files", "grep", "blame"]
 READ_SHELL = [r for sub in READ_SUBS for r in (f"git {sub}", f"git {sub} *")] + \
-    ["cat *", "ls", "ls *", "head *", "tail *", "wc *", "grep *", "rg *"]
+    ["cat *", "ls", "ls *", "head *", "tail *", "wc *", "grep *", "rg *", "echo", "echo *"]
 GATE_SHELL = ["npm run *", "npm test", "npm test *", "dotnet build", "dotnet build *", "dotnet test",
               "dotnet test *", "just", "just *", "composer test", "composer test *", "composer lint",
               "composer lint *", "php artisan test", "php artisan test *", "vendor/bin/pint", "vendor/bin/pint *",
@@ -341,6 +357,7 @@ DENY_SHELL = [
     "tail *-f*", "tail *-F*", "*.ssh*", "*.config/tea*", "*.config/pulse*", "*.netrc*", "*.git-credentials*",
     "*/proc/*", "*gitea_token*",
 ]
+CLAUDE_HOOK_DECIDES = ("*>*", "*$*")
 CURSOR_DENY = ["git push", "git push --force", "git reset --hard", "git merge", "git rebase", "git branch -D",
                "git difftool", "git diff --output", "git log --output", "git show --output",
                "git diff --ext-diff", "git log --ext-diff", "git show --ext-diff",
@@ -399,7 +416,10 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
         tools = [f"Read({ab(r)}/**)" for r in read_roots(a)] + ["Grep", "Glob", f"Write({ab(a.report)})"]
         if a.job in WRITING_JOBS:
             tools += [f"Edit({ab(wt)}/**)", f"Write({ab(wt)}/**)"]
-        denies = [f"Bash({r})" for r in deny]
+        # Claude's PreToolUse hook runs the full `check`, which still denies every `$` and
+        # redirection except the harmless `2>&1` and `$?`; a CLI glob cannot tell those apart,
+        # so Claude alone drops the two blanket globs and leaves that decision to the hook.
+        denies = [f"Bash({r})" for r in deny if r not in CLAUDE_HOOK_DECIDES]
         denies += [f"{t}({ab(p)})" for p in git_paths(a) for t in ("Edit", "Write")]
         denies += [f"Read({ab(p)})" for p in credential_globs()]
         return tools + [f"Bash({r})" for r in allow], denies
@@ -448,6 +468,7 @@ def writes_output(seg: list[str]) -> bool:
 def check(a: argparse.Namespace, command: str) -> str:
     if not argument_check(command, a):
         return "deny"
+    command = harmless_idioms_removed(command)
     segments = tokenize(command)
     if any(writes_output(seg) for seg in segments):
         return "deny"
