@@ -320,14 +320,26 @@ if [ "${#QUEUE[@]}" -eq 0 ]; then log "nothing to do after skips"; exit 0; fi
 
 # The handoff runs on QUEUE, after the marker checks, so an already-reviewed head is not handed
 # to the pool and stale findings still go back to review:requested first.
+#
+# Add agent:ready BEFORE removing $TRIGGER, and verify the add actually landed, rather than
+# trusting the label call's exit code alone: `tea pr edit --add-labels` exits 0 even when the
+# named label does not exist on the repo (it just has nothing to add), which silently dropped
+# a PR with no label at all the one time a pool-managed repo was missing agent:ready (#52,
+# 2026-10-26). Ordering add-then-remove means a failed add leaves $TRIGGER in place instead of
+# orphaning the PR.
 if pool_owns_repo; then
   for row in "${QUEUE[@]}"; do
     IFS=$'\t' read -r pr _ sha _ <<<"$row"
     if [ "$DRY_RUN" = "1" ]; then log "DRY: #$pr would hand off to the agent pool ($TRIGGER -> agent:ready) at $sha"; continue; fi
-    if python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" --add agent:ready >/dev/null 2>&1; then
-      log "#$pr: handed off to the agent pool ($TRIGGER -> agent:ready) at $sha"
+    python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --add agent:ready >/dev/null 2>&1
+    if python3 "$ADAPTER" labels --repo "$REPO" --pr "$pr" 2>/dev/null | grep -q '"agent:ready"'; then
+      if python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" >/dev/null 2>&1; then
+        log "#$pr: handed off to the agent pool ($TRIGGER -> agent:ready) at $sha"
+      else
+        log "warning: #$pr: agent:ready landed but $TRIGGER could not be removed; retry on the next tick"
+      fi
     else
-      log "warning: hand-off of #$pr to the agent pool failed; it stays at $TRIGGER"
+      log "warning: hand-off of #$pr to the agent pool failed (agent:ready did not land, likely missing on this repo); it stays at $TRIGGER"
     fi
   done
   exit 0
