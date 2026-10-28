@@ -146,6 +146,8 @@ elif sys.argv[1] in ("label", "labels"):
     if sys.argv[1] == "label":
         add = arg("--add")
         remove = arg("--remove")
+        if remove and os.environ.get("ADAPTER_REMOVE_FAIL"):
+            sys.exit(1)
         # Simulates the real failure: the Gitea API accepts an unknown label name as a no-op,
         # exit 0, nothing added -- ADAPTER_NO_AGENT_LABEL stands in for a repo the label
         # roller was never run against.
@@ -156,6 +158,8 @@ elif sys.argv[1] in ("label", "labels"):
         state[pr] = sorted(cur)
         json.dump(state, open(path, "w"))
     else:
+        if os.environ.get("ADAPTER_LABELS_FAIL"):
+            sys.exit(1)
         print(json.dumps(sorted(cur)))
 PY
 cat > "$LC/marker.py" <<'PY'
@@ -218,7 +222,20 @@ expect "a repo missing the agent:ready label: hand-off is reported as failed, no
 expect "  ... review:requested is never removed when the add did not land" \
   [ "$(python3 -c 'import json; print(json.load(open("'"$LABEL_STATE"'"))["8"])')" = "['review:requested']" ]
 expect "  ... so the PR is never left with no label at all" \
-  [ -n "$(python3 -c 'import json; print(json.load(open("'"$LABEL_STATE"'"))["8"])')" ]
+  python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["8"] else 1)' "$LABEL_STATE"
+
+rm -f "$LABEL_STATE"
+out="$(ADAPTER_LABELS_FAIL=1 PR_LOOP_PR=8 loop_live)"
+expect "a failed verification read reports a failed hand-off" has "$out" "warning: hand-off"
+expect "a failed verification read preserves the trigger" \
+  python3 -c 'import json, sys; sys.exit(0 if "review:requested" in json.load(open(sys.argv[1]))["8"] else 1)' "$LABEL_STATE"
+
+rm -f "$LABEL_STATE"
+out="$(ADAPTER_REMOVE_FAIL=1 PR_LOOP_PR=8 loop_live)"
+expect "a failed trigger removal reports a warning" has "$out" "could not be removed"
+expect "a failed trigger removal never reports success" lacks "$out" "#8: handed off"
+expect "a failed trigger removal preserves both routing labels" \
+  [ "$(python3 -c 'import json; print(json.load(open("'"$LABEL_STATE"'"))["8"])')" = "['agent:ready', 'review:requested']" ]
 
 # ================================================================ pr-drain
 echo

@@ -333,8 +333,11 @@ if pool_owns_repo; then
     if [ "$DRY_RUN" = "1" ]; then log "DRY: #$pr would hand off to the agent pool ($TRIGGER -> agent:ready) at $sha"; continue; fi
     python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --add agent:ready >/dev/null 2>&1
     if python3 "$ADAPTER" labels --repo "$REPO" --pr "$pr" 2>/dev/null | grep -q '"agent:ready"'; then
-      python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" >/dev/null 2>&1
-      log "#$pr: handed off to the agent pool ($TRIGGER -> agent:ready) at $sha"
+      if python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" >/dev/null 2>&1; then
+        log "#$pr: handed off to the agent pool ($TRIGGER -> agent:ready) at $sha"
+      else
+        log "warning: #$pr: agent:ready landed but $TRIGGER could not be removed; retry on the next tick"
+      fi
     else
       log "warning: hand-off of #$pr to the agent pool failed (agent:ready did not land, likely missing on this repo); it stays at $TRIGGER"
     fi
