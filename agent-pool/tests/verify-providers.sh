@@ -808,16 +808,27 @@ expect "#60: the receipt says so, with the same blob" "$(receipt)" '"status": "f
 expect "#60: (blob)" "$(receipt)" "\"blob\": \"$LOCKBLOB\""
 expect "#60: and the resolve is done" "$(labels)" "agent:done"
 
+CACHE_FAULT="$TMP/state/faults/gates-cache/owner__repo.json"
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave claude resolve-fix; behave warm fail
-tick
+AGENT_POOL_GATE_CACHE_PAUSE_SECS=600 tick
 expect "#60: a failed warm pushes nothing" "$(origin_head)" "$SHA"
 expect "#60: and runs no install or gate after it" "$(just_order)" "warm "
 expect_not "#60: (no install)" "$(just_order)" "install"
 expect "#60: (no gate)" "$(gate_ran)" "none"
 expect "#60: the job is requeued" "$(labels)" "agent:ready"
 expect_not "#60: not a needs-human (no gate refused the candidate)" "$(labels)" "agent:needs-human"
-expect "#60: as a setup fault of the gates, naming the warm" "$(cat "$TMP/out.txt")" "SETUP FAULT [gates]: warming dependency cache tools"
+expect "#60: as a gate cache fault of this repo, naming the warm" "$(cat "$TMP/out.txt")" "GATE CACHE FAULT [owner/repo]: warming dependency cache tools"
+expect_not "#60: not a global gates setup fault" "$(cat "$TMP/out.txt")" "SETUP FAULT [gates]"
+expect "#60: so faults/gates.json is not written" "$([ -e "$TMP/state/faults/gates.json" ] && echo written || echo absent)" "absent"
+expect "#60: the repo's own fault is" "$(cat "$CACHE_FAULT" 2>/dev/null)" '"repo": "owner/repo"'
+expect "#60: naming the failed dep" "$(cat "$CACHE_FAULT" 2>/dev/null)" '"name": "tools"'
+expect "#60: its lockfile" "$(cat "$CACHE_FAULT" 2>/dev/null)" '"lockfile": "justfile"'
+expect "#60: and that lockfile's blob at the base" "$(cat "$CACHE_FAULT" 2>/dev/null)" "\"blob\": \"$LOCKBLOB\""
+expect "#60: the base SHA" "$(cat "$CACHE_FAULT" 2>/dev/null)" "\"base_sha\": \"$BASESHA\""
+expect "#60: the warm's reason" "$(cat "$CACHE_FAULT" 2>/dev/null)" "warming dependency cache tools: warm 'tools' exited 1"
+expect "#60: expiring after AGENT_POOL_GATE_CACHE_PAUSE_SECS" \
+  "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(round(d["expires_at"] - d["at"]))' "$CACHE_FAULT" 2>/dev/null)" "600"
 expect "#60: the tick exits 2" "$TICK_RC" "2"
 expect "#60: the provider is not cooled down" "$(cooldown_doc claude)" "none"
 expect "#60: nor charged a setup fault" "$(cat "$TMP/state/faults/claude.json" 2>/dev/null || echo none)" "none"
@@ -826,6 +837,35 @@ expect "#60: the receipt records the warm as infra" "$(receipt)" '"result": "inf
 expect "#60: with the warm's reason" "$(receipt)" "warming dependency cache tools: warm 'tools' exited 1"
 expect "#60: and the dep marked failed" "$(receipt)" '"status": "failed"'
 expect "#60: no cache was swapped in" "$([ -e "$DEPDIR/cache" ] && echo swapped || echo none)" "none"
+
+tick
+expect "#60: while the repo's fault stands, its resolve jobs are not claimed" "$(cat "$TMP/out.txt")" "owner/repo: resolve jobs for this repo are paused"
+expect "#60: saying why and how to retry sooner" "$(cat "$TMP/out.txt")" "delete $CACHE_FAULT to retry sooner"
+expect "#60: so the provider is not run again" "$(ncalls claude)" "1"
+expect "#60: and the job stays queued" "$(labels)" "agent:ready"
+
+AGENT_POOL_REPO=other/repo tick
+expect_not "#60: another repo's resolve jobs are not paused" "$(cat "$TMP/out.txt")" "are paused"
+expect "#60: its provider runs" "$(ncalls claude)" "2"
+expect "#60: and its fix is gated and published" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "#60: (done)" "$(labels)" "agent:done"
+expect "#60: (with its own passing receipt)" "$(cat "$TMP/state/gates/other_repo__7__"*.json 2>/dev/null)" '"result": "pass"'
+expect "#60: the first repo's fault still stands" "$([ -e "$CACHE_FAULT" ] && echo present || echo gone)" "present"
+
+cp "$CACHE_FAULT" "$TMP/cache-fault.keep"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+mkdir -p "$(dirname "$CACHE_FAULT")"
+python3 -c 'import json,sys,time; d=json.load(open(sys.argv[1])); d["expires_at"]=time.time()-1; json.dump(d, open(sys.argv[2], "w"))' \
+  "$TMP/cache-fault.keep" "$CACHE_FAULT"
+rm -f "$TMP/cache-fault.keep"
+behave claude resolve-fix
+tick
+expect_not "#60: an expired fault no longer pauses the repo" "$(cat "$TMP/out.txt")" "are paused"
+expect "#60: the next resolve warms again" "$(just_order)" "warm install gate "
+expect "#60: and is published" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "#60: (done)" "$(labels)" "agent:done"
+expect "#60: the passing warm clears the repo's fault" "$([ -e "$CACHE_FAULT" ] && echo present || echo gone)" "gone"
+expect "#60: and says so" "$(cat "$TMP/out.txt")" "gate cache fault is cleared"
 rm -rf "$TMP/gates-override"
 
 reset '["agent:ready"]' '[]' "$(marker_for "$ATTR_SHA")" feature/attr

@@ -100,6 +100,8 @@
 #   AGY_PRINT_TIMEOUT=0            agy's own print timeout; 0 leaves WORKER_TIMEOUT as the only limit
 #   AGENT_POOL_GATE_BUDGET=1200    cap (s) on any manifest's gate budget, and separately on a job's
 #                                  [[deps]] warm; both also stop 60s before its claim deadline
+#   AGENT_POOL_GATE_CACHE_PAUSE_SECS=3600   how long a failed [[deps]] warm pauses that repo's
+#                                  resolve jobs (faults/gates-cache/<owner>__<name>.json)
 #   AGENT_POOL_GATES_DIR           controller-owned manifest overrides (~/.config/agent-pool/gates)
 #   AGENT_POOL_GATE_RO_BINDS       colon list of toolchain dirs bound read-only into the gate sandbox
 #   AGENT_POOL_GATE_SANDBOX AGENT_POOL_GATE_SCOPE   bwrap and systemd-run paths (default: /usr/bin)
@@ -131,8 +133,10 @@
 # network, still no credentials). The result is a write-once receipt bound to the attempt and
 # the exact head, naming the lockfile blob each dep's cache was warmed from; the push goes ahead
 # only for a receipt that passed. A red gate is a needs-human with nothing pushed; a broken
-# sandbox or manifest, or a failed warm, is a setup fault [gates] that requeues the job and
-# pauses resolve jobs until a person fixes it and deletes faults/gates.json.
+# sandbox or manifest is a setup fault [gates] that requeues the job and pauses resolve jobs
+# until a person fixes it and deletes faults/gates.json. A failed warm requeues the job too, but
+# pauses only this repo's resolve jobs, through faults/gates-cache/<owner>__<name>.json, which
+# expires after AGENT_POOL_GATE_CACHE_PAUSE_SECS and is cleared by the next warm that passes.
 #
 # Exit codes: 0 for a normal tick (including nothing to do); 2 for a setup fault.
 
@@ -331,13 +335,23 @@ ability_enabled() { # job
 # resolves when an operator running this tick directly opted in to it unattended; under an
 # entrypoint (AGENT_POOL_ABILITIES set) it never resolves.
 job_providers() { # job
-  local p
+  local p pause
   JOB_PROVIDERS=()
   ability_enabled "$1" || return 0
   # Another provider would only hit the same broken sandbox after a full WORKER_TIMEOUT.
   if [ "$1" = resolve ] && [ -e "$STATE/faults/gates.json" ]; then
     log "$REPO: resolve jobs are paused: the gate sandbox has a recorded fault ($STATE/faults/gates.json); fix it, then delete that file"
     return 0
+  fi
+  # Only this repo's dependency cache failed to warm; other repos keep resolving. A failed check
+  # reads as paused.
+  if [ "$1" = resolve ]; then
+    pause="$(python3 "$SCRIPTS/gates.py" cache-pause --state "$STATE" --repo "$REPO" 2>>"$LOG")"
+    if [ "$pause" != clear ]; then
+      [[ "$pause" == paused$'\t'* ]] || pause=$'paused\tthe gate cache fault check failed'
+      log "$REPO: resolve jobs for this repo are paused: its dependency cache could not be warmed: ${pause#*$'\t'}"
+      return 0
+    fi
   fi
   # Checked once per tick, before any claim: a resolve's work could never be committed.
   if [ "$1" = resolve ] && [ "$SIGNING_CHECKED" = 0 ]; then
@@ -732,13 +746,14 @@ print(d.get("source") or "none", d.get("blob") or "-")' "$5")
 }
 
 # run_gates provider sha newhead base -> 0 with GATE_RECEIPT naming a passing receipt, else 1
-# with PUB set: fail:<why> (a red gate, protected paths, no manifest), gateinfra:<why> or lost.
-# GATE_TERMINAL=1 when no provider retry could change the outcome (protected paths, no manifest).
-# The worker's process group is already dead; nothing here reads the worker's worktree.
-# A manifest with [[deps]] first has its caches under $STATE/gate-cache warmed from BASE_SHA
-# (gates.py warm: base-branch code, network, no credentials); a failed warm is gateinfra.
+# with PUB set: fail:<why> (a red gate, protected paths, no manifest), gateinfra:<why>,
+# cacheinfra:<why> or lost. GATE_TERMINAL=1 when no provider retry could change the outcome
+# (protected paths, no manifest). The worker's process group is already dead; nothing here reads
+# the worker's worktree. A manifest with [[deps]] first has its caches under $STATE/gate-cache
+# warmed from BASE_SHA (gates.py warm: base-branch code, network, no credentials); a failed warm
+# records this repo's gate cache fault and is cacheinfra, and a passing one clears that fault.
 run_gates() {
-  local p="$1" sha="$2" newhead="$3" base="$4" tag base_sha manifest raw hits names budget run res why deps rc
+  local p="$1" sha="$2" newhead="$3" base="$4" tag base_sha manifest raw hits names budget run res why deps rc fault
   local warm=""
   tag="$JOB_PR-${ATTEMPT:0:8}"; manifest="$RUNS/gates-manifest-$tag.json"; raw="$RUNS/gates-diff-$tag"
   run="$RUNS/gates-run-$tag.json"; GATE_RECEIPT=""; GATE_TERMINAL=0
@@ -803,10 +818,18 @@ run_gates() {
       why="${why:-the dependency warm failed}"
       gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" infra "$why" "" "$warm"
       jlog "gates: dependency warm failed, so no gate ran at $newhead ($why)"
-      PUB="gateinfra:$why"; return 1
+      if fault="$(python3 "$SCRIPTS/gates.py" cache-fault --state "$STATE" --repo "$REPO" --base-sha "$base_sha" \
+           --warm "$warm" --reason "$why" 2>>"$LOG")"; then
+        log "GATE CACHE FAULT [$REPO]: $why (only $REPO's resolve jobs pause, for ${AGENT_POOL_GATE_CACHE_PAUSE_SECS:-3600}s or until $fault is deleted; no provider cooldown)"
+      else
+        log "GATE CACHE FAULT [$REPO]: $why (the fault could not be recorded, so the next tick warms again)"
+      fi
+      PUB="cacheinfra:$why"; return 1
     fi
     jlog "gates: dependency caches ready ($(python3 -c 'import json,sys
 print(" ".join("%s=%s" % (d.get("name"), d.get("status")) for d in json.load(open(sys.argv[1])).get("deps", [])))' "$warm" 2>/dev/null))"
+    fault="$(python3 "$SCRIPTS/gates.py" cache-clear --state "$STATE" --repo "$REPO" 2>>"$LOG")"
+    [ -n "$fault" ] && jlog "gates: the warm passed, so $REPO's gate cache fault is cleared ($fault)"
   fi
   budget="$(gate_secs)"
   # No time left, or the claim could not be read: a controller fault, not a red gate.
@@ -845,7 +868,8 @@ COMMIT_IGNORED=(".cursor/*" ".grok/*" ".claude/*" "$CONTEXT_FILE")
 CREDENTIAL_PATHS='/\.env(\.[^/]*)?$|gitea_token|/id_(rsa|ecdsa|ed25519)[^/]*$|\.pem$|/\.netrc$|/\.git-credentials$'
 
 # controller_commit provider ability sha base report refuse -> 0 with NEWHEAD, else 1 with PUB
-# set (fail:<why>, gateinfra:<why>, signinfra:<why> or lost). The one commit per ability run.
+# set (fail:<why>, gateinfra:<why>, cacheinfra:<why>, signinfra:<why> or lost). The one commit
+# per ability run.
 # It runs after the worker's process group is dead and the claim re-checked, and reads the
 # worktree's changes against sha through a private index of the main clone; it never runs git
 # inside the worktree, whose .git, config and hooks are the worker's. NEWHEAD is sha when the
@@ -927,8 +951,8 @@ controller_commit() {
 
 # ---------------------------------------------------------------- controller-side publication
 # publish provider sha headref report result base -> PUB: published | nomarker:<why> |
-# requeue:<why> | fail:<why> | gateinfra:<why> | signinfra:<why> | lost. The only path by which
-# a worker's work reaches Gitea.
+# requeue:<why> | fail:<why> | gateinfra:<why> | cacheinfra:<why> | signinfra:<why> | lost. The
+# only path by which a worker's work reaches Gitea.
 publish() {
   local p="$1" sha="$2" headref="$3" report="$4" result="$5" base="$6" chk alt head fixed newhead remote rc refuse
   local args=(--marker-module "$MARKER")
@@ -1060,6 +1084,10 @@ attempt() {
     gateinfra:*)
       setup_fault gates "${PUB#*:}"
       VERDICT=requeue; DETAIL="the controller's gate run could not complete (${PUB#*:})"; return ;;
+    # run_gates already recorded this repo's gate cache fault; nothing global is paused.
+    cacheinfra:*)
+      SETUP_FAULTS=$((SETUP_FAULTS + 1))
+      VERDICT=requeue; DETAIL="the controller could not warm $REPO's dependency cache (${PUB#*:})"; return ;;
     signinfra:*)
       setup_fault signing "${PUB#*:}"
       VERDICT=requeue; DETAIL="the controller could not sign the commit (${PUB#*:})"; return ;;

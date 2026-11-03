@@ -423,6 +423,34 @@ expect "check-receipt still accepts a receipt with no deps key" "$?" "0"
 python3 "$GATES" annotate --report "$TMP/report.md" --receipt "$ST/gates/owner_repo__7__att-old.json" --out "$TMP/report.old"
 expect "and annotate still renders it" "$(cat "$TMP/report.old")" "agent-pool-gates:v1 head=$H4 manifest=abc123 result=pass"
 
+echo "#60: a failed warm pauses only its own repo, until the fault expires or is cleared"
+cf() { python3 "$GATES" "$@" --state "$ST" --repo owner/repo 2>&1; }
+CF="$ST/faults/gates-cache/owner__repo.json"
+printf '{"result": "infra", "reason": "warming dependency cache web: x", "deps": [{"name": "web", "lockfile": "web/package-lock.json", "status": "failed", "blob": "b10b5ea", "base_sha": ""}, {"name": "ok", "lockfile": "ok.lock", "status": "fresh", "blob": "0kb10b", "base_sha": "%s"}]}' \
+  "$H2" > "$TMP/warm-fail.json"
+out="$(AGENT_POOL_NOW=1000 cf cache-fault --base-sha "$H2" --warm "$TMP/warm-fail.json")"
+expect "cache-fault writes faults/gates-cache/<owner>__<name>.json" "$out" "$CF"
+expect "naming the repo" "$(cat "$CF")" '"repo": "owner/repo"'
+expect "the warm's reason" "$(cat "$CF")" "warming dependency cache web: x"
+expect "the base SHA" "$(cat "$CF")" "\"base_sha\": \"$H2\""
+expect "the failed dep's lockfile blob" "$(cat "$CF")" '"blob": "b10b5ea"'
+expect_not "but not a dep that was fine" "$(cat "$CF")" '"name": "ok"'
+expect "expiring an hour later by default" "$(cat "$CF")" '"expires_at": 4600'
+expect "cache-pause reports it before then" "$(AGENT_POOL_NOW=4599 cf cache-pause)" "paused"
+expect "with its reason" "$(AGENT_POOL_NOW=4599 cf cache-pause)" "warming dependency cache web: x"
+expect "but another repo is clear" "$(AGENT_POOL_NOW=4599 python3 "$GATES" cache-pause --state "$ST" --repo owner/other)" "clear"
+expect "and it lapses at expires_at" "$(AGENT_POOL_NOW=4600 cf cache-pause)" "clear"
+AGENT_POOL_NOW=5000 AGENT_POOL_GATE_CACHE_PAUSE_SECS=60 cf cache-fault --base-sha "$H2" --warm "$TMP/warm-fail.json" >/dev/null
+expect "a second failure is counted" "$(cat "$CF")" '"count": 2'
+expect "and AGENT_POOL_GATE_CACHE_PAUSE_SECS sets the pause" "$(cat "$CF")" '"expires_at": 5060'
+echo 'not json' > "$CF"
+expect "an unreadable fault still pauses" "$(cf cache-pause)" "paused"
+expect "but expires from its mtime" "$(AGENT_POOL_NOW=$(( $(date +%s) + 3700 )) cf cache-pause)" "clear"
+expect "cache-clear deletes it" "$(cf cache-clear)" "$CF"
+expect "(gone)" "$([ -e "$CF" ] && echo present || echo gone)" "gone"
+expect "and then it is clear" "$(cf cache-pause)" "clear"
+expect "cache-clear with no fault is a quiet no-op" "[$(cf cache-clear)] rc=$?" "[] rc=0"
+
 # ---------------------------------------------------------------- run: refusals before any sandbox
 echo "run fails closed (infra) before running anything"
 FAKEHOME="$TMP/fakehome"

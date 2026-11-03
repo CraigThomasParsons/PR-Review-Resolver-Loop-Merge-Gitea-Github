@@ -149,9 +149,21 @@ install  = ["npm", "ci", "--offline"]          # sandbox, worker's tree, network
   the controller re-warms a dep whose lockfile blob on the base branch, or whose `[[deps]]`
   entry, has changed. It runs `warm` against an export of the base commit, in the same sandbox
   as the gates but with network. That is base-branch code: no worker edit, no environment, no
-  ssh agent and no tokens. A failed warm keeps the previous cache. It counts as a gate setup
-  fault: the job is requeued, and resolve jobs pause until a person fixes the cause and deletes
-  `$AGENT_POOL_STATE/faults/gates.json`.
+  ssh agent and no tokens.
+- **A failed warm pauses only that repo.** The previous cache is kept, and the job goes back to
+  `agent:ready`. The provider gets no cooldown or fault, and the PR doesn't go to a human. The
+  controller writes `$AGENT_POOL_STATE/faults/gates-cache/<owner>__<name>.json`, recording the
+  reason, the base commit, the failed deps and their lockfile blobs, and when it expires. That
+  repo's resolve jobs are then skipped, while other repos keep resolving. The pause ends in any
+  of three ways:
+  - After `AGENT_POOL_GATE_CACHE_PAUSE_SECS` (default 3600), the next tick claims a resolve job
+    and warms again.
+  - A warm for that repo passes, which deletes the file.
+  - You delete the file by hand to retry sooner.
+
+  Other gate infrastructure faults are unchanged. A broken sandbox or an invalid manifest still
+  writes `$AGENT_POOL_STATE/faults/gates.json` and pauses resolve jobs in every repo until a person
+  deletes it.
 - **Each gate receipt names the warmed lockfile blob(s).** Receipts are under
   `$AGENT_POOL_STATE/gates/`, and the posted gate section shows them too.
 - **Clearing a cache.** Delete that dep's dir, for example

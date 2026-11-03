@@ -68,6 +68,16 @@ Subcommands:
                                         passed (pass or none-needed)
   annotate --report R --receipt RC --out O   copy R to O with the controller's gate section
                                         and gate marker inserted before the resolve marker
+  cache-fault --state S --repo O/R --base-sha B [--warm J] [--reason W]
+                                        record a failed warm as the repo's own gate cache fault,
+                                        S/faults/gates-cache/<owner>__<name>.json (repo, reason,
+                                        base_sha, the failed deps with their lockfile blobs,
+                                        count, at, expires_at); print its path
+  cache-pause --state S --repo O/R      print "clear", or "paused<TAB><why>" while that fault
+                                        has not expired (an unreadable one expires from its
+                                        mtime)
+  cache-clear --state S --repo O/R      delete that fault (after a warm passes); print its path
+                                        if there was one
 
 `--manifest J` for select/protected/warm/run accepts either a path to a JSON file holding the
 "manifest" object (as produced by `load`) or a literal JSON string.
@@ -75,7 +85,8 @@ Subcommands:
 Knobs: AGENT_POOL_GATE_SANDBOX (bwrap path), AGENT_POOL_GATE_SCOPE (systemd-run path),
 AGENT_POOL_GATE_RO_BINDS (colon list of toolchain dirs bound read-only at the same path; each
 one, and its bin/, goes first on the gate's PATH; $HOME, its parents and anything holding a
-credential directory are refused), AGENT_POOL_GATE_BUDGET (the cap on any manifest's budget).
+credential directory are refused), AGENT_POOL_GATE_BUDGET (the cap on any manifest's budget),
+AGENT_POOL_GATE_CACHE_PAUSE_SECS (how long a gate cache fault pauses its repo; default 3600).
 `--cache-root` follows the same rules, except that it may live under
 `$AGENT_POOL_STATE/gate-cache` (default ~/.local/state/agent-pool/gate-cache): only a single
 dep's staging dir or a per-run copy is ever bound, never the root or a parent.
@@ -788,9 +799,9 @@ def _swap_cache(depdir: Path, staging: str) -> None:
             _rmtree(old)
 
 
-def _warm_dep(dep: dict, a: argparse.Namespace, root: Path, defaults: dict, deadline: float) -> dict:
+def _warm_dep(dep: dict, a: argparse.Namespace, root: Path, defaults: dict, deadline: float, blob: str) -> dict:
+    """BLOB is the dep's lockfile blob at BASE_SHA, empty when there is none."""
     name, lockfile = dep["name"], dep["lockfile"]
-    blob = _blob_sha(a.main, a.base_sha, lockfile)
     if not blob:
         raise SandboxError(f"its lockfile {lockfile} does not exist at {a.base_sha}")
     depdir = dep_dir(root, a.repo, name)
@@ -844,7 +855,8 @@ def cmd_warm(a: argparse.Namespace) -> int:
             record: dict[str, Any] = {"name": dep["name"], "lockfile": dep["lockfile"], "status": "failed",
                                       "blob": "", "base_sha": "", "reason": ""}
             try:
-                record.update(_warm_dep(dep, a, root, defaults, deadline))
+                record["blob"] = _blob_sha(a.main, a.base_sha, dep["lockfile"])
+                record.update(_warm_dep(dep, a, root, defaults, deadline, record["blob"]))
             except (SandboxError, OSError) as error:
                 record.update(status="failed", reason=f"warming dependency cache {dep['name']}: {error}")
                 if out["result"] == "pass":
@@ -1022,6 +1034,74 @@ def cmd_receipt(a: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- gate cache faults
+def cache_pause_secs() -> int:
+    return int(os.environ.get("AGENT_POOL_GATE_CACHE_PAUSE_SECS", 3600))
+
+
+def cache_fault_path(state: str | Path, repo: str) -> Path:
+    owner, _, name = repo.partition("/")
+    return Path(state) / "faults" / "gates-cache" / f"{poolstate.slug(owner)}__{poolstate.slug(name)}.json"
+
+
+def cache_pause(state: str | Path, repo: str, now: float) -> dict | None:
+    """The repo's gate cache fault while it has not expired, else None. Only this repo's resolve
+    jobs wait on it; an unreadable fault expires from its mtime, so it never pauses forever."""
+    path = cache_fault_path(state, repo)
+    doc = poolstate.load(path)
+    if doc is None:
+        return None
+    if not isinstance(doc, dict) or doc.get("_unreadable"):
+        doc = {"repo": repo, "reason": f"{path.name} is unreadable"}
+    expires = doc.get("expires_at")
+    if not isinstance(expires, (int, float)) or isinstance(expires, bool):
+        try:
+            expires = path.stat().st_mtime + cache_pause_secs()
+        except OSError:
+            return None
+        doc["expires_at"] = expires
+    return doc if expires > now else None
+
+
+def cmd_cache_fault(a: argparse.Namespace) -> int:
+    warm = _json_doc(a.warm)
+    path = cache_fault_path(a.state, a.repo)
+    with poolstate.locked(path):
+        old = poolstate.load(path)
+        count = old.get("count") if isinstance(old, dict) else 0
+        now = poolstate.now()
+        doc = {"repo": a.repo, "reason": a.reason or warm.get("reason") or "the dependency warm failed",
+               "base_sha": a.base_sha, "deps": [d for d in receipt_deps(warm) if d["status"] == "failed"],
+               "count": (count if isinstance(count, int) else 0) + 1, "at": now, "expires_at": now + cache_pause_secs()}
+        poolstate.save(path, doc)
+    print(path)
+    return 0
+
+
+def cmd_cache_pause(a: argparse.Namespace) -> int:
+    doc = cache_pause(a.state, a.repo, poolstate.now())
+    if doc is None:
+        print("clear")
+        return 0
+    until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(doc["expires_at"]))
+    reason = str(doc.get("reason") or "the dependency warm failed").replace("\t", " ").replace("\n", " ")
+    print(f"paused\t{reason} (until {until}; delete {cache_fault_path(a.state, a.repo)} to retry sooner)")
+    return 0
+
+
+def cmd_cache_clear(a: argparse.Namespace) -> int:
+    path = cache_fault_path(a.state, a.repo)
+    if not path.exists():
+        return 0
+    with poolstate.locked(path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return 0
+    print(path)
+    return 0
+
+
 def cmd_check_receipt(a: argparse.Namespace) -> int:
     path, _ = receipt_paths(a.state, a.repo, a.pr, a.attempt, a.head)
     doc = poolstate.load(path)
@@ -1081,7 +1161,8 @@ def cmd_annotate(a: argparse.Namespace) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("action", choices=["validate", "load", "select", "protected", "changes", "docs-only", "warm",
-                                      "run", "receipt", "check-receipt", "annotate"])
+                                      "run", "receipt", "check-receipt", "annotate", "cache-fault", "cache-pause",
+                                      "cache-clear"])
     for flag in ("--file", "--main", "--base-sha", "--repo", "--manifest", "--changed", "--raw", "--changed-out",
                  "--gitlinks-out", "--gate-dir", "--select", "--runs", "--tag", "--lock", "--cache-root", "--state",
                  "--pr", "--attempt", "--provider", "--pr-head", "--head", "--source", "--blob", "--result", "--run",
@@ -1098,7 +1179,8 @@ def main() -> int:
                 "run": ["manifest", "gate_dir", "select", "runs", "tag", "budget"],
                 "receipt": ["state", "repo", "pr", "attempt", "provider", "base_sha", "pr_head", "head", "result"],
                 "check-receipt": ["state", "repo", "pr", "attempt", "head"],
-                "annotate": ["report", "receipt", "out"]}
+                "annotate": ["report", "receipt", "out"], "cache-fault": ["state", "repo", "base_sha"],
+                "cache-pause": ["state", "repo"], "cache-clear": ["state", "repo"]}
     for name in required[a.action]:
         if getattr(a, name) in (None, ""):
             p.error(f"--{name.replace('_', '-')} is required for {a.action}")

@@ -374,8 +374,27 @@ Step 2 is the `prod-common.sh` wiring, in `run_gates`:
   `[[deps]]` ignores them and is never warmed.
 - A warm whose `result` isn't `pass` is infra. So is a warm that exits non-zero or leaves no
   readable JSON. In each case `run` isn't called, and the receipt records `result: infra` with
-  the warm's reason. `publish` returns `gateinfra:<reason>`, which is a `setup_fault gates` and a
-  requeue. It's never `GATE_TERMINAL`, and the provider gets no cooldown or fault.
+  the warm's reason.
+- **A failed warm pauses only its repo.** It is not a `setup_fault gates` and writes no
+  `faults/gates.json`.
+  - `run_gates` calls `gates.py cache-fault`, which writes
+    `$STATE/faults/gates-cache/<owner>__<name>.json`. That file holds `repo`, `reason`,
+    `base_sha`, the failed `deps` (`name`, `lockfile`, `blob`), `count`, `at` and `expires_at`.
+    `at` and `expires_at` are epoch seconds, and `expires_at` is `at` plus
+    `AGENT_POOL_GATE_CACHE_PAUSE_SECS` (default 3600).
+  - `publish` then returns `cacheinfra:<reason>`. `attempt()` maps that to a requeue: the label
+    goes back to `agent:ready`. It's never `GATE_TERMINAL`, the provider gets no cooldown or
+    fault, and the tick still exits 2.
+  - `job_providers resolve` asks `gates.py cache-pause` for the tick's own repo. While the fault
+    hasn't expired, that repo's resolve jobs aren't claimed. Every other repo, and review jobs
+    everywhere, carry on. If the check itself fails, the repo reads as paused.
+  - An unreadable fault file expires from its mtime.
+  - The pause ends when `expires_at` passes (the next resolve warms again), when a warm for the
+    repo passes (`gates.py cache-clear` deletes the file), or when a person deletes the file.
+  - `capabilities.py check-queue --repo O/R` reports `gates-paused` for that repo's gated jobs
+    under the same rule.
+  - Every other gate infra fault (sandbox, manifest, checkout, config checksum, receipt) is
+    still a global `setup_fault gates` through `faults/gates.json`.
 - The receipt carries `deps`: `[{name, lockfile, status, blob, base_sha}]` from the warm's
   output. It's an empty list when nothing was warmed, and `check-receipt` doesn't read it.
   Receipts written before this have no `deps` key and are still accepted. The posted gate
@@ -476,7 +495,8 @@ is the local receipt.
 | **gate-fail** | child started and exited non-zero (not 124/137/126/127) | no | `needs-human` (`fail`) | none, and strikes are **not** cleared | no | failing gate, rc, last 60 lines |
 | **gate-timeout** | `timeout` fired (124, or 137 after `-k`), or the budget ran out | no | `needs-human` (`fail`) | none | no | "timed out after Ns; if the gate is just slow, raise its timeout in the manifest" |
 | **gate-resource** | `memory.events` `oom_kill > 0`, or `TasksMax` hit | no | `needs-human` (`fail`) | none | no | which limit, last lines |
-| **infra** | bwrap/systemd-run missing or failing, no `child-pid` on the status fd, child rc 126/127, manifest unreadable or invalid at `BASE_SHA`, cache warm failure, checkout failure, `MAIN` config checksum mismatch, disk full | no | `ready` (requeue) | **none** for the provider | **yes**, `setup_fault gates "<why>"`, so the tick exits 2 | none (requeue posts nothing) |
+| **infra** | bwrap/systemd-run missing or failing, no `child-pid` on the status fd, child rc 126/127, manifest unreadable or invalid at `BASE_SHA`, checkout failure, `MAIN` config checksum mismatch, disk full | no | `ready` (requeue) | **none** for the provider | **yes**, `setup_fault gates "<why>"`, so the tick exits 2 | none (requeue posts nothing) |
+| **cache infra** | a `[[deps]]` warm failed, crashed or left no result (§2.5) | no | `ready` (requeue) | **none** for the provider | no global fault: `faults/gates-cache/<owner>__<name>.json` pauses that repo's resolves until it expires or a warm passes; the tick exits 2 | none |
 | **lost** | `still_held` false after gates | no | untouched | none | no | none |
 
 Notes on the rules:
