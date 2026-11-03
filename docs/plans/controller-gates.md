@@ -132,6 +132,7 @@ A manifest that fails validation is an **infra** fault (§3), not a gate failure
 | `load --main M --base-sha S --repo O/R` | Prints the validated manifest as JSON plus its blob SHA and source (base or override). |
 | `select --manifest J --changed FILE` | Prints the gates whose `paths` match the worker's changed files. Prints `none` for a docs-only change. |
 | `protected --manifest J --changed FILE` | Prints the changed paths that are protected (built-ins plus `protect`). |
+| `warm ...` | Warms each `[[deps]]` cache from the `BASE_SHA` tree, with network (§2.5). |
 | `run ...` | The sandbox runner (§2). |
 
 ### Detecting and rejecting a worker's change to the manifest
@@ -327,6 +328,37 @@ Dependencies come from a controller-owned cache at `$STATE/gate-cache/<repo-slug
 Scoping the network to "the npm registry only" would need a filtering proxy. This plan avoids
 needing one: worker-influenced code gets no network, and base code gets plain network but no
 credentials.
+
+**Built (step 1, #60), in `gates.py` only.** It differs from the sketch above in these ways:
+
+- The cache is per dep: `<cache-root>/<repo-slug>/<dep>/` holds `cache` (a symlink to a
+  `cache-*` dir), `warmed.json` (`lockfile`, `blob`, `base_sha`, `dep_hash`, `warmed_at`) and
+  the last warm's log.
+- `gates.py warm --manifest J --main M --base-sha S --cache-root DIR --repo O/R [--budget N]`
+  re-warms a dep when its lockfile blob at `BASE_SHA` or its warm definition (`name`, `cwd`,
+  `lockfile`, `warm`) differs from `warmed.json`.
+  - The tree is exported with the §2.1 plumbing.
+  - `warm` runs through the same sandbox builder as the gates, plus `--share-net` and the
+    resolver files under `/etc`, writing into a fresh staging dir at `/cache`.
+  - The `cache` symlink is swapped to the new dir only on success. A failed warm keeps the
+    old cache and is infra.
+- `gates.py run` takes `--cache-root DIR --repo O/R`, and a manifest with `[[deps]]` needs both,
+  plus a `warmed.json` for every dep. Otherwise the run is infra.
+  - The run makes a scratch copy of every dep's cache, merged, under the runs dir. The copy is
+    read-write because composer disables a read-only cache. It's deleted after the run, and the
+    warmed cache itself is never bound.
+  - Each `install` runs first, offline, and counts against the budget. An install failure is
+    `gate-fail`, and no gate runs.
+  - The gates then see the same copy at `/cache`.
+- Warm, install and the gates all get `COMPOSER_CACHE_DIR`, `COMPOSER_HOME`,
+  `npm_config_cache` and `NUGET_PACKAGES` under `/cache`. Install and the gates also get
+  `COMPOSER_DISABLE_NETWORK=1`.
+- The cache root follows the `AGENT_POOL_GATE_RO_BINDS` rules, with one exception: it may sit
+  under `$AGENT_POOL_STATE/gate-cache`.
+
+Step 2 is the `prod-common.sh` wiring: calling `warm` before `run_gates` and passing
+`--cache-root`/`--repo` to `run`. Until step 2 lands, `run_gates` reports a manifest with
+`[[deps]]` as infra, because `run` is called without a cache root.
 
 ### 2.6 Output capture
 
