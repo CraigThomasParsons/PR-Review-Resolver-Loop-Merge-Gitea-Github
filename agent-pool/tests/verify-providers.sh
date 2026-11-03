@@ -232,6 +232,9 @@ case "$behave" in
   resolve-noted)    resolve_text 0 1 0 > "$report"; success ;;
   resolve-deferred) resolve_text 0 0 1 > "$report"; success ;;
   resolve-fix)      commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-fix-denied)
+    commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"done","permission_denials":[{"tool_name":"Bash"}]}' ;;
   resolve-repoint)
     # Commit, then point the worktree's .git at a gitdir of the worker's choosing.
     commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"
@@ -725,6 +728,15 @@ tick
 expect "a base with no manifest: a code fix is never pushed" "$(origin_head)" "$SHA"
 expect "it goes to needs-human" "$(labels)" "agent:needs-human"
 expect "saying there is no manifest" "$(comments)" "has no gate manifest"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER" feature/x bare
+behave claude resolve-fix-denied
+tick
+expect "#58: no manifest plus a denied tool call: still never pushed" "$(origin_head)" "$SHA"
+expect "#58: it goes to needs-human" "$(labels)" "agent:needs-human"
+expect_not "#58: not back to agent:ready" "$(labels)" "agent:ready"
+expect "#58: saying there is no manifest" "$(comments)" "has no gate manifest"
+expect "#58: the denial is still recorded as a setup fault" "$(cat "$TMP/state/faults/claude.json" 2>/dev/null)" "rejected the candidate anyway"
+expect "#58: and logged" "$(cat "$TMP/out.txt")" "SETUP FAULT [claude]"
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER" feature/x bare
 behave claude resolve-docs
 tick

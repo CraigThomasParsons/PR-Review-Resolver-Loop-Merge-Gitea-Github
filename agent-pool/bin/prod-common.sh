@@ -712,11 +712,12 @@ print(d.get("source") or "none", d.get("blob") or "-")' "$5")
 
 # run_gates provider sha newhead base -> 0 with GATE_RECEIPT naming a passing receipt, else 1
 # with PUB set: fail:<why> (a red gate, protected paths, no manifest), gateinfra:<why> or lost.
+# GATE_TERMINAL=1 when no provider retry could change the outcome (protected paths, no manifest).
 # The worker's process group is already dead; nothing here reads the worker's worktree.
 run_gates() {
   local p="$1" sha="$2" newhead="$3" base="$4" tag base_sha manifest raw hits names budget left run res why
   tag="$JOB_PR-${ATTEMPT:0:8}"; manifest="$RUNS/gates-manifest-$tag.json"; raw="$RUNS/gates-diff-$tag"
-  run="$RUNS/gates-run-$tag.json"; GATE_RECEIPT=""
+  run="$RUNS/gates-run-$tag.json"; GATE_RECEIPT=""; GATE_TERMINAL=0
   gate_config_intact || { PUB="gateinfra:the main clone's git config changed during the job; refusing to gate or push"; return 1; }
   [ "$(gate_git rev-parse --verify -q "$newhead^{commit}")" = "$newhead" ] \
     || { PUB="gateinfra:the candidate $newhead is not a commit in the main clone"; return 1; }
@@ -737,7 +738,7 @@ run_gates() {
   if [ "$hits" != none ]; then
     why="the worker's edits change gate-defining files ($(printf '%s\n' "$hits" | head -5 | tr '\n' ' ' | sed 's/ $//')); a human must review them"
     gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" protected "$why"
-    PUB="fail:$why"; return 1
+    GATE_TERMINAL=1; PUB="fail:$why"; return 1
   fi
   if [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source"))' "$manifest" 2>/dev/null)" = none ]; then
     if python3 "$SCRIPTS/gates.py" docs-only --changed "$raw.changed"; then
@@ -747,7 +748,7 @@ run_gates() {
     fi
     why="$REPO has no gate manifest (.agent-pool/gates.toml on $base or a controller override), so the worker's code changes cannot be gated"
     gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" no-manifest "$why"
-    PUB="fail:$why"; return 1
+    GATE_TERMINAL=1; PUB="fail:$why"; return 1
   fi
   names="$(python3 "$SCRIPTS/gates.py" select --manifest "$manifest" --changed "$raw.changed")" \
     || { PUB="gateinfra:could not select the gates for the worker's changes"; return 1; }
@@ -981,7 +982,7 @@ render_prompt() { # provider sha headref base report -> prompt file path
 # Runs in the calling shell: it sets JOB_WT and may record setup faults.
 attempt() {
   local p="$1" sha="$2" headref="$3" base="$4" tag prompt report result out err rc t0 elapsed cls session v
-  VERDICT=""; DETAIL=""; CURRENT_PROVIDER="$p"
+  VERDICT=""; DETAIL=""; GATE_TERMINAL=0; CURRENT_PROVIDER="$p"
   prepare_worktree "$sha" "$headref" || { VERDICT=setup; DETAIL="could not prepare a worktree at $sha"; return; }
   tag="$JOB_PR-${ATTEMPT:0:8}-$p"
   report="$RUNS/report-$tag.md"; result="$RUNS/result-$tag.txt"; rm -f "$report" "$result"
@@ -1030,6 +1031,11 @@ attempt() {
       if [ "$JOB_KIND" = review ] && [ "$v" = ok ]; then VERDICT=findings; else VERDICT=done; fi
       DETAIL="$p verified"; return ;;
   esac
+  # The controller's own gate refused the candidate: no provider retry can change that.
+  if [ "$GATE_TERMINAL" = 1 ]; then
+    case "$cls" in setup*) setup_fault "$p" "${cls#*$'\t'} (the controller's gate check rejected the candidate anyway)" ;; esac
+    VERDICT=fail; DETAIL="${v#*:} ($p, ${elapsed}s)"; return
+  fi
   case "$cls" in
     setup*)   VERDICT=setup; DETAIL="${cls#*$'\t'}"; return ;;
     limit*)   VERDICT=limit; DETAIL="${cls#*$'\t'}"; return ;;
