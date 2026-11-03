@@ -3,8 +3,8 @@
 Status: partly built (issue #14). Built: Section 1 (`gates.py` load/validate/select/protected);
 Sections 2.1 to 2.4 and 2.6's log capture (`gate_git`, the by-SHA checkout, `gates.py run`); the
 receipt, the comment section and the verdict mapping from Section 3, with the push refused unless
-this attempt's receipt passed at the exact head. Not built yet: the `[[deps]]` cache (2.5; a
-manifest declaring deps is refused as infra), posting sanitized log tails (`report.py
+this attempt's receipt passed at the exact head; the `[[deps]]` cache (2.5, issue #60). Not built
+yet: posting sanitized log tails (`report.py
 sanitize`), the re-run at the PR head for a pre-existing red gate, the `verify()`/`derive_job()`
 receipt check (step 5), the deadline startup check (Q2 is open; gates stop 60s before the claim
 deadline instead), and Sections 4 and 5. Written 2026-10-17 against `feature/agent-pool-core` at
@@ -329,7 +329,7 @@ Scoping the network to "the npm registry only" would need a filtering proxy. Thi
 needing one: worker-influenced code gets no network, and base code gets plain network but no
 credentials.
 
-**Built (step 1, #60), in `gates.py` only.** It differs from the sketch above in these ways:
+**Built (steps 1-2, #60).** It differs from the sketch above in these ways:
 
 - The cache is per dep: `<cache-root>/<repo-slug>/<dep>/` holds `cache` (a symlink to a
   `cache-*` dir), `warmed.json` (`lockfile`, `blob`, `base_sha`, `dep_hash`, `warmed_at`) and
@@ -356,9 +356,32 @@ credentials.
 - The cache root follows the `AGENT_POOL_GATE_RO_BINDS` rules, with one exception: it may sit
   under `$AGENT_POOL_STATE/gate-cache`.
 
-Step 2 is the `prod-common.sh` wiring: calling `warm` before `run_gates` and passing
-`--cache-root`/`--repo` to `run`. Until step 2 lands, `run_gates` reports a manifest with
-`[[deps]]` as infra, because `run` is called without a cache root.
+- `warm` reports, per dep, its `name`, `lockfile`, `status` (`fresh`, `warmed` or `failed`),
+  `blob` and `base_sha` (the commit its cache was warmed from, which for `fresh` can be an
+  earlier base commit with the same lockfile blob).
+
+Step 2 is the `prod-common.sh` wiring, in `run_gates`:
+
+- When the manifest actually used (base blob or override) declares `[[deps]]` and a gate is
+  selected, `run_gates` calls `gates.py warm --manifest … --main $MAIN --base-sha BASE_SHA
+  --cache-root $STATE/gate-cache --repo OWNER/NAME --budget N` before `run`.
+  - It runs in its own process group and is watched like the gate run, so a superseded claim
+    kills it. If the claim is lost, the result is `lost`.
+  - N is worked out the same way as `run`'s: `AGENT_POOL_GATE_BUDGET`, stopping 60s before the
+    claim deadline. `run`'s budget is worked out again after the warm, so warm time comes out of
+    the claim, not out of `AGENT_POOL_GATE_BUDGET`.
+- `run` always gets `--cache-root $STATE/gate-cache --repo OWNER/NAME`. A manifest without
+  `[[deps]]` ignores them and is never warmed.
+- A warm whose `result` isn't `pass` is infra. So is a warm that exits non-zero or leaves no
+  readable JSON. In each case `run` isn't called, and the receipt records `result: infra` with
+  the warm's reason. `publish` returns `gateinfra:<reason>`, which is a `setup_fault gates` and a
+  requeue. It's never `GATE_TERMINAL`, and the provider gets no cooldown or fault.
+- The receipt carries `deps`: `[{name, lockfile, status, blob, base_sha}]` from the warm's
+  output. It's an empty list when nothing was warmed, and `check-receipt` doesn't read it.
+  Receipts written before this have no `deps` key and are still accepted. The posted gate
+  section names each dep's lockfile blob.
+- Clearing a cache means deleting its dep dir, `$STATE/gate-cache/<repo-slug>/<dep>/`. The next
+  gated resolve that needs it warms it again.
 
 ### 2.6 Output capture
 
@@ -391,7 +414,9 @@ an existing one:
  "base_sha": "...", "pr_head": "<sha>", "head": "<newhead>",
  "manifest": {"source": "base|override", "blob": "<sha>"},
  "result": "pass|none-needed|gate-fail|gate-timeout|gate-resource|protected|infra",
- "gates": [{"name": "client", "argv": [...], "rc": 0, "secs": 212, "log": "gate-...log"}]}
+ "gates": [{"name": "client", "argv": [...], "rc": 0, "secs": 212, "log": "gate-...log"}],
+ "deps": [{"name": "client-npm", "lockfile": "clientv2/package-lock.json", "status": "fresh",
+           "blob": "<sha>", "base_sha": "<sha>"}]}
 ```
 
 It also writes a copy indexed by head at `gates/by-head/<slug>__<pr>__<newhead>.json`, which

@@ -121,6 +121,44 @@ It does not run review workers. Where the host event trigger is also installed,
 its resulting `labeled` event joins the same deduplicated PR queue. Use the host
 path when custom host label policy is required.
 
+## Agent pool gates and the dependency cache
+
+Resolve workers run no tests. After a worker exits, the agent-pool controller runs the repo's
+gates in a sandbox with no network, no home directory and no credentials, and pushes only if
+they pass. The gates come from `.agent-pool/gates.toml` on the PR's base branch, or from a
+controller-owned override at `~/.config/agent-pool/gates/<owner>__<name>.toml`. A worker edit to
+the manifest, or to a lockfile it names, sends the PR to a human. See `agent-pool/config/gates.example.toml` for a manifest
+and `docs/plans/controller-gates.md` for the design.
+
+Dependencies are declared as `[[deps]]` and installed offline inside the gate sandbox:
+
+```toml
+[[deps]]
+name     = "client-npm"
+cwd      = "clientv2"
+lockfile = "clientv2/package-lock.json"
+warm     = ["npm", "ci", "--ignore-scripts"]   # controller, base tree, network on
+install  = ["npm", "ci", "--offline"]          # sandbox, worker's tree, network off
+```
+
+- **Where the cache lives.** It's at `$AGENT_POOL_STATE/gate-cache/<owner>_<name>/<dep>/`
+  (default `~/.local/state/agent-pool/gate-cache/`). Each dep dir holds `cache` (a symlink to
+  the current `cache-*` dir), `warmed.json` (the lockfile blob and base commit it was warmed
+  from) and the last warm's log.
+- **Warming uses the network, as the controller, with no credentials.** Before a gated resolve,
+  the controller re-warms a dep whose lockfile blob on the base branch, or whose `[[deps]]`
+  entry, has changed. It runs `warm` against an export of the base commit, in the same sandbox
+  as the gates but with network. That is base-branch code: no worker edit, no environment, no
+  ssh agent and no tokens. A failed warm keeps the previous cache. It counts as a gate setup
+  fault: the job is requeued, and resolve jobs pause until a person fixes the cause and deletes
+  `$AGENT_POOL_STATE/faults/gates.json`.
+- **Each gate receipt names the warmed lockfile blob(s).** Receipts are under
+  `$AGENT_POOL_STATE/gates/`, and the posted gate section shows them too.
+- **Clearing a cache.** Delete that dep's dir, for example
+  `rm -rf ~/.local/state/agent-pool/gate-cache/owner_repo/client-npm`. The next gated resolve
+  warms it from scratch. Do it between ticks: a tick that is mid-warm or mid-copy holds locks in
+  that dir.
+
 ## Tests
 
 ```sh
@@ -130,6 +168,7 @@ skills/pr-loops-common/tests/verify-trigger.sh
 tests/verify-install.sh
 agent-pool/tests/verify-lease.sh
 agent-pool/tests/verify-providers.sh
+agent-pool/tests/verify-gates.sh
 agent-pool/tests/verify-nightcrew-issue-hold.sh
 agent-pool/tests/verify-doctor.sh
 agent-pool/tests/verify-systemd-units.sh

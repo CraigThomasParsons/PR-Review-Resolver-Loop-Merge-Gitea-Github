@@ -44,7 +44,8 @@ Subcommands:
                                         BASE_SHA tree and run `warm` in the sandbox WITH network
                                         into a fresh cache, swapped in only on success; print
                                         {"result": pass | infra, "reason": ..., "deps": [{name,
-                                        status: fresh | warmed | failed, ...}]}
+                                        lockfile, status: fresh | warmed | failed, blob,
+                                        base_sha (the commit the cache was warmed from), ...}]}
   run --manifest J --gate-dir D --select F --runs R --tag T --budget N [--lock L]
       [--cache-root DIR --repo O/R]    run each gate named in F (manifest order as given) in
                                         the sandbox against the checkout D; logs and per-gate
@@ -57,9 +58,11 @@ Subcommands:
                                         dep's `install` runs first (R/install-T-<dep>.*),
                                         offline, and counts against N
   receipt --state S --repo O/R --pr N --attempt A --provider P --base-sha B --pr-head H
-          --head NEW --source SRC --blob SHA --result RES [--reason W] [--run J]
+          --head NEW --source SRC --blob SHA --result RES [--reason W] [--run J] [--warm J2]
                                         write S/gates/<repo>__<pr>__<attempt>.json once (exit 3
-                                        if it already exists) and the by-head copy
+                                        if it already exists) and the by-head copy; its "deps"
+                                        lists each dep of warm's output J2 (name, lockfile,
+                                        status, blob, base_sha), empty without one
   check-receipt --state S --repo O/R --pr N --attempt A --head NEW
                                         exit 0 only if this attempt's receipt names NEW and
                                         passed (pass or none-needed)
@@ -800,7 +803,7 @@ def _warm_dep(dep: dict, a: argparse.Namespace, root: Path, defaults: dict, dead
         warmed = poolstate.load(depdir / "warmed.json")
         if (isinstance(warmed, dict) and warmed.get("blob") == blob and warmed.get("dep_hash") == want
                 and (depdir / "cache").is_dir()):
-            return {"status": "fresh", "blob": blob}
+            return {"status": "fresh", "blob": blob, "base_sha": warmed.get("base_sha") or ""}
         left = int(deadline - time.monotonic())
         if left < 1:
             raise SandboxError("the warm budget ran out before it started")
@@ -818,7 +821,8 @@ def _warm_dep(dep: dict, a: argparse.Namespace, root: Path, defaults: dict, dead
             staging = ""
             poolstate.save(depdir / "warmed.json", {"lockfile": lockfile, "blob": blob, "base_sha": a.base_sha,
                                                     "dep_hash": want, "warmed_at": poolstate.now()})
-            return {"status": "warmed", "blob": blob, "secs": record["secs"], "log": record["log"]}
+            return {"status": "warmed", "blob": blob, "base_sha": a.base_sha, "secs": record["secs"],
+                    "log": record["log"]}
         finally:
             _rmtree(work)
             if staging:
@@ -838,7 +842,7 @@ def cmd_warm(a: argparse.Namespace) -> int:
         deadline = started + (a.budget if a.budget is not None else defaults["budget"])
         for dep in deps:
             record: dict[str, Any] = {"name": dep["name"], "lockfile": dep["lockfile"], "status": "failed",
-                                      "blob": "", "reason": ""}
+                                      "blob": "", "base_sha": "", "reason": ""}
             try:
                 record.update(_warm_dep(dep, a, root, defaults, deadline))
             except (SandboxError, OSError) as error:
@@ -985,19 +989,30 @@ def _write_once(path: Path, doc: dict) -> bool:
         os.unlink(temporary)
 
 
+def _json_doc(path: str | None) -> dict:
+    """PATH's JSON object; {} when PATH is unset, missing, unreadable or not an object."""
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        doc = json.loads(Path(path).read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def receipt_deps(warm: dict) -> list[dict]:
+    """The lockfile blob each dep's cache was warmed from, as `warm` reported it."""
+    deps = warm.get("deps")
+    return [{key: str(dep.get(key) or "") for key in ("name", "lockfile", "status", "blob", "base_sha")}
+            for dep in (deps if isinstance(deps, list) else []) if isinstance(dep, dict)]
+
+
 def cmd_receipt(a: argparse.Namespace) -> int:
-    run: dict = {}
-    if a.run and os.path.isfile(a.run):
-        try:
-            run = json.loads(Path(a.run).read_text() or "{}")
-        except ValueError:
-            run = {}
-        if not isinstance(run, dict):
-            run = {}
+    run = _json_doc(a.run)
     doc = {"version": 1, "repo": a.repo, "pr": int(a.pr), "attempt_id": a.attempt, "provider": a.provider,
            "base_sha": a.base_sha, "pr_head": a.pr_head, "head": a.head,
            "manifest": {"source": a.source, "blob": a.blob}, "result": a.result, "reason": a.reason,
-           "gates": run.get("gates", []), "created_at": poolstate.now()}
+           "gates": run.get("gates", []), "deps": receipt_deps(_json_doc(a.warm)), "created_at": poolstate.now()}
     attempt_path, head_path = receipt_paths(a.state, a.repo, a.pr, a.attempt, a.head)
     if not _write_once(attempt_path, doc):
         print(f"gates: a receipt for attempt {a.attempt} already exists; it is never rewritten", file=sys.stderr)
@@ -1039,6 +1054,12 @@ def render_section(doc: dict) -> str:
         for gate in doc.get("gates", []):
             lines.append(f"| {_cell(gate['name'])} | `{_cell(shlex.join(gate['argv']))}` | "
                          f"{gate.get('result', '')} | {gate.get('secs', '')} |")
+        deps = doc.get("deps") or []
+        if deps:
+            lines += ["", "Dependencies were installed offline from the controller's cache, warmed from the base "
+                      "branch's lockfiles: " + ", ".join(
+                          f"{_cell(dep.get('name', ''))} (`{_cell(dep.get('lockfile', ''))}` blob "
+                          f"`{dep.get('blob', '')[:12]}`)" for dep in deps) + "."]
     lines += ["", f"<!-- agent-pool-gates:v1 head={head} manifest={blob or 'none'} result={result} -->", "", ""]
     return "\n".join(lines)
 
@@ -1064,7 +1085,7 @@ def main() -> int:
     for flag in ("--file", "--main", "--base-sha", "--repo", "--manifest", "--changed", "--raw", "--changed-out",
                  "--gitlinks-out", "--gate-dir", "--select", "--runs", "--tag", "--lock", "--cache-root", "--state",
                  "--pr", "--attempt", "--provider", "--pr-head", "--head", "--source", "--blob", "--result", "--run",
-                 "--report", "--receipt", "--out"):
+                 "--warm", "--report", "--receipt", "--out"):
         p.add_argument(flag)
     p.add_argument("--gitlinks", default="")
     p.add_argument("--reason", default="")

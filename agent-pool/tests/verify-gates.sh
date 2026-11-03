@@ -391,6 +391,37 @@ expect "annotate adds the gate section" "$body" "### Gates (run by the pool cont
 expect "and the gate marker before the resolve marker" "${body%%pulse-resolve*}" "agent-pool-gates:v1 head=$H1 manifest=abc123 result=pass"
 expect "keeping the resolve marker as the last line" "$(tail -1 "$TMP/report.gated")" "pulse-resolve:v1 head=$H1"
 expect "keeping the worker's text" "$body" "Fixed: 1"
+expect "a receipt with no warm lists no deps" "$(cat "$ST/gates/owner_repo__7__att-a.json")" '"deps": []'
+expect_not "and its gate section names none" "$body" "Dependencies were installed"
+
+H3=3333333333333333333333333333333333333333; H4=4444444444444444444444444444444444444444
+printf '{"result": "pass", "reason": "", "deps": [{"name": "web", "lockfile": "web/package-lock.json", "status": "warmed", "blob": "b10b5ea", "base_sha": "%s", "secs": 3, "log": "warm-latest-web.log"}]}' \
+  "$H2" > "$TMP/warm.json"
+python3 "$GATES" receipt --state "$ST" --repo owner/repo --pr 7 --attempt att-d --provider claude --base-sha "$H2" \
+  --pr-head "$H2" --head "$H3" --source base --blob abc123 --result pass --warm "$TMP/warm.json" >/dev/null
+out="$(cat "$ST/gates/owner_repo__7__att-d.json")"
+expect "#60: a receipt given warm's output lists each dep" "$out" '"name": "web"'
+expect "with its lockfile" "$out" '"lockfile": "web/package-lock.json"'
+expect "the lockfile blob its cache was warmed from" "$out" '"blob": "b10b5ea"'
+expect "and the commit it was warmed at" "$out" "\"base_sha\": \"$H2\""
+expect_not "but none of warm's log details" "$out" "warm-latest-web.log"
+check att-d "$H3" >/dev/null
+expect "check-receipt passes it like any other" "$?" "0"
+python3 "$GATES" annotate --report "$TMP/report.md" --receipt "$ST/gates/owner_repo__7__att-d.json" --out "$TMP/report.deps"
+expect "annotate names the dep's lockfile blob" "$(cat "$TMP/report.deps")" "web (\`web/package-lock.json\` blob \`b10b5ea\`)"
+echo 'not json' > "$TMP/warm-bad.json"
+python3 "$GATES" receipt --state "$ST" --repo owner/repo --pr 7 --attempt att-e --provider claude --base-sha "$H2" \
+  --pr-head "$H2" --head "$H4" --source base --blob abc123 --result infra --warm "$TMP/warm-bad.json" >/dev/null
+expect "an unreadable warm output still writes the receipt, with no deps" "$(cat "$ST/gates/owner_repo__7__att-e.json" 2>/dev/null)" '"deps": []'
+# A receipt written before [[deps]] existed has no "deps" key at all.
+python3 -c 'import json, sys
+json.dump({"version": 1, "repo": "owner/repo", "pr": 7, "attempt_id": "att-old", "provider": "claude", "base_sha": sys.argv[2],
+           "pr_head": sys.argv[2], "head": sys.argv[2], "manifest": {"source": "base", "blob": "abc123"}, "result": "pass",
+           "reason": "", "gates": [], "created_at": ""}, open(sys.argv[1], "w"))' "$ST/gates/owner_repo__7__att-old.json" "$H4"
+check att-old "$H4" >/dev/null
+expect "check-receipt still accepts a receipt with no deps key" "$?" "0"
+python3 "$GATES" annotate --report "$TMP/report.md" --receipt "$ST/gates/owner_repo__7__att-old.json" --out "$TMP/report.old"
+expect "and annotate still renders it" "$(cat "$TMP/report.old")" "agent-pool-gates:v1 head=$H4 manifest=abc123 result=pass"
 
 # ---------------------------------------------------------------- run: refusals before any sandbox
 echo "run fails closed (infra) before running anything"
@@ -529,6 +560,8 @@ deps_manifest warm install
 out="$(warm)"
 expect "the first warm passes" "$out" '"result": "pass"'
 expect "and warms the dep" "$out" '"status": "warmed"'
+expect "reporting the lockfile blob it warmed from" "$out" "\"blob\": \"$DBLOB1\""
+expect "and the base SHA it warmed at" "$out" "\"base_sha\": \"$DBASE\""
 expect "running warm once, in the BASE_SHA tree" "$(cat "$TMP/npm-calls")" "warm lock-v1"
 expect "into the swapped-in cache" "$(cat "$DWEB/cache/npm/pkg" 2>/dev/null)" "lock-v1"
 expect "recording the lockfile blob" "$(cat "$DWEB/warmed.json")" "\"blob\": \"$DBLOB1\""
@@ -544,6 +577,7 @@ expect "the export dir is gone afterwards" "$(ls -d "$DWEB"/work-* 2>/dev/null |
 
 out="$(warm)"
 expect "a second warm at the same lockfile blob is fresh" "$out" '"status": "fresh"'
+expect "still reporting the base SHA its cache was warmed from" "$out" "\"base_sha\": \"$DBASE\""
 expect "and runs nothing" "$(calls)" "1"
 
 echo lock-v2 > "$DREPO/web/package-lock.json"
