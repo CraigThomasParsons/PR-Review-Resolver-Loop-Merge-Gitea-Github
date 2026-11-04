@@ -362,7 +362,7 @@ fi
 # ---------------------------------------------------------------- workers
 # W_SESS is every live worker's name (a tmux session for claude); W_PROV says which provider it is.
 # Assigned empty, not just declared: under set -u, ${#W_SESS[@]} of a declared-only array is unbound.
-declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=()
+declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=() W_VENDOR=()
 spawned=0
 
 # Mark a worktree path trusted in ~/.claude.json so Claude Code skips the
@@ -481,7 +481,9 @@ install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) an
   # The PR's composer.json is untrusted until a human has looked at it: its scripts and plugins
   # would run arbitrary code here, on the review host, before any worker or deny list exists.
   [ "${PR_LOOP_COMPOSER_ALLOW_SCRIPTS:-0}" = 1 ] || args+=(--no-scripts --no-plugins)
-  COMPOSER_WHY=""; COMPOSER_EXCERPT=""
+  # COMPOSER_DONE: each dir an install was started in, worktree-relative, one per line. finish()
+  # discards their vendor/ trees but keeps a worktree with any other dirt.
+  COMPOSER_WHY=""; COMPOSER_EXCERPT=""; COMPOSER_DONE=""
   case "${PR_LOOP_COMPOSER_INSTALL:-1}" in 0|off|no|false) return 0 ;; esac
   if [ -n "${PR_LOOP_COMPOSER_DIRS:-}" ]; then
     # read -a rather than an unquoted expansion: a listed dir must never glob.
@@ -510,6 +512,7 @@ install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) an
   for dir in "${dirs[@]}"; do
     rel="${dir#"$wt"}"; rel="${rel#/}"; rel="${rel:-.}"
     log "$(basename -- "$wt"): composer install in $rel"
+    COMPOSER_DONE+="$rel"$'\n'
     # Bounded: a hung install (a dead mirror, a stuck network) would otherwise hold this MODE's lock
     # and stall every later tick.
     out="$(timeout "$secs" "$bin" "${args[@]}" --working-dir="$dir" </dev/null 2>&1)"; rc=$?
@@ -556,10 +559,11 @@ spawn() { # row
     # No worker exists yet: W_PROV names composer so finish() has no session or process to stop,
     # and its comment says "composer said:" above the excerpt.
     log "#$pr: $COMPOSER_WHY; not starting a worker"
-    W_PROV[$pr]=composer
+    W_PROV[$pr]=composer; W_VENDOR[$pr]="$COMPOSER_DONE"
     finish "$pr" fail "$COMPOSER_WHY" "$COMPOSER_EXCERPT"
     return 1
   fi
+  W_VENDOR[$pr]="$COMPOSER_DONE"
   if [ "$use" = agy ]; then
     log "#$pr: Claude is limited until $LIMIT_UNTIL; reviewing with agy"
     start_agy "$pr"; return 0
@@ -625,11 +629,29 @@ finish() { # pr outcome reason [provider output]
     requeue) relabel "$pr" "$CLAIM" "$TRIGGER"; comment "$pr" "Automated $MODE loop paused on this PR: $reason. It is back at $TRIGGER for a later tick.$said" ;;
   esac
   rm -f "$wt/$CONTEXT_FILE"
-  if git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1; then :; else log "#$pr: worktree $wt kept (uncommitted changes or busy); inspect and remove by hand"; fi
+  # --force only once nothing but the loop's own composer installs is dirty: vendor/ under a dir
+  # install_composer_deps handled may go, but anything else (a resolve worker's uncommitted edits,
+  # a stray new file) keeps the worktree for a human. A status that cannot be read keeps it too.
+  local vendor="${W_VENDOR[$1]:-}" status line d foreign=""
+  if status="$(git -C "$wt" status --porcelain --untracked-files=all --ignored=no 2>/dev/null)"; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      foreign="$line"
+      while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if [ "$d" = . ]; then d=""; else d="$d/"; fi
+        case "${line:3}" in "${d}vendor/"*) foreign=""; break ;; esac
+      done <<<"$vendor"
+      [ -n "$foreign" ] && break
+    done <<<"$status"
+  else
+    foreign="git status failed"
+  fi
+  if [ -z "$foreign" ] && git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1; then :; else log "#$pr: worktree $wt kept (uncommitted changes or busy); inspect and remove by hand"; fi
   rm -f "$STATE/classify-$sess.state" "$STATE/launch-$MODE-$pr.sh" "$STATE/agy-$MODE-$pr.rc" "$STATE/agy-$MODE-$pr.prompt" "$STATE/agy-$MODE-$pr.report"
   log "#$pr: $outcome ($reason)"
   [ -n "$detail" ] && printf '%s\n' "$detail" | sed 's/^/    | /' | tee -a "$LOG" >&2
-  unset "W_SESS[$pr]" "W_WT[$pr]" "W_SHA[$pr]" "W_HEADREF[$pr]" "W_BASE[$pr]" "W_PROV[$pr]" "W_PID[$pr]" "W_START[$pr]" "W_STALLS[$pr]" "W_BLOCKS[$pr]"
+  unset "W_SESS[$pr]" "W_WT[$pr]" "W_SHA[$pr]" "W_HEADREF[$pr]" "W_BASE[$pr]" "W_PROV[$pr]" "W_PID[$pr]" "W_START[$pr]" "W_STALLS[$pr]" "W_BLOCKS[$pr]" "W_VENDOR[$pr]"
 }
 
 # A Claude worker hit a usage limit: kill it now (it would sit on the limit menu until

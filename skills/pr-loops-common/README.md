@@ -78,8 +78,10 @@ binary is not on PATH, or when an entry in `PR_LOOP_COMPOSER_DIRS` is absolute, 
 has no lock. Installing stops at the first failure. The loop then logs the reason, moves the PR from its claim label to
 `review:needs-human` with a comment giving the reason (for example
 `composer install failed in apps/game (exit 2)`) and an excerpt of composer's output, and removes
-the worktree. Worktrees are removed with `--force` whatever the outcome, since an installed
-`vendor/` that the repo does not ignore would otherwise keep every one of them. No worker is started, and the PR's slot goes to the next one in the queue. Dry runs
+the worktree. At the end of any run, a worktree whose only uncommitted files are under the
+`vendor/` of a directory the loop installed in is removed with `--force`, so a `vendor/` the repo
+does not ignore does not keep it. Any other dirt (a resolve worker's uncommitted edits, a new
+file) keeps the worktree and names it in the log, as before. No worker is started, and the PR's slot goes to the next one in the queue. Dry runs
 never create a worktree, so they never install.
 
 TODO: resolve has no fallback provider. Agy has no tool deny list, so the agent pool never lets it

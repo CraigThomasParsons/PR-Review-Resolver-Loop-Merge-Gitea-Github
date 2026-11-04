@@ -188,37 +188,62 @@ expect "  ... saying composer is missing and where it was needed" eval \
   'has "$WHY" "$TMP/nowhere/composer is not on PATH" && has "$WHY" "apps/game/composer.lock"'
 
 # ================================================================ finish() and an installed vendor/
-# The real finish() against a real git repo, before the whole-tick stubs put a fake git on PATH:
-# a worktree holding an untracked vendor/ (what an install leaves when the repo does not ignore
-# it) must still be removed.
+# The real finish() against a real git repo, before the whole-tick stubs put a fake git on PATH.
+# A worktree whose only dirt is vendor/ under a dir the loop installed in (what an install leaves
+# when the repo does not ignore vendor/) is removed; any other dirt keeps it, so a resolve
+# worker's uncommitted edits survive for a human.
 echo
 echo "finish"
-REPO_DIR="$TMP/repo"; FWT="$TMP/fwt"
+REPO_DIR="$TMP/repo"
 if ! command -v git >/dev/null 2>&1; then
-  no "finish removes a worktree with an untracked vendor/" "git is not on PATH, so this case cannot run"
+  no "finish cases" "git is not on PATH, so these cases cannot run"
 else
   git init -q "$REPO_DIR"
-  git -C "$REPO_DIR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m init
-  git -C "$REPO_DIR" worktree add -q --detach "$FWT" HEAD
-  mkdir -p "$FWT/vendor/acme"; echo '<?php' > "$FWT/vendor/acme/autoload.php"
-  expect "a plain worktree remove refuses that worktree (so the case means something)" eval \
-    '! git -C "$REPO_DIR" worktree remove "$FWT" >/dev/null 2>&1 && [ -d "$FWT" ]'
+  echo readme > "$REPO_DIR/README.md"
+  git -C "$REPO_DIR" add README.md
+  git -C "$REPO_DIR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m init
   {
     echo 'set -uo pipefail'
-    echo 'MODE=review; REPO=o/r; CLAIM=review:in-progress; OK=review:findings; CLEAN=review:clean'
-    echo 'FAIL=review:needs-human; TRIGGER=review:requested; CONTEXT_FILE=.pr-loop-context.md'
+    echo 'MODE=resolve; REPO=o/r; CLAIM=review:resolving; OK=review:resolved; CLEAN=""'
+    echo 'FAIL=review:needs-human; TRIGGER=review:findings; CONTEXT_FILE=.pr-loop-context.md'
     echo "LOG=$TMP/finish.log; STATE=$TMP/fstate; MAIN=$REPO_DIR"
-    echo 'declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=()'
+    echo 'declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=() W_VENDOR=()'
     echo 'relabel() { :; }; comment() { :; }; stop_agy() { :; }'
     sed -n '/^log() /p' "$LOOP"
     sed -n '/^finish()/,/^}/p' "$LOOP"
-    echo "W_WT[7]=$FWT; W_PROV[7]=composer"
-    echo 'finish 7 fail "composer install failed in . (exit 3)"'
+    echo 'W_WT[7]="$1"; W_PROV[7]=composer; W_VENDOR[7]="$2"'
+    echo 'finish 7 fail "the resolver left no disposition marker"'
   } > "$TMP/finish-driver.sh"
   mkdir -p "$TMP/fstate"
-  bash "$TMP/finish-driver.sh" 2>/dev/null
-  expect "finish removes a worktree with an untracked vendor/" [ ! -e "$FWT" ]
+  fwt() { # name -> a fresh worktree at HEAD with an installed apps/game/vendor/ and root vendor/
+    local w="$TMP/fwt-$1"
+    git -C "$REPO_DIR" worktree add -q --detach "$w" HEAD
+    mkdir -p "$w/vendor/acme" "$w/apps/game/vendor/acme"
+    echo '<?php' > "$w/vendor/acme/autoload.php"; echo '<?php' > "$w/apps/game/vendor/acme/autoload.php"
+    : > "$TMP/finish.log"
+    printf '%s' "$w"
+  }
+  fin() { bash "$TMP/finish-driver.sh" "$1" "$(printf '.\napps/game\n')" 2>/dev/null; }
+
+  W="$(fwt vendor-only)"
+  expect "a plain worktree remove refuses a vendor-only worktree (so the case means something)" eval \
+    '! git -C "$REPO_DIR" worktree remove "$W" >/dev/null 2>&1 && [ -d "$W" ]'
+  fin "$W"
+  expect "only installed vendor/ dirt: finish removes the worktree" [ ! -e "$W" ]
   expect "  ... and does not log it as kept" eval '! grep -q "kept" "$TMP/finish.log"'
+
+  W="$(fwt tracked-edit)"
+  echo 'a resolver edit' >> "$W/README.md"
+  fin "$W"
+  expect "a modified tracked file: the worktree is kept" [ -f "$W/README.md" ]
+  expect "  ... with the edit intact" grep -q 'a resolver edit' "$W/README.md"
+  expect "  ... and logged as kept" grep -q "worktree $W kept (uncommitted changes or busy); inspect and remove by hand" "$TMP/finish.log"
+
+  W="$(fwt untracked)"
+  echo 'new work' > "$W/notes.txt"
+  fin "$W"
+  expect "an untracked file outside vendor/: the worktree is kept" [ -f "$W/notes.txt" ]
+  expect "  ... and logged as kept" grep -q "worktree $W kept" "$TMP/finish.log"
 fi
 
 # ================================================================ whole ticks
