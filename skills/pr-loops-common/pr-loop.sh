@@ -61,7 +61,8 @@
 #   PR_LOOP_COMPOSER_TIMEOUT=600  seconds one directory's install may take before it is killed
 #                      and counted as a failure
 #   PR_LOOP_COMPOSER_KILL_AFTER=30  seconds after that SIGTERM before a composer that ignores it
-#                      gets SIGKILL (timeout -k)
+#                      gets SIGKILL (timeout -k). Both durations are whole positive seconds; any
+#                      other value (1.5, 10m, 0, empty) stops the PR without running composer
 #   PR_LOOP_COMPOSER_ALLOW_SCRIPTS=0  1 drops --no-scripts --no-plugins, letting the PR's
 #                      composer.json run its scripts and plugins on this host
 #   PR_LOOP_POOL=auto  hand this tick's PRs to the agent pool instead of spawning workers here.
@@ -478,8 +479,9 @@ stop_agy() { # pr
 # trees are pruned. The PR_LOOP_COMPOSER_* knobs are read here with their defaults inlined, so
 # tests/verify-composer.sh can lift this function out of the file and run it alone.
 install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) and COMPOSER_EXCERPT set
-  local wt="$1" bin="${PR_LOOP_COMPOSER_BIN:-composer}" secs="${PR_LOOP_COMPOSER_TIMEOUT:-600}" d dir rel out rc t0
-  local kill_after="${PR_LOOP_COMPOSER_KILL_AFTER:-30}"
+  # No colon on the two durations: set-but-empty is a mistake to report, not a request for the default.
+  local wt="$1" bin="${PR_LOOP_COMPOSER_BIN:-composer}" secs="${PR_LOOP_COMPOSER_TIMEOUT-600}" d dir rel out rc t0
+  local kill_after="${PR_LOOP_COMPOSER_KILL_AFTER-30}"
   local -a dirs=() listed=() args=(install --no-interaction --no-progress)
   # The PR's composer.json is untrusted until a human has looked at it: its scripts and plugins
   # would run arbitrary code here, on the review host, before any worker or deny list exists.
@@ -508,6 +510,14 @@ install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) an
       -o -type f -name composer.lock -print 2>/dev/null | sed 's|/composer\.lock$||' | LC_ALL=C sort)
   fi
   [ "${#dirs[@]}" -eq 0 ] && return 0
+  # Whole seconds only: timeout(1) would read 10m as ten minutes and 0 as "never", and the
+  # elapsed-time check that tells a -k kill from any other SIGKILL compares integers.
+  if ! [[ "$secs" =~ ^[1-9][0-9]*$ ]]; then
+    COMPOSER_WHY="PR_LOOP_COMPOSER_TIMEOUT must be whole positive seconds (got '$secs'); composer was not run"; return 1
+  fi
+  if ! [[ "$kill_after" =~ ^[1-9][0-9]*$ ]]; then
+    COMPOSER_WHY="PR_LOOP_COMPOSER_KILL_AFTER must be whole positive seconds (got '$kill_after'); composer was not run"; return 1
+  fi
   if ! command -v "$bin" >/dev/null 2>&1; then
     rel="${dirs[0]#"$wt"}"; rel="${rel#/}"
     COMPOSER_WHY="${rel:-.}/composer.lock needs composer install but $bin is not on PATH"; return 1

@@ -72,6 +72,11 @@ exists.
 | `PR_LOOP_COMPOSER_BIN` | `composer` | The binary to run (the tests use a stub) |
 | `PR_LOOP_COMPOSER_TIMEOUT` | `600` | Seconds one directory's install may run before `timeout` sends it SIGTERM |
 | `PR_LOOP_COMPOSER_KILL_AFTER` | `30` | Seconds after that SIGTERM before a composer still running gets SIGKILL (`timeout -k`); counted as a timeout either way |
+
+`PR_LOOP_COMPOSER_TIMEOUT` and `PR_LOOP_COMPOSER_KILL_AFTER` must be whole positive seconds
+(`^[1-9][0-9]*$`). Any other value, such as `1.5`, `10m`, `0`, `-3`, `abc`, or set but empty, is
+an install failure naming the variable and the value, and composer is not run. The check happens
+only when there is something to install, so a worktree with no `composer.lock` is unaffected.
 | `PR_LOOP_COMPOSER_ALLOW_SCRIPTS` | `0` | `1` drops `--no-scripts --no-plugins` |
 
 The PR stops when an install exits non-zero or times out, when a lock exists but the composer

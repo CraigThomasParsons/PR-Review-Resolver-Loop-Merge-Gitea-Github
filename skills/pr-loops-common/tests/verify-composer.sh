@@ -19,7 +19,8 @@ BIN="$HOME/.local/bin"
 mkdir -p "$BIN"
 export PATH="$BIN:$PATH"
 unset PR_LOOP_PINNED PR_LOOP_PR PR_LOOP_LOCK_WAIT PR_LOOP_STATE DRY_RUN \
-  PR_LOOP_COMPOSER_INSTALL PR_LOOP_COMPOSER_DIRS PR_LOOP_COMPOSER_BIN
+  PR_LOOP_COMPOSER_INSTALL PR_LOOP_COMPOSER_DIRS PR_LOOP_COMPOSER_BIN \
+  PR_LOOP_COMPOSER_TIMEOUT PR_LOOP_COMPOSER_KILL_AFTER PR_LOOP_COMPOSER_ALLOW_SCRIPTS
 
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
@@ -39,12 +40,14 @@ lacks() { [[ "$1" != *"$2"* ]]; }
 # Each call appends "<args>" to $CALLS. FAKE_FAIL_IN=<dir suffix> makes the install in that
 # directory fail with exit 3 and an error line, as a missing PHP extension does. FAKE_SLEEP=<s>
 # makes every install hang that long first, as one behind a dead mirror does; FAKE_IGNORE_TERM=1
-# makes it (and the sleep, which inherits the ignored signal) deaf to SIGTERM.
+# makes it (and the sleep, which inherits the ignored signal) deaf to SIGTERM; FAKE_SIGKILL=1 makes
+# it SIGKILL itself at once (exit 137), as the OOM killer would.
 COMPOSER="$TMP/fake-composer"
 CALLS="$TMP/composer-calls"; export CALLS
 cat > "$COMPOSER" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CALLS"
+[ -n "${FAKE_SIGKILL:-}" ] && kill -KILL $$
 [ -n "${FAKE_IGNORE_TERM:-}" ] && trap '' TERM
 if [ -n "${FAKE_SLEEP:-}" ]; then echo "Downloading from a mirror that never answers"; sleep "$FAKE_SLEEP"; fi
 wd=""
@@ -155,6 +158,27 @@ took=$(( $(date +%s) - start ))
 expect "composer that ignores SIGTERM: non-zero" [ "$RC" -ne 0 ]
 same "  ... still reported as a timeout" "$WHY" "composer install timed out after 1s in apps/game"
 expect "  ... SIGKILLed after the kill-after grace, not left to sleep out" [ "$took" -lt 10 ]
+fresh apps/game
+deps FAKE_SIGKILL=1 PR_LOOP_COMPOSER_TIMEOUT=30
+expect "composer SIGKILLed long before the timeout: non-zero" [ "$RC" -ne 0 ]
+same "  ... a plain failure with exit 137, not a timeout" "$WHY" "composer install failed in apps/game (exit 137)"
+
+for bad in 1.5 10m 0 -3 abc ''; do
+  fresh apps/game
+  deps PR_LOOP_COMPOSER_TIMEOUT="$bad"
+  expect "PR_LOOP_COMPOSER_TIMEOUT='$bad': refused" [ "$RC" -ne 0 ]
+  same "  ... naming the variable and the value" "$WHY" \
+    "PR_LOOP_COMPOSER_TIMEOUT must be whole positive seconds (got '$bad'); composer was not run"
+  same "  ... and composer is never called" "$NCALLS" 0
+done
+for bad in 2.5 30s 0; do
+  fresh apps/game
+  deps PR_LOOP_COMPOSER_KILL_AFTER="$bad"
+  expect "PR_LOOP_COMPOSER_KILL_AFTER='$bad': refused" [ "$RC" -ne 0 ]
+  same "  ... naming the variable and the value" "$WHY" \
+    "PR_LOOP_COMPOSER_KILL_AFTER must be whole positive seconds (got '$bad'); composer was not run"
+  same "  ... and composer is never called" "$NCALLS" 0
+done
 
 fresh apps/game
 deps PR_LOOP_COMPOSER_INSTALL=0
