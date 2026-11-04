@@ -60,6 +60,8 @@
 #   PR_LOOP_COMPOSER_BIN=composer  the composer binary (the tests point it at a stub)
 #   PR_LOOP_COMPOSER_TIMEOUT=600  seconds one directory's install may take before it is killed
 #                      and counted as a failure
+#   PR_LOOP_COMPOSER_KILL_AFTER=30  seconds after that SIGTERM before a composer that ignores it
+#                      gets SIGKILL (timeout -k)
 #   PR_LOOP_COMPOSER_ALLOW_SCRIPTS=0  1 drops --no-scripts --no-plugins, letting the PR's
 #                      composer.json run its scripts and plugins on this host
 #   PR_LOOP_POOL=auto  hand this tick's PRs to the agent pool instead of spawning workers here.
@@ -476,7 +478,8 @@ stop_agy() { # pr
 # trees are pruned. The PR_LOOP_COMPOSER_* knobs are read here with their defaults inlined, so
 # tests/verify-composer.sh can lift this function out of the file and run it alone.
 install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) and COMPOSER_EXCERPT set
-  local wt="$1" bin="${PR_LOOP_COMPOSER_BIN:-composer}" secs="${PR_LOOP_COMPOSER_TIMEOUT:-600}" d dir rel out rc
+  local wt="$1" bin="${PR_LOOP_COMPOSER_BIN:-composer}" secs="${PR_LOOP_COMPOSER_TIMEOUT:-600}" d dir rel out rc t0
+  local kill_after="${PR_LOOP_COMPOSER_KILL_AFTER:-30}"
   local -a dirs=() listed=() args=(install --no-interaction --no-progress)
   # The PR's composer.json is untrusted until a human has looked at it: its scripts and plugins
   # would run arbitrary code here, on the review host, before any worker or deny list exists.
@@ -514,10 +517,14 @@ install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) an
     log "$(basename -- "$wt"): composer install in $rel"
     COMPOSER_DONE+="$rel"$'\n'
     # Bounded: a hung install (a dead mirror, a stuck network) would otherwise hold this MODE's lock
-    # and stall every later tick.
-    out="$(timeout "$secs" "$bin" "${args[@]}" --working-dir="$dir" </dev/null 2>&1)"; rc=$?
+    # and stall every later tick. -k because SIGTERM alone does not stop a process that ignores it.
+    t0=$SECONDS
+    out="$(timeout -k "$kill_after" "$secs" "$bin" "${args[@]}" --working-dir="$dir" </dev/null 2>&1)"; rc=$?
     [ -n "$out" ] && printf '%s\n' "$out" | tail -n 20 | sed 's/^/    | /' | tee -a "$LOG" >&2
-    if [ "$rc" -eq 124 ]; then
+    # When -k fires, timeout's SIGKILL reaches its own process group, timeout included, so the
+    # status is 137 rather than 124. A 137 that comes sooner than the timeout is some other SIGKILL
+    # (the OOM killer, say) and is reported as a plain failure below.
+    if [ "$rc" -eq 124 ] || { [ "$rc" -eq 137 ] && [ $((SECONDS - t0)) -ge "$secs" ] 2>/dev/null; }; then
       COMPOSER_WHY="composer install timed out after ${secs}s in $rel"
       COMPOSER_EXCERPT="$(text_excerpt "$out")"
       return 1
@@ -629,24 +636,34 @@ finish() { # pr outcome reason [provider output]
     requeue) relabel "$pr" "$CLAIM" "$TRIGGER"; comment "$pr" "Automated $MODE loop paused on this PR: $reason. It is back at $TRIGGER for a later tick.$said" ;;
   esac
   rm -f "$wt/$CONTEXT_FILE"
-  # --force only once nothing but the loop's own composer installs is dirty: vendor/ under a dir
-  # install_composer_deps handled may go, but anything else (a resolve worker's uncommitted edits,
-  # a stray new file) keeps the worktree for a human. A status that cannot be read keeps it too.
-  local vendor="${W_VENDOR[$1]:-}" status line d foreign=""
-  if status="$(git -C "$wt" status --porcelain --untracked-files=all --ignored=no 2>/dev/null)"; then
-    while IFS= read -r line; do
-      [ -n "$line" ] || continue
-      foreign="$line"
-      while IFS= read -r d; do
-        [ -n "$d" ] || continue
-        if [ "$d" = . ]; then d=""; else d="$d/"; fi
-        case "${line:3}" in "${d}vendor/"*) foreign=""; break ;; esac
-      done <<<"$vendor"
+  # --force only once nothing but the loop's own composer installs is dirty: UNTRACKED files under
+  # the vendor/ of a dir install_composer_deps handled may go. Anything else keeps the worktree for
+  # a human: a resolve worker's uncommitted edits, a stray new file, and any change to a tracked
+  # file, including a committed vendor/ file. A status that cannot be read keeps it too.
+  # -z, read field by field: line-based porcelain quotes unusual names ("vendor/my file \303\251.php")
+  # and the quoted form would never match a prefix. NUL cannot live in a variable, hence the file.
+  local vendor="${W_VENDOR[$1]:-}" st rec origin d foreign=""
+  st="$(mktemp)"
+  if git -C "$wt" status --porcelain -z --untracked-files=all --ignored=no >"$st" 2>/dev/null; then
+    while IFS= read -r -d '' rec; do
+      foreign="$rec"
+      case "${rec:0:2}" in
+        '??')
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            if [ "$d" = . ]; then d=""; else d="$d/"; fi
+            case "${rec:3}" in "${d}vendor/"*) foreign=""; break ;; esac
+          done <<<"$vendor" ;;
+        # A rename or copy carries its origin path as the next NUL-separated field; consume it so
+        # it is never read as a record of its own.
+        *R*|*C*) IFS= read -r -d '' origin ;;
+      esac
       [ -n "$foreign" ] && break
-    done <<<"$status"
+    done <"$st"
   else
     foreign="git status failed"
   fi
+  rm -f "$st"
   if [ -z "$foreign" ] && git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1; then :; else log "#$pr: worktree $wt kept (uncommitted changes or busy); inspect and remove by hand"; fi
   rm -f "$STATE/classify-$sess.state" "$STATE/launch-$MODE-$pr.sh" "$STATE/agy-$MODE-$pr.rc" "$STATE/agy-$MODE-$pr.prompt" "$STATE/agy-$MODE-$pr.report"
   log "#$pr: $outcome ($reason)"

@@ -38,12 +38,14 @@ lacks() { [[ "$1" != *"$2"* ]]; }
 
 # Each call appends "<args>" to $CALLS. FAKE_FAIL_IN=<dir suffix> makes the install in that
 # directory fail with exit 3 and an error line, as a missing PHP extension does. FAKE_SLEEP=<s>
-# makes every install hang that long first, as one behind a dead mirror does.
+# makes every install hang that long first, as one behind a dead mirror does; FAKE_IGNORE_TERM=1
+# makes it (and the sleep, which inherits the ignored signal) deaf to SIGTERM.
 COMPOSER="$TMP/fake-composer"
 CALLS="$TMP/composer-calls"; export CALLS
 cat > "$COMPOSER" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CALLS"
+[ -n "${FAKE_IGNORE_TERM:-}" ] && trap '' TERM
 if [ -n "${FAKE_SLEEP:-}" ]; then echo "Downloading from a mirror that never answers"; sleep "$FAKE_SLEEP"; fi
 wd=""
 for a in "$@"; do case "$a" in --working-dir=*) wd="${a#--working-dir=}" ;; esac; done
@@ -146,6 +148,13 @@ start=$(date +%s); deps FAKE_SLEEP=30 PR_LOOP_COMPOSER_TIMEOUT=1; took=$(( $(dat
 expect "hung composer: non-zero" [ "$RC" -ne 0 ]
 same "  ... the reason says it timed out, after how long, and where" "$WHY" "composer install timed out after 1s in apps/game"
 expect "  ... killed at the timeout, not left to finish" [ "$took" -lt 10 ]
+fresh apps/game
+start=$(date +%s)
+deps FAKE_SLEEP=30 FAKE_IGNORE_TERM=1 PR_LOOP_COMPOSER_TIMEOUT=1 PR_LOOP_COMPOSER_KILL_AFTER=1
+took=$(( $(date +%s) - start ))
+expect "composer that ignores SIGTERM: non-zero" [ "$RC" -ne 0 ]
+same "  ... still reported as a timeout" "$WHY" "composer install timed out after 1s in apps/game"
+expect "  ... SIGKILLed after the kill-after grace, not left to sleep out" [ "$took" -lt 10 ]
 
 fresh apps/game
 deps PR_LOOP_COMPOSER_INSTALL=0
@@ -198,9 +207,11 @@ REPO_DIR="$TMP/repo"
 if ! command -v git >/dev/null 2>&1; then
   no "finish cases" "git is not on PATH, so these cases cannot run"
 else
+  # vendor/x.php is committed, as some repos commit vendor/: a change to it is real work.
   git init -q "$REPO_DIR"
   echo readme > "$REPO_DIR/README.md"
-  git -C "$REPO_DIR" add README.md
+  mkdir -p "$REPO_DIR/vendor"; echo '<?php // committed' > "$REPO_DIR/vendor/x.php"
+  git -C "$REPO_DIR" add README.md vendor/x.php
   git -C "$REPO_DIR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m init
   {
     echo 'set -uo pipefail'
@@ -244,6 +255,21 @@ else
   fin "$W"
   expect "an untracked file outside vendor/: the worktree is kept" [ -f "$W/notes.txt" ]
   expect "  ... and logged as kept" grep -q "worktree $W kept" "$TMP/finish.log"
+
+  W="$(fwt tracked-vendor)"
+  echo '// a resolver edit' >> "$W/vendor/x.php"
+  fin "$W"
+  expect "an edit to a committed vendor/ file: the worktree is kept" [ -f "$W/vendor/x.php" ]
+  expect "  ... with the edit intact" grep -q 'a resolver edit' "$W/vendor/x.php"
+  expect "  ... and logged as kept" grep -q "worktree $W kept (uncommitted changes or busy); inspect and remove by hand" "$TMP/finish.log"
+
+  W="$(fwt quoted-name)"
+  echo '<?php' > "$W/vendor/my file é.php"
+  expect "line-based porcelain quotes that name (so the case means something)" eval \
+    'git -C "$W" -c core.quotePath=true status --porcelain --untracked-files=all | grep -qF "\"vendor/my file \\303\\251.php\""'
+  fin "$W"
+  expect "an untracked vendor/ file whose name git quotes: still leftovers, the worktree is removed" [ ! -e "$W" ]
+  expect "  ... and not logged as kept" eval '! grep -q "kept" "$TMP/finish.log"'
 fi
 
 # ================================================================ whole ticks

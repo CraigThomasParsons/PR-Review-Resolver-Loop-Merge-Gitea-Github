@@ -70,7 +70,8 @@ exists.
 | `PR_LOOP_COMPOSER_INSTALL` | `1` | `0` skips the step |
 | `PR_LOOP_COMPOSER_DIRS` | unset | Space-separated directories, relative to the worktree, to install in instead of discovering them. Each must hold a `composer.lock`; an absolute path or one with a `..` component is refused. |
 | `PR_LOOP_COMPOSER_BIN` | `composer` | The binary to run (the tests use a stub) |
-| `PR_LOOP_COMPOSER_TIMEOUT` | `600` | Seconds one directory's install may run before `timeout` kills it |
+| `PR_LOOP_COMPOSER_TIMEOUT` | `600` | Seconds one directory's install may run before `timeout` sends it SIGTERM |
+| `PR_LOOP_COMPOSER_KILL_AFTER` | `30` | Seconds after that SIGTERM before a composer still running gets SIGKILL (`timeout -k`); counted as a timeout either way |
 | `PR_LOOP_COMPOSER_ALLOW_SCRIPTS` | `0` | `1` drops `--no-scripts --no-plugins` |
 
 The PR stops when an install exits non-zero or times out, when a lock exists but the composer
@@ -78,10 +79,11 @@ binary is not on PATH, or when an entry in `PR_LOOP_COMPOSER_DIRS` is absolute, 
 has no lock. Installing stops at the first failure. The loop then logs the reason, moves the PR from its claim label to
 `review:needs-human` with a comment giving the reason (for example
 `composer install failed in apps/game (exit 2)`) and an excerpt of composer's output, and removes
-the worktree. At the end of any run, a worktree whose only uncommitted files are under the
-`vendor/` of a directory the loop installed in is removed with `--force`, so a `vendor/` the repo
-does not ignore does not keep it. Any other dirt (a resolve worker's uncommitted edits, a new
-file) keeps the worktree and names it in the log, as before. No worker is started, and the PR's slot goes to the next one in the queue. Dry runs
+the worktree. At the end of any run, a worktree whose only uncommitted files are untracked ones
+under the `vendor/` of a directory the loop installed in is removed with `--force`, so a `vendor/`
+the repo does not ignore does not keep it. Any other dirt (a resolve worker's uncommitted edits, a
+new file, a change to a committed `vendor/` file) keeps the worktree and names it in the log, as
+before. No worker is started, and the PR's slot goes to the next one in the queue. Dry runs
 never create a worktree, so they never install.
 
 TODO: resolve has no fallback provider. Agy has no tool deny list, so the agent pool never lets it
