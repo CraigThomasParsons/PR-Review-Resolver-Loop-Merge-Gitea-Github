@@ -48,6 +48,15 @@
 #   PR_LOOP_AGY_BIN=agy  the Agy CLI used when Claude is limited; review only. Never a bare `agent`
 #   PR_LOOP_AGY_MODEL    --model for Agy (unset = Agy's own default)
 #   PR_LOOP_LIMIT_DEFAULT_SECS=21600  how long a limit lasts when its message names no reset
+#   PR_LOOP_COMPOSER_INSTALL=1  run `composer install --no-interaction --no-progress` in the PR's
+#                      worktree before its worker starts, once per directory holding a
+#                      composer.lock (vendor/, node_modules/ and .git are not searched). No lock,
+#                      no install. 0 skips the step. A failed install, or a lock with no composer
+#                      to run it, stops the PR at review:needs-human with composer's output, and
+#                      no worker is started
+#   PR_LOOP_COMPOSER_DIRS  space-separated directories, relative to the worktree, to install in
+#                      instead of discovering them; each must hold a composer.lock or the PR stops
+#   PR_LOOP_COMPOSER_BIN=composer  the composer binary (the tests point it at a stub)
 #   PR_LOOP_POOL=auto  hand this tick's PRs to the agent pool instead of spawning workers here.
 #                      auto (default): when ~/.config/agent-pool/repos.toml (AGENT_POOL_CONFIG)
 #                      gives some rostered provider this MODE's ability on the repo. 1 forces it,
@@ -453,6 +462,51 @@ stop_agy() { # pr
   return 0
 }
 
+# A fresh worktree has no vendor/, so a PHP repo's own gate (composer test, vendor/bin/phpunit,
+# pint) cannot run in it until something installs the dependencies. The loop does that here,
+# before any worker starts, rather than leaving it to the worker: a broken install then stops the
+# PR with composer's own words instead of surfacing as a gate failure the worker misreads, and no
+# worker needs a network-facing `composer install` in its allow list to get going.
+# A composer.lock under vendor/ or node_modules/ belongs to a dependency, not to the PR, so those
+# trees are pruned. The PR_LOOP_COMPOSER_* knobs are read here with their defaults inlined, so
+# tests/verify-composer.sh can lift this function out of the file and run it alone.
+install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) and COMPOSER_EXCERPT set
+  local wt="$1" bin="${PR_LOOP_COMPOSER_BIN:-composer}" d dir rel out rc
+  local -a dirs=() listed=()
+  COMPOSER_WHY=""; COMPOSER_EXCERPT=""
+  case "${PR_LOOP_COMPOSER_INSTALL:-1}" in 0|off|no|false) return 0 ;; esac
+  if [ -n "${PR_LOOP_COMPOSER_DIRS:-}" ]; then
+    # read -a rather than an unquoted expansion: a listed dir must never glob.
+    read -r -a listed <<<"$PR_LOOP_COMPOSER_DIRS"
+    for d in "${listed[@]}"; do
+      if [ ! -f "$wt/${d%/}/composer.lock" ]; then
+        COMPOSER_WHY="PR_LOOP_COMPOSER_DIRS names $d, which has no composer.lock in this PR"; return 1
+      fi
+      dirs+=("$wt/${d%/}")
+    done
+  else
+    mapfile -t dirs < <(find "$wt" \( -name vendor -o -name node_modules -o -name .git \) -prune \
+      -o -type f -name composer.lock -print 2>/dev/null | sed 's|/composer\.lock$||' | LC_ALL=C sort)
+  fi
+  [ "${#dirs[@]}" -eq 0 ] && return 0
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    rel="${dirs[0]#"$wt"}"; rel="${rel#/}"
+    COMPOSER_WHY="${rel:-.}/composer.lock needs composer install but $bin is not on PATH"; return 1
+  fi
+  for dir in "${dirs[@]}"; do
+    rel="${dir#"$wt"}"; rel="${rel#/}"; rel="${rel:-.}"
+    log "$(basename -- "$wt"): composer install in $rel"
+    out="$("$bin" install --no-interaction --no-progress --working-dir="$dir" </dev/null 2>&1)"; rc=$?
+    [ -n "$out" ] && printf '%s\n' "$out" | tail -n 20 | sed 's/^/    | /' | tee -a "$LOG" >&2
+    if [ "$rc" -ne 0 ]; then
+      COMPOSER_WHY="composer install failed in $rel (exit $rc)"
+      COMPOSER_EXCERPT="$(text_excerpt "$out")"
+      return 1
+    fi
+  done
+  return 0
+}
+
 spawn() { # row
   IFS=$'\t' read -r pr headref sha base <<<"$1"
   local sess="prloop-$MODE-$pr" wt="$WT_ROOT/prloop-$MODE-$pr" prompt="$STATE/prompt-$MODE-$pr.txt" launch="$STATE/launch-$MODE-$pr.sh"
@@ -477,6 +531,14 @@ spawn() { # row
   [ -d "$wt" ] && git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1
   git -C "$MAIN" worktree add --detach "$wt" "$sha" >/dev/null 2>&1 || { log "#$pr: worktree add failed"; relabel "$pr" "$CLAIM" "$FAIL"; return 1; }
   W_WT[$pr]="$wt"; W_SHA[$pr]="$sha"; W_HEADREF[$pr]="$headref"; W_BASE[$pr]="$base"
+  if ! install_composer_deps "$wt"; then
+    # No worker exists yet: W_PROV names composer so finish() has no session or process to stop,
+    # and its comment says "composer said:" above the excerpt.
+    log "#$pr: $COMPOSER_WHY; not starting a worker"
+    W_PROV[$pr]=composer
+    finish "$pr" fail "$COMPOSER_WHY" "$COMPOSER_EXCERPT"
+    return 1
+  fi
   if [ "$use" = agy ]; then
     log "#$pr: Claude is limited until $LIMIT_UNTIL; reviewing with agy"
     start_agy "$pr"; return 0
@@ -525,9 +587,16 @@ spawn() { # row
 }
 
 finish() { # pr outcome reason [provider output]
-  local pr="$1" outcome="$2" reason="$3" detail="${4:-}" sess="${W_SESS[$pr]}" wt="${W_WT[$pr]}" said=""
-  if [ "${W_PROV[$pr]}" = agy ]; then stop_agy "$pr"; else tmux kill-session -t "$sess" 2>/dev/null; fi
-  [ -n "$detail" ] && printf -v said '\n\n%s said:\n\n```\n%s\n```' "${W_PROV[$pr]}" "$detail"
+  # Every lookup defaults: a PR stopped before its worker started (composer install failed) has no
+  # W_SESS entry, and under set -u a missing key would kill the whole tick. An empty session must
+  # never reach `tmux kill-session -t`, where it would name the caller's own session.
+  local pr="$1" outcome="$2" reason="$3" detail="${4:-}" sess="${W_SESS[$1]:-}" wt="${W_WT[$1]:-}" prov="${W_PROV[$1]:-}" said=""
+  case "$prov" in
+    agy) stop_agy "$pr" ;;
+    composer) : ;;
+    *) [ -n "$sess" ] && tmux kill-session -t "$sess" 2>/dev/null ;;
+  esac
+  [ -n "$detail" ] && printf -v said '\n\n%s said:\n\n```\n%s\n```' "$prov" "$detail"
   case "$outcome" in
     ok)    relabel "$pr" "$CLAIM" "$OK" ;;
     clean) relabel "$pr" "$CLAIM" "$CLEAN" ;;
