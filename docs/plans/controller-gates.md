@@ -3,8 +3,8 @@
 Status: partly built (issue #14). Built: Section 1 (`gates.py` load/validate/select/protected);
 Sections 2.1 to 2.4 and 2.6's log capture (`gate_git`, the by-SHA checkout, `gates.py run`); the
 receipt, the comment section and the verdict mapping from Section 3, with the push refused unless
-this attempt's receipt passed at the exact head. Not built yet: the `[[deps]]` cache (2.5; a
-manifest declaring deps is refused as infra), posting sanitized log tails (`report.py
+this attempt's receipt passed at the exact head; the `[[deps]]` cache (2.5, issue #60). Not built
+yet: posting sanitized log tails (`report.py
 sanitize`), the re-run at the PR head for a pre-existing red gate, the `verify()`/`derive_job()`
 receipt check (step 5), the deadline startup check (Q2 is open; gates stop 60s before the claim
 deadline instead), and Sections 4 and 5. Written 2026-10-17 against `feature/agent-pool-core` at
@@ -132,6 +132,7 @@ A manifest that fails validation is an **infra** fault (§3), not a gate failure
 | `load --main M --base-sha S --repo O/R` | Prints the validated manifest as JSON plus its blob SHA and source (base or override). |
 | `select --manifest J --changed FILE` | Prints the gates whose `paths` match the worker's changed files. Prints `none` for a docs-only change. |
 | `protected --manifest J --changed FILE` | Prints the changed paths that are protected (built-ins plus `protect`). |
+| `warm ...` | Warms each `[[deps]]` cache from the `BASE_SHA` tree, with network (§2.5). |
 | `run ...` | The sandbox runner (§2). |
 
 ### Detecting and rejecting a worker's change to the manifest
@@ -328,6 +329,79 @@ Scoping the network to "the npm registry only" would need a filtering proxy. Thi
 needing one: worker-influenced code gets no network, and base code gets plain network but no
 credentials.
 
+**Built (steps 1-2, #60).** It differs from the sketch above in these ways:
+
+- The cache is per dep: `<cache-root>/<repo-slug>/<dep>/` holds `cache` (a symlink to a
+  `cache-*` dir), `warmed.json` (`lockfile`, `blob`, `base_sha`, `dep_hash`, `warmed_at`) and
+  the last warm's log.
+- `gates.py warm --manifest J --main M --base-sha S --cache-root DIR --repo O/R [--budget N]`
+  re-warms a dep when its lockfile blob at `BASE_SHA` or its warm definition (`name`, `cwd`,
+  `lockfile`, `warm`) differs from `warmed.json`.
+  - The tree is exported with the §2.1 plumbing.
+  - `warm` runs through the same sandbox builder as the gates, plus `--share-net` and the
+    resolver files under `/etc`, writing into a fresh staging dir at `/cache`.
+  - The `cache` symlink is swapped to the new dir only on success. A failed warm keeps the
+    old cache and is infra.
+- `gates.py run` takes `--cache-root DIR --repo O/R`, and a manifest with `[[deps]]` needs both,
+  plus a `warmed.json` for every dep. Otherwise the run is infra.
+  - The run makes a scratch copy of every dep's cache, merged, under the runs dir. The copy is
+    read-write because composer disables a read-only cache. It's deleted after the run, and the
+    warmed cache itself is never bound.
+  - Each `install` runs first, offline, and counts against the budget. An install failure is
+    `gate-fail`, and no gate runs.
+  - The gates then see the same copy at `/cache`.
+- Warm, install and the gates all get `COMPOSER_CACHE_DIR`, `COMPOSER_HOME`,
+  `npm_config_cache` and `NUGET_PACKAGES` under `/cache`. Install and the gates also get
+  `COMPOSER_DISABLE_NETWORK=1`.
+- The cache root follows the `AGENT_POOL_GATE_RO_BINDS` rules, with one exception: it may sit
+  under `$AGENT_POOL_STATE/gate-cache`.
+
+- `warm` reports, per dep, its `name`, `lockfile`, `status` (`fresh`, `warmed` or `failed`),
+  `blob` and `base_sha` (the commit its cache was warmed from, which for `fresh` can be an
+  earlier base commit with the same lockfile blob).
+
+Step 2 is the `prod-common.sh` wiring, in `run_gates`:
+
+- When the manifest actually used (base blob or override) declares `[[deps]]` and a gate is
+  selected, `run_gates` calls `gates.py warm --manifest … --main $MAIN --base-sha BASE_SHA
+  --cache-root $STATE/gate-cache --repo OWNER/NAME --budget N` before `run`.
+  - It runs in its own process group and is watched like the gate run, so a superseded claim
+    kills it. If the claim is lost, the result is `lost`.
+  - N is worked out the same way as `run`'s: `AGENT_POOL_GATE_BUDGET`, stopping 60s before the
+    claim deadline. `run`'s budget is worked out again after the warm, so warm time comes out of
+    the claim, not out of `AGENT_POOL_GATE_BUDGET`.
+- `run` always gets `--cache-root $STATE/gate-cache --repo OWNER/NAME`. A manifest without
+  `[[deps]]` ignores them and is never warmed.
+- A warm whose `result` isn't `pass` is infra. So is a warm that exits non-zero or leaves no
+  readable JSON. In each case `run` isn't called, and the receipt records `result: infra` with
+  the warm's reason.
+- **A failed warm pauses only its repo.** It is not a `setup_fault gates` and writes no
+  `faults/gates.json`.
+  - `run_gates` calls `gates.py cache-fault`, which writes
+    `$STATE/faults/gates-cache/<owner>__<name>.json`. That file holds `repo`, `reason`,
+    `base_sha`, the failed `deps` (`name`, `lockfile`, `blob`), `count`, `at` and `expires_at`.
+    `at` and `expires_at` are epoch seconds, and `expires_at` is `at` plus
+    `AGENT_POOL_GATE_CACHE_PAUSE_SECS` (default 3600).
+  - `publish` then returns `cacheinfra:<reason>`. `attempt()` maps that to a requeue: the label
+    goes back to `agent:ready`. It's never `GATE_TERMINAL`, the provider gets no cooldown or
+    fault, and the tick still exits 2.
+  - `job_providers resolve` asks `gates.py cache-pause` for the tick's own repo. While the fault
+    hasn't expired, that repo's resolve jobs aren't claimed. Every other repo, and review jobs
+    everywhere, carry on. If the check itself fails, the repo reads as paused.
+  - An unreadable fault file expires from its mtime.
+  - The pause ends when `expires_at` passes (the next resolve warms again), when a warm for the
+    repo passes (`gates.py cache-clear` deletes the file), or when a person deletes the file.
+  - `capabilities.py check-queue --repo O/R` reports `gates-paused` for that repo's gated jobs
+    under the same rule.
+  - Every other gate infra fault (sandbox, manifest, checkout, config checksum, receipt) is
+    still a global `setup_fault gates` through `faults/gates.json`.
+- The receipt carries `deps`: `[{name, lockfile, status, blob, base_sha}]` from the warm's
+  output. It's an empty list when nothing was warmed, and `check-receipt` doesn't read it.
+  Receipts written before this have no `deps` key and are still accepted. The posted gate
+  section names each dep's lockfile blob.
+- Clearing a cache means deleting its dep dir, `$STATE/gate-cache/<repo-slug>/<dep>/`. The next
+  gated resolve that needs it warms it again.
+
 ### 2.6 Output capture
 
 - The runner, not the gate, owns both fds. Each gate's stdout and stderr go to **one** file in
@@ -359,7 +433,9 @@ an existing one:
  "base_sha": "...", "pr_head": "<sha>", "head": "<newhead>",
  "manifest": {"source": "base|override", "blob": "<sha>"},
  "result": "pass|none-needed|gate-fail|gate-timeout|gate-resource|protected|infra",
- "gates": [{"name": "client", "argv": [...], "rc": 0, "secs": 212, "log": "gate-...log"}]}
+ "gates": [{"name": "client", "argv": [...], "rc": 0, "secs": 212, "log": "gate-...log"}],
+ "deps": [{"name": "client-npm", "lockfile": "clientv2/package-lock.json", "status": "fresh",
+           "blob": "<sha>", "base_sha": "<sha>"}]}
 ```
 
 It also writes a copy indexed by head at `gates/by-head/<slug>__<pr>__<newhead>.json`, which
@@ -419,7 +495,8 @@ is the local receipt.
 | **gate-fail** | child started and exited non-zero (not 124/137/126/127) | no | `needs-human` (`fail`) | none, and strikes are **not** cleared | no | failing gate, rc, last 60 lines |
 | **gate-timeout** | `timeout` fired (124, or 137 after `-k`), or the budget ran out | no | `needs-human` (`fail`) | none | no | "timed out after Ns; if the gate is just slow, raise its timeout in the manifest" |
 | **gate-resource** | `memory.events` `oom_kill > 0`, or `TasksMax` hit | no | `needs-human` (`fail`) | none | no | which limit, last lines |
-| **infra** | bwrap/systemd-run missing or failing, no `child-pid` on the status fd, child rc 126/127, manifest unreadable or invalid at `BASE_SHA`, cache warm failure, checkout failure, `MAIN` config checksum mismatch, disk full | no | `ready` (requeue) | **none** for the provider | **yes**, `setup_fault gates "<why>"`, so the tick exits 2 | none (requeue posts nothing) |
+| **infra** | bwrap/systemd-run missing or failing, no `child-pid` on the status fd, child rc 126/127, manifest unreadable or invalid at `BASE_SHA`, checkout failure, `MAIN` config checksum mismatch, disk full | no | `ready` (requeue) | **none** for the provider | **yes**, `setup_fault gates "<why>"`, so the tick exits 2 | none (requeue posts nothing) |
+| **cache infra** | a `[[deps]]` warm failed, crashed or left no result (§2.5) | no | `ready` (requeue) | **none** for the provider | no global fault: `faults/gates-cache/<owner>__<name>.json` pauses that repo's resolves until it expires or a warm passes; the tick exits 2 | none |
 | **lost** | `still_held` false after gates | no | untouched | none | no | none |
 
 Notes on the rules:
