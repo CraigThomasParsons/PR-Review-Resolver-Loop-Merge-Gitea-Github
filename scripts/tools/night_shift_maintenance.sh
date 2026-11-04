@@ -36,7 +36,10 @@ case "$TASK" in
       ran=$((ran + 1))
       # A minimal environment: operator variables (AGENT_POOL_*, PROVIDER_ORDER ...) inherited
       # from the caller change what the suites exercise and fail them with no real defect.
+      # XDG_RUNTIME_DIR lets systemd-analyze reach the user manager; CONDUITS_PYTHON picks the venv.
       if env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C.UTF-8}" \
+          ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} \
+          ${CONDUITS_PYTHON:+CONDUITS_PYTHON="$CONDUITS_PYTHON"} \
           bash "$suite" > "$output" 2>&1; then
         log "ok   ${suite}"
       else
