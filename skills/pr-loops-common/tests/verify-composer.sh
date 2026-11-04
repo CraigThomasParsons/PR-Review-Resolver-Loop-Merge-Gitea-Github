@@ -4,9 +4,10 @@
 #
 # The first half calls the real install_composer_deps() lifted out of pr-loop.sh (with the real
 # log and text_excerpt it uses) against temp worktrees and a stub composer named by
-# PR_LOOP_COMPOSER_BIN. The second half runs whole review ticks with claude, tea, tmux and git
-# stubbed, as tests/verify-fallback.sh does, to show a failed install stops the PR without ever
-# starting a worker. No network, no repository, no real composer.
+# PR_LOOP_COMPOSER_BIN. Then the real finish() removes a worktree holding an untracked vendor/
+# from a throwaway local git repo. The last part runs whole review ticks with claude, tea, tmux and
+# git stubbed, as tests/verify-fallback.sh does, to show a failed install stops the PR without ever
+# starting a worker. No network, no remote repository, no real composer.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,12 +37,14 @@ has() { [[ "$1" == *"$2"* ]]; }
 lacks() { [[ "$1" != *"$2"* ]]; }
 
 # Each call appends "<args>" to $CALLS. FAKE_FAIL_IN=<dir suffix> makes the install in that
-# directory fail with exit 3 and an error line, as a missing PHP extension does.
+# directory fail with exit 3 and an error line, as a missing PHP extension does. FAKE_SLEEP=<s>
+# makes every install hang that long first, as one behind a dead mirror does.
 COMPOSER="$TMP/fake-composer"
 CALLS="$TMP/composer-calls"; export CALLS
 cat > "$COMPOSER" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CALLS"
+if [ -n "${FAKE_SLEEP:-}" ]; then echo "Downloading from a mirror that never answers"; sleep "$FAKE_SLEEP"; fi
 wd=""
 for a in "$@"; do case "$a" in --working-dir=*) wd="${a#--working-dir=}" ;; esac; done
 if [ -n "${FAKE_FAIL_IN:-}" ] && [[ "$wd" == *"/$FAKE_FAIL_IN" ]]; then
@@ -88,7 +91,7 @@ deps() { # [env...] -> RC, WHY, EXCERPT, NCALLS
   WHY="$(cat "$TMP/res.why")"; EXCERPT="$(cat "$TMP/res.excerpt")"
   NCALLS="$(wc -l < "$CALLS")"
 }
-want_call() { printf 'install --no-interaction --no-progress --working-dir=%s' "$1"; }
+want_call() { printf 'install --no-interaction --no-progress --no-scripts --no-plugins --working-dir=%s' "$1"; }
 
 fresh
 deps
@@ -106,6 +109,12 @@ expect "apps/game/composer.lock: success" [ "$RC" -eq 0 ]
 same "  ... composer called once, in apps/game, non-interactive" "$(cat "$CALLS")" "$(want_call "$WT/apps/game")"
 expect "  ... the log names the dir" grep -q 'composer install in apps/game' "$TMP/loop.log"
 expect "  ... and carries composer's output" grep -q '    | Generating optimized autoload files' "$TMP/loop.log"
+expect "  ... with scripts and plugins off by default" eval \
+  'grep -q -- " --no-scripts " "$CALLS" && grep -q -- " --no-plugins " "$CALLS"'
+fresh apps/game
+deps PR_LOOP_COMPOSER_ALLOW_SCRIPTS=1
+same "PR_LOOP_COMPOSER_ALLOW_SCRIPTS=1: installed without --no-scripts --no-plugins" "$(cat "$CALLS")" \
+  "install --no-interaction --no-progress --working-dir=$WT/apps/game"
 
 fresh vendor/acme/lib node_modules/pkg apps/game/vendor/acme/lib apps/game/node_modules/pkg
 deps
@@ -133,6 +142,12 @@ same "  ... the first failure stops the rest" "$NCALLS" 2
 expect "  ... and the reason names the failing dir, not the last" has "$WHY" "failed in apps/game"
 
 fresh apps/game
+start=$(date +%s); deps FAKE_SLEEP=30 PR_LOOP_COMPOSER_TIMEOUT=1; took=$(( $(date +%s) - start ))
+expect "hung composer: non-zero" [ "$RC" -ne 0 ]
+same "  ... the reason says it timed out, after how long, and where" "$WHY" "composer install timed out after 1s in apps/game"
+expect "  ... killed at the timeout, not left to finish" [ "$took" -lt 10 ]
+
+fresh apps/game
 deps PR_LOOP_COMPOSER_INSTALL=0
 expect "PR_LOOP_COMPOSER_INSTALL=0: success" [ "$RC" -eq 0 ]
 same "  ... and composer is never called" "$NCALLS" 0
@@ -153,12 +168,58 @@ same "  ... before anything is installed" "$NCALLS" 0
 fresh apps/game
 deps PR_LOOP_COMPOSER_DIRS='*'
 expect "  ... a listed dir is never globbed" eval '[ "$RC" -ne 0 ] && has "$WHY" "names *,"'
+# Both refused paths below do hold a composer.lock, so only the path rule can stop them.
+fresh apps/game
+deps PR_LOOP_COMPOSER_DIRS="$WT/apps/game"
+expect "  ... an absolute dir is refused" eval '[ "$RC" -ne 0 ] && has "$WHY" "is absolute"'
+same "  ... and nothing is installed" "$NCALLS" 0
+fresh apps/game
+mkdir -p "$TMP/outside"; echo '{}' > "$TMP/outside/composer.lock"
+deps PR_LOOP_COMPOSER_DIRS="apps/../../outside"
+expect "  ... a dir with a .. component is refused" eval '[ "$RC" -ne 0 ] && has "$WHY" "has a .. component"'
+same "  ... and nothing is installed" "$NCALLS" 0
+deps PR_LOOP_COMPOSER_DIRS="apps/game/.."
+expect "  ... even a trailing .. that stays inside the worktree" eval '[ "$RC" -ne 0 ] && has "$WHY" "has a .. component"'
 
 fresh apps/game
 deps PR_LOOP_COMPOSER_BIN="$TMP/nowhere/composer"
 expect "composer.lock but no composer: failure" [ "$RC" -ne 0 ]
 expect "  ... saying composer is missing and where it was needed" eval \
   'has "$WHY" "$TMP/nowhere/composer is not on PATH" && has "$WHY" "apps/game/composer.lock"'
+
+# ================================================================ finish() and an installed vendor/
+# The real finish() against a real git repo, before the whole-tick stubs put a fake git on PATH:
+# a worktree holding an untracked vendor/ (what an install leaves when the repo does not ignore
+# it) must still be removed.
+echo
+echo "finish"
+REPO_DIR="$TMP/repo"; FWT="$TMP/fwt"
+if ! command -v git >/dev/null 2>&1; then
+  no "finish removes a worktree with an untracked vendor/" "git is not on PATH, so this case cannot run"
+else
+  git init -q "$REPO_DIR"
+  git -C "$REPO_DIR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m init
+  git -C "$REPO_DIR" worktree add -q --detach "$FWT" HEAD
+  mkdir -p "$FWT/vendor/acme"; echo '<?php' > "$FWT/vendor/acme/autoload.php"
+  expect "a plain worktree remove refuses that worktree (so the case means something)" eval \
+    '! git -C "$REPO_DIR" worktree remove "$FWT" >/dev/null 2>&1 && [ -d "$FWT" ]'
+  {
+    echo 'set -uo pipefail'
+    echo 'MODE=review; REPO=o/r; CLAIM=review:in-progress; OK=review:findings; CLEAN=review:clean'
+    echo 'FAIL=review:needs-human; TRIGGER=review:requested; CONTEXT_FILE=.pr-loop-context.md'
+    echo "LOG=$TMP/finish.log; STATE=$TMP/fstate; MAIN=$REPO_DIR"
+    echo 'declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=()'
+    echo 'relabel() { :; }; comment() { :; }; stop_agy() { :; }'
+    sed -n '/^log() /p' "$LOOP"
+    sed -n '/^finish()/,/^}/p' "$LOOP"
+    echo "W_WT[7]=$FWT; W_PROV[7]=composer"
+    echo 'finish 7 fail "composer install failed in . (exit 3)"'
+  } > "$TMP/finish-driver.sh"
+  mkdir -p "$TMP/fstate"
+  bash "$TMP/finish-driver.sh" 2>/dev/null
+  expect "finish removes a worktree with an untracked vendor/" [ ! -e "$FWT" ]
+  expect "  ... and does not log it as kept" eval '! grep -q "kept" "$TMP/finish.log"'
+fi
 
 # ================================================================ whole ticks
 echo

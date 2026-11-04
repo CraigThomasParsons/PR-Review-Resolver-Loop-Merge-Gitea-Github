@@ -48,15 +48,20 @@
 #   PR_LOOP_AGY_BIN=agy  the Agy CLI used when Claude is limited; review only. Never a bare `agent`
 #   PR_LOOP_AGY_MODEL    --model for Agy (unset = Agy's own default)
 #   PR_LOOP_LIMIT_DEFAULT_SECS=21600  how long a limit lasts when its message names no reset
-#   PR_LOOP_COMPOSER_INSTALL=1  run `composer install --no-interaction --no-progress` in the PR's
-#                      worktree before its worker starts, once per directory holding a
-#                      composer.lock (vendor/, node_modules/ and .git are not searched). No lock,
-#                      no install. 0 skips the step. A failed install, or a lock with no composer
-#                      to run it, stops the PR at review:needs-human with composer's output, and
-#                      no worker is started
+#   PR_LOOP_COMPOSER_INSTALL=1  run `composer install --no-interaction --no-progress --no-scripts
+#                      --no-plugins` in the PR's worktree before its worker starts, once per
+#                      directory holding a composer.lock (vendor/, node_modules/ and .git are not
+#                      searched). No lock, no install. 0 skips the step. A failed or timed-out
+#                      install, or a lock with no composer to run it, stops the PR at
+#                      review:needs-human with composer's output, and no worker is started
 #   PR_LOOP_COMPOSER_DIRS  space-separated directories, relative to the worktree, to install in
-#                      instead of discovering them; each must hold a composer.lock or the PR stops
+#                      instead of discovering them; each must hold a composer.lock, and an
+#                      absolute path or one with a .. component is refused; either stops the PR
 #   PR_LOOP_COMPOSER_BIN=composer  the composer binary (the tests point it at a stub)
+#   PR_LOOP_COMPOSER_TIMEOUT=600  seconds one directory's install may take before it is killed
+#                      and counted as a failure
+#   PR_LOOP_COMPOSER_ALLOW_SCRIPTS=0  1 drops --no-scripts --no-plugins, letting the PR's
+#                      composer.json run its scripts and plugins on this host
 #   PR_LOOP_POOL=auto  hand this tick's PRs to the agent pool instead of spawning workers here.
 #                      auto (default): when ~/.config/agent-pool/repos.toml (AGENT_POOL_CONFIG)
 #                      gives some rostered provider this MODE's ability on the repo. 1 forces it,
@@ -471,14 +476,23 @@ stop_agy() { # pr
 # trees are pruned. The PR_LOOP_COMPOSER_* knobs are read here with their defaults inlined, so
 # tests/verify-composer.sh can lift this function out of the file and run it alone.
 install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) and COMPOSER_EXCERPT set
-  local wt="$1" bin="${PR_LOOP_COMPOSER_BIN:-composer}" d dir rel out rc
-  local -a dirs=() listed=()
+  local wt="$1" bin="${PR_LOOP_COMPOSER_BIN:-composer}" secs="${PR_LOOP_COMPOSER_TIMEOUT:-600}" d dir rel out rc
+  local -a dirs=() listed=() args=(install --no-interaction --no-progress)
+  # The PR's composer.json is untrusted until a human has looked at it: its scripts and plugins
+  # would run arbitrary code here, on the review host, before any worker or deny list exists.
+  [ "${PR_LOOP_COMPOSER_ALLOW_SCRIPTS:-0}" = 1 ] || args+=(--no-scripts --no-plugins)
   COMPOSER_WHY=""; COMPOSER_EXCERPT=""
   case "${PR_LOOP_COMPOSER_INSTALL:-1}" in 0|off|no|false) return 0 ;; esac
   if [ -n "${PR_LOOP_COMPOSER_DIRS:-}" ]; then
     # read -a rather than an unquoted expansion: a listed dir must never glob.
     read -r -a listed <<<"$PR_LOOP_COMPOSER_DIRS"
     for d in "${listed[@]}"; do
+      if [[ "$d" == /* ]]; then
+        COMPOSER_WHY="PR_LOOP_COMPOSER_DIRS entry $d is absolute; entries must be relative to the worktree"; return 1
+      fi
+      if [[ "/$d/" == */../* ]]; then
+        COMPOSER_WHY="PR_LOOP_COMPOSER_DIRS entry $d has a .. component; entries must stay inside the worktree"; return 1
+      fi
       if [ ! -f "$wt/${d%/}/composer.lock" ]; then
         COMPOSER_WHY="PR_LOOP_COMPOSER_DIRS names $d, which has no composer.lock in this PR"; return 1
       fi
@@ -496,8 +510,15 @@ install_composer_deps() { # wt -> 0, or 1 with COMPOSER_WHY (the stop reason) an
   for dir in "${dirs[@]}"; do
     rel="${dir#"$wt"}"; rel="${rel#/}"; rel="${rel:-.}"
     log "$(basename -- "$wt"): composer install in $rel"
-    out="$("$bin" install --no-interaction --no-progress --working-dir="$dir" </dev/null 2>&1)"; rc=$?
+    # Bounded: a hung install (a dead mirror, a stuck network) would otherwise hold this MODE's lock
+    # and stall every later tick.
+    out="$(timeout "$secs" "$bin" "${args[@]}" --working-dir="$dir" </dev/null 2>&1)"; rc=$?
     [ -n "$out" ] && printf '%s\n' "$out" | tail -n 20 | sed 's/^/    | /' | tee -a "$LOG" >&2
+    if [ "$rc" -eq 124 ]; then
+      COMPOSER_WHY="composer install timed out after ${secs}s in $rel"
+      COMPOSER_EXCERPT="$(text_excerpt "$out")"
+      return 1
+    fi
     if [ "$rc" -ne 0 ]; then
       COMPOSER_WHY="composer install failed in $rel (exit $rc)"
       COMPOSER_EXCERPT="$(text_excerpt "$out")"
@@ -604,7 +625,7 @@ finish() { # pr outcome reason [provider output]
     requeue) relabel "$pr" "$CLAIM" "$TRIGGER"; comment "$pr" "Automated $MODE loop paused on this PR: $reason. It is back at $TRIGGER for a later tick.$said" ;;
   esac
   rm -f "$wt/$CONTEXT_FILE"
-  if git -C "$MAIN" worktree remove "$wt" >/dev/null 2>&1; then :; else log "#$pr: worktree $wt kept (uncommitted changes or busy); inspect and remove by hand"; fi
+  if git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1; then :; else log "#$pr: worktree $wt kept (uncommitted changes or busy); inspect and remove by hand"; fi
   rm -f "$STATE/classify-$sess.state" "$STATE/launch-$MODE-$pr.sh" "$STATE/agy-$MODE-$pr.rc" "$STATE/agy-$MODE-$pr.prompt" "$STATE/agy-$MODE-$pr.report"
   log "#$pr: $outcome ($reason)"
   [ -n "$detail" ] && printf '%s\n' "$detail" | sed 's/^/    | /' | tee -a "$LOG" >&2

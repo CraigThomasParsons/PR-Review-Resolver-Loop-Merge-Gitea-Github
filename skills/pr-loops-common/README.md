@@ -57,23 +57,29 @@ no `SKILL.md` on purpose.
 `pr-loop.sh` gives each PR a fresh detached worktree, which has no `vendor/`, so a PHP repo's gate
 (`composer test`, `vendor/bin/phpunit`, `pint`) cannot run there as checked out. After the
 worktree is added and before any worker starts (Claude or the Agy fallback), the loop runs
-`composer install --no-interaction --no-progress --working-dir=<dir>` once in every directory of
-the worktree that holds a `composer.lock`. `vendor/`, `node_modules/` and `.git` are not searched,
-since a lock there belongs to a dependency. A worktree with no `composer.lock` skips the step
-silently. Composer's output (last 20 lines per directory) goes to the loop log.
+`composer install --no-interaction --no-progress --no-scripts --no-plugins --working-dir=<dir>`
+once in every directory of the worktree that holds a `composer.lock`. `vendor/`, `node_modules/`
+and `.git` are not searched, since a lock there belongs to a dependency. A worktree with no
+`composer.lock` skips the step silently. Composer's output (last 20 lines per directory) goes to
+the loop log. Scripts and plugins are off by default because the PR's `composer.json` has not been
+reviewed yet, and they would run its code on the review host before any worker or deny list
+exists.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `PR_LOOP_COMPOSER_INSTALL` | `1` | `0` skips the step |
-| `PR_LOOP_COMPOSER_DIRS` | unset | Space-separated directories, relative to the worktree, to install in instead of discovering them. Each must hold a `composer.lock`. |
+| `PR_LOOP_COMPOSER_DIRS` | unset | Space-separated directories, relative to the worktree, to install in instead of discovering them. Each must hold a `composer.lock`; an absolute path or one with a `..` component is refused. |
 | `PR_LOOP_COMPOSER_BIN` | `composer` | The binary to run (the tests use a stub) |
+| `PR_LOOP_COMPOSER_TIMEOUT` | `600` | Seconds one directory's install may run before `timeout` kills it |
+| `PR_LOOP_COMPOSER_ALLOW_SCRIPTS` | `0` | `1` drops `--no-scripts --no-plugins` |
 
-The PR stops when an install exits non-zero, when a lock exists but the composer binary is not on
-PATH, or when a directory named in `PR_LOOP_COMPOSER_DIRS` has no lock. Installing stops at the
-first failure. The loop then logs the reason, moves the PR from its claim label to
+The PR stops when an install exits non-zero or times out, when a lock exists but the composer
+binary is not on PATH, or when an entry in `PR_LOOP_COMPOSER_DIRS` is absolute, contains `..`, or
+has no lock. Installing stops at the first failure. The loop then logs the reason, moves the PR from its claim label to
 `review:needs-human` with a comment giving the reason (for example
 `composer install failed in apps/game (exit 2)`) and an excerpt of composer's output, and removes
-the worktree. No worker is started, and the PR's slot goes to the next one in the queue. Dry runs
+the worktree. Worktrees are removed with `--force` whatever the outcome, since an installed
+`vendor/` that the repo does not ignore would otherwise keep every one of them. No worker is started, and the PR's slot goes to the next one in the queue. Dry runs
 never create a worktree, so they never install.
 
 TODO: resolve has no fallback provider. Agy has no tool deny list, so the agent pool never lets it
