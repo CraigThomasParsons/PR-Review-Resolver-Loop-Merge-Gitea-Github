@@ -136,7 +136,7 @@ if command -v systemd-analyze > /dev/null 2>&1; then
     "$V/agent-pool-doctor.timer" "$V/agent-pool-doctor.service" 2>&1)"
   rc=$?
   ours="$(grep -E 'agent-pool' <<< "$out" || true)"
-  if [ "$rc" -ne 0 ] && grep -qiE 'connect|bus|no such file or directory.*(runtime|bus)' <<< "$out" && [ -z "$ours" ]; then
+  if [ "$rc" -ne 0 ] && grep -qiE 'connect|bus|no such file or directory.*(runtime|bus)|failed to initialize manager' <<< "$out" && [ -z "$ours" ]; then
     echo "  skip  systemd-analyze could not reach a user manager here: $(head -1 <<< "$out")"
   else
     expect "systemd-analyze verify accepts the units" "$rc" "0"
