@@ -19,7 +19,9 @@ Operator setup, prerequisites, and cron are in
    included), and any PR whose head already carries a review marker.
 3. For up to `MAX_PARALLEL` (default 2) of them: flips the label to `review:in-progress`, makes a
    detached worktree at the PR head under `<parent of the clone>/.prloop-worktrees/prloop-review-<n>`,
-   starts a tmux session `prloop-review-<n>` running `claude --permission-mode auto` with a
+   runs `composer install` in each directory of it that holds a `composer.lock` (a failure sends
+   the PR to `review:needs-human` with composer's output and starts no worker; see
+   `pr-loops-common/README.md` for `PR_LOOP_COMPOSER_*`), then starts a tmux session `prloop-review-<n>` running `claude --permission-mode auto` with a
    read-only allow list and a deny list (no merge, no force-push, no reset, no label edits),
    pastes the worker prompt, and waits for the sentinel `PR_REVIEW_DONE`.
 4. Verifies with `tea` + the Gitea adapter, not with the worker's word: the newest PR comment must end with
