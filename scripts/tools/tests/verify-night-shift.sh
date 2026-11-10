@@ -17,7 +17,7 @@ cleanup() {
 trap cleanup EXIT
 export HOME="$TMP/home"
 mkdir -p "$HOME"
-unset GITEA_TOKEN NIGHT_CREW_TASK_RECEIPT http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY
+unset GITEA_TOKEN NIGHT_CREW_TASK_RECEIPT GIT_CONFIG_COUNT http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
 export GIT_CONFIG_GLOBAL="$TMP/gitconfig"
@@ -45,13 +45,19 @@ for _ in $(seq 1 50); do [ -s "$GITEA/port" ] && break; sleep 0.1; done
 export GITEA_BASE_URL="http://127.0.0.1:$(cat "$GITEA/port")"
 printf '{"number": 7, "title": "Add a widget", "body": "Make `widget.txt`. $(touch /tmp/never) Gate: bash agent-pool/tests/verify-widget.sh; not ../../etc/verify-x.sh"}' > "$GITEA/issue.json"
 
-# Stub cursor-agent: records its argv and the cli.json it was given, then acts per STUB_MODE.
+# Stub cursor-agent: records its argv, the cli.json it was given, which controller variables it
+# inherited, whether the run lock's fd 9 is open and whether it can push, then acts per STUB_MODE.
 STUB="$TMP/bin/cursor-agent"
 mkdir -p "$TMP/bin"
 cat > "$STUB" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$STUB_STATE/argv"
 cp .cursor/cli.json "$STUB_STATE/cli.json" 2>/dev/null
+for name in GITEA_TOKEN NIGHT_SHIFT_GITEA_TOKEN_FILE NIGHT_CREW_TASK_RECEIPT; do
+  [ -n "${!name+x}" ] && echo "$name"
+done > "$STUB_STATE/env"
+if { : >&9; } 2>/dev/null; then echo open; else echo closed; fi > "$STUB_STATE/fd9"
+if git push -q origin HEAD:refs/heads/worker-push-probe >/dev/null 2>&1; then echo pushed; else echo refused; fi > "$STUB_STATE/push"
 echo '{"type":"system","subtype":"init"}'
 case "${STUB_MODE:-edit}" in
   # The worker is edit-only: it writes files and never stages or commits (workercommit aside).
@@ -279,8 +285,12 @@ drop_issue 7
 echo
 echo "success"
 RECEIPT="$TMP/receipts/job-1.json"
-NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=edit run "$PROJECT" 7
+GITEA_TOKEN="$SECRET" NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=edit run "$PROJECT" 7
 same "success (with a denied commit along the way) -> exit 0" "$CODE" 0
+same "the worker inherits no Gitea token, token file or task receipt variable" "$(tr '\n' ' ' < "$STUB_STATE/env")" ""
+same "the worker does not inherit the run lock's fd 9" "$(cat "$STUB_STATE/fd9")" closed
+same "a git push from the worker fails" "$(cat "$STUB_STATE/push")" refused
+same "nothing the worker pushed reached the remote" "$(remote_has_branch worker-push-probe)" no
 same "branch pushed by the launcher" "$(remote_has_branch feature/7-nightcrew)" yes
 same "one PR opened" "$(created_count)" 1
 pr_fields="$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readline()); print(b["head"], b["base"], b["title"], "Closes #7" in b["body"])' "$GITEA/created.jsonl")"
