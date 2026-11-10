@@ -225,8 +225,8 @@ class Doctor:
         if doc is None:
             # The records were read before the listing; a tick may have claimed it since.
             fresh = poolstate.load(self.state / "claims" / f"{poolstate.slug(repo)}__{pr}.json")
-            if isinstance(fresh, dict) and fresh:
-                doc = fresh
+            if fresh is not None:
+                doc = fresh if isinstance(fresh, dict) and fresh else {"_unreadable": True}
         if doc is not None:
             entry.update(attempt=doc.get("attempt_id", ""), provider=doc.get("provider", ""),
                          worker_id=doc.get("worker_id", ""), deadline=doc.get("expected_deadline_at", ""))
