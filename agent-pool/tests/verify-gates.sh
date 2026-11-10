@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Offline cases for agent-pool/scripts/gates.py, issue #14, docs/plans/controller-gates.md:
 # the pinned manifest (load/validate/select/protected), the diff and receipt helpers the
-# controller uses, and the sandboxed runner (`run`). The runner's real-sandbox cases need an
-# unprivileged bwrap and a systemd user manager; without them (or with
-# AGENT_POOL_TEST_REAL_SANDBOX=0) they are reported as SKIP and counted, never passed. They talk
+# controller uses, the sandboxed runner (`run`), and `report.py sanitize` for its logs. The
+# runner's real-sandbox cases need an unprivileged bwrap and a systemd user manager; without them
+# (or with AGENT_POOL_TEST_REAL_SANDBOX=0) each is reported as "SKIP (bwrap missing)" and counted
+# in the summary line, never passed. They talk
 # only to a loopback listener this script opens and to fixture credentials in a temp HOME.
 # The MemoryMax case deliberately OOM-kills a scope (desktop low-memory notification), so it
 # is SKIP unless AGENT_POOL_TEST_OOM=1.
@@ -21,7 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pass=0; fail=0; skipped=0
+pass=0; fail=0; skipped=0; sandbox_skipped=0
 expect() { # name got wanted-substring
   if [[ "$2" == *"$3"* ]]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
   else fail=$((fail+1)); printf '  FAIL  %s\n         wanted *%s*\n         got %s\n' "$1" "$3" "$2"; fi
@@ -336,6 +337,40 @@ expect "and the gate marker before the resolve marker" "${body%%pulse-resolve*}"
 expect "keeping the resolve marker as the last line" "$(tail -1 "$TMP/report.gated")" "pulse-resolve:v1 head=$H1"
 expect "keeping the worker's text" "$body" "Fixed: 1"
 
+# ---------------------------------------------------------------- report.py sanitize
+echo "report.py sanitize redacts token-shaped lines and rewrites host paths"
+REPORT="$ROOT/agent-pool/scripts/report.py"
+SANHOME="$TMP/sanhome"; SANSTATE="$SANHOME/.local/state/agent-pool"; SANGD="$SANSTATE/gate-work/owner_repo__7"
+mkdir -p "$SANGD"
+cat > "$TMP/gate-raw.log" <<EOF
+Compiling $SANGD/src/App.tsx
+GITEA_TOKEN=abcdef0123456789abcdef0123
+-----BEGIN OPENSSH PRIVATE KEY-----
+echo live-fixture-token-value
+error in $SANSTATE/runs/gate.log
+cache at $SANHOME/.npm/_cacache
+a sibling $SANHOME-other/file is not home
+3 tests failed
+EOF
+out="$(env HOME="$SANHOME" AGENT_POOL_STATE="$SANSTATE" GITEA_TOKEN=live-fixture-token-value \
+  python3 "$REPORT" sanitize --file "$TMP/gate-raw.log" --gate-dir "$SANGD" 2>&1)"; rc=$?
+expect "sanitize exits 0" "$rc" "0"
+expect "a token-shaped line is redacted" "$out" "[redacted: token-shaped]"
+expect_not "and its value is gone" "$out" "abcdef0123456789abcdef0123"
+expect_not "a private key header is gone" "$out" "BEGIN OPENSSH"
+expect_not "the live token is gone" "$out" "live-fixture-token-value"
+expect "the gate's work dir becomes /work" "$out" "Compiling /work/src/App.tsx"
+expect "the state dir becomes <state>" "$out" "error in <state>/runs/gate.log"
+expect "the home dir becomes <home>" "$out" "cache at <home>/.npm/_cacache"
+expect "a path that only starts with home's name is not mangled" "$out" "a sibling $SANHOME-other/file"
+expect_not "and no path under home survives" "$out" "$SANHOME/"
+expect "an ordinary line is kept" "$out" "3 tests failed"
+expect "one output line per input line" "$(printf '%s\n' "$out" | wc -l)" "8"
+expect "the input file itself is left alone" "$(cat "$TMP/gate-raw.log")" "abcdef0123456789abcdef0123"
+out="$(python3 "$REPORT" sanitize --file "$TMP/no-such.log" 2>&1)"; rc=$?
+expect "a missing file is an error, not a traceback" "$rc" "2"
+expect_not "without crashing" "$out" "Traceback"
+
 # ---------------------------------------------------------------- run: refusals before any sandbox
 echo "run fails closed (infra) before running anything"
 FAKEHOME="$TMP/fakehome"
@@ -418,12 +453,16 @@ try: socket.create_connection(("127.0.0.1", $(cat "$TMP/port")), timeout=2); pri
 except OSError as e: print("NET=blocked", e)' ;;
   write) touch "$TMP/outside-write" 2>/dev/null && echo OUTSIDE=wrote
          echo x > /work/inside && echo INSIDE=wrote
-         touch /usr/gate-write 2>/dev/null && echo USR=wrote ;;
+         echo t > /tmp/scratch && echo TMP=wrote
+         touch /usr/gate-write 2>/dev/null && echo USR=wrote
+         touch /etc/gate-write 2>/dev/null && echo ETC=wrote
+         touch /gate-write 2>/dev/null && echo ROOT=wrote ;;
   both)  echo out-1; echo err-1 >&2; echo out-2; echo err-2 >&2 ;;
   argv)  shift; printf 'ARG=%s\n' "\$@" ;;
   sleep) sleep 30 ;;
   hog)   exec python3 -c "x = b'a' * (300 * 1024 * 1024); import time; time.sleep(2)" ;;
   fail)  echo "red"; exit 3 ;;
+  notool) exec no-such-toolchain-binary ;;
 esac
 exit 0
 SH
@@ -433,6 +472,9 @@ SH
   gate_manifest '["just", "env"]'
   out="$(run_gate env)"
   expect "a gate that only reads its env passes" "$out" '"result": "pass"'
+  expect "its per-gate record has the exit code" "$(cat "$TMP/runs/gate-env-g.json")" '"exit_code": 0'
+  expect "and its duration" "$(cat "$TMP/runs/gate-env-g.json")" '"secs": '
+  expect "and says no kill fired" "$(cat "$TMP/runs/gate-env-g.json")" '"kill": null'
   expect_not "it never sees the Gitea token" "$(log_of env)" "GITEA_TOKEN"
   expect_not "nor its value" "$(log_of env)" "fixture-gitea-token"
   expect_not "nor the ssh agent socket" "$(log_of env)" "SSH_AUTH_SOCK"
@@ -453,11 +495,16 @@ SH
   out="$(run_gate write)"
   expect "a write outside /work never reaches the host" "$([ -e "$TMP/outside-write" ] && echo wrote || echo absent)" "absent"
   expect_not "/usr is read-only" "$(log_of write)" "USR=wrote"
+  expect_not "/etc is read-only" "$(log_of write)" "ETC=wrote"
+  expect_not "the sandbox root is read-only" "$(log_of write)" "ROOT=wrote"
   expect "the gate checkout itself is writable" "$(cat "$TMP/gd/inside" 2>/dev/null)" "x"
+  expect "and so is the sandbox's own /tmp" "$(log_of write)" "TMP=wrote"
 
   gate_manifest '["just", "both"]'
   out="$(run_gate both)"
   expect "both fds go to one log in arrival order" "$(log_of both | tr '\n' '|')" "out-1|err-1|out-2|err-2|"
+  expect_not "with no 2>&1 anywhere in the runner" "$(cat "$GATES")" "2>&1"
+  expect_not "nor in the gate's argv" "$(cat "$TMP/run-manifest.json")" "2>&1"
 
   gate_manifest '["just", "argv", "$HOME", "${GITEA_TOKEN}"]'
   out="$(run_gate argv)"
@@ -474,6 +521,7 @@ SH
   expect "a gate past its timeout is gate-timeout" "$out" '"result": "gate-timeout"'
   expect "after its own timeout" "$out" "timed out after 3s"
   expect "promptly" "$([ "$took" -lt 15 ] && echo prompt || echo "slow ${took}s")" "prompt"
+  expect "its record says the timeout fired" "$(cat "$TMP/runs/gate-sleep-g.json")" '"kill": "timeout'
 
   # Deliberately OOM-kills a capped scope, which makes desktops pop a "system is low on
   # memory" notification. Opt in with AGENT_POOL_TEST_OOM=1 (issue #56).
@@ -481,6 +529,7 @@ SH
     gate_manifest '["just", "hog"]'
     out="$(run_gate hog)"
     expect "a gate over MemoryMax is gate-resource" "$out" '"result": "gate-resource"'
+    expect "its record says a resource kill fired" "$(cat "$TMP/runs/gate-hog-g.json")" '"kill": "resource"'
   else
     skipped=$((skipped + 1)); printf '  SKIP  a gate over MemoryMax is gate-resource: set AGENT_POOL_TEST_OOM=1 to run (it OOM-kills a scope on purpose)\n'
   fi
@@ -488,6 +537,13 @@ SH
   gate_manifest '["vendor/bin/phpunit"]'
   out="$(run_gate missing)"
   expect "a runner that is not in the tree is infra, not a gate failure" "$out" '"result": "infra"'
+  expect "after trying it in the sandbox (a per-gate record exists)" "$(cat "$TMP/runs/gate-missing-g.json" 2>/dev/null)" '"exit_code": '
+
+  gate_manifest '["just", "notool"]'
+  out="$(run_gate notool)"
+  expect "a toolchain binary missing inside the sandbox is infra" "$out" '"result": "infra"'
+  expect "from the child's exit 127" "$(cat "$TMP/runs/gate-notool-g.json")" '"exit_code": 127'
+  expect "naming it as a missing toolchain" "$out" "exited 127: the toolchain is not available inside the sandbox"
   if [ ! -e /usr/bin/just ] && [ ! -e /bin/just ]; then
     gate_manifest '["just", "env"]'
     out="$(run_gate nopath AGENT_POOL_GATE_RO_BINDS=)"
@@ -510,8 +566,29 @@ SH
   out="$(BUDGET=2 run_gate locked)"
   expect "the host-wide gate lock's wait counts against the budget" "$out" "ran out waiting for the host-wide gate lock"
 else
-  skipped=$((skipped + 1)); printf '  SKIP  real sandbox cases: %s\n' "$why"
+  for case in "the gate sees no fixture HOME, ssh key, SSH_AUTH_SOCK or GITEA_TOKEN" \
+              "a host loopback listener is unreachable (no network)" \
+              "a write outside /work and /tmp fails" \
+              "stdout and stderr share one log in arrival order" \
+              "argv reaches the gate unexpanded" \
+              "a gate exiting non-zero is gate-fail" \
+              "a gate past its timeout is gate-timeout" \
+              "a gate over MemoryMax is gate-resource" \
+              "a missing argv[0] is infra (127)" \
+              "a bwrap that cannot start is infra" \
+              "the gate budget and the host-wide gate lock"; do
+    sandbox_skipped=$((sandbox_skipped + 1)); printf '  SKIP (bwrap missing)  %s: %s\n' "$case" "$why"
+  done
+  skipped=$((skipped + sandbox_skipped))
 fi
 
-printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skipped"
+if [ "${AGENT_POOL_TEST_REAL_SANDBOX:-1}" != 0 ]; then
+  echo "without a usable sandbox the suite skips the sandbox cases, never passes them"
+  out="$(AGENT_POOL_TEST_REAL_SANDBOX=0 bash "$ROOT/agent-pool/tests/verify-gates.sh" 2>&1)"; rc=$?
+  expect "it still exits 0" "$rc" "0"
+  expect "printing SKIP (bwrap missing) per case" "$out" "SKIP (bwrap missing)  a host loopback listener is unreachable"
+  expect "with the skip count in the summary line" "$(printf '%s\n' "$out" | tail -1)" "0 failed, 11 skipped (11 of them: bwrap missing)"
+fi
+
+printf '\n%d passed, %d failed, %d skipped (%d of them: bwrap missing)\n' "$pass" "$fail" "$skipped" "$sandbox_skipped"
 [ "$fail" -eq 0 ]

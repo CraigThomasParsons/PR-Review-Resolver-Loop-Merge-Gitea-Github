@@ -15,6 +15,12 @@ Usage:
   report.py stamp-head --file R --head NEWHEAD
                                   rewrite head=pending in R's resolve marker to head=NEWHEAD, in
                                   place; exit 1 if R has no pending resolve marker
+  report.py sanitize --file F [--gate-dir D] [--state S]
+                                  print F (a gate log) fit to post: every line `scan` would flag
+                                  becomes "[redacted: token-shaped]", and the gate dir D, the
+                                  state dir S (default $AGENT_POOL_STATE or
+                                  ~/.local/state/agent-pool) and $HOME become /work, <state> and
+                                  <home>; F itself is left alone
 
 Prints "ok<TAB><head><TAB><fixed>" when the report carries a marker the loop can verify
 (review: a pulse-review marker naming S; resolve: a pulse-resolve marker whose reviewed= is H,
@@ -40,6 +46,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from typing import Callable
 
 # Bare 40-hex is deliberately absent: commit SHAs have the same shape. The live token is matched
 # exactly instead.
@@ -64,6 +71,7 @@ PENDING = re.compile(r"(?<!\S)head=pending(?!\S)")
 PENDING_STANDIN = "0" * 40
 SUMMARY = re.compile(r"^Summary:[ \t]*(.+?)[ \t]*$", re.M)
 SUMMARY_MAX = 100
+REDACTED = "[redacted: token-shaped]"
 
 
 def live_tokens() -> list[str]:
@@ -176,10 +184,39 @@ def stamp_head(path: str, head: str) -> int:
     return 0
 
 
+def host_paths(gate_dir: str, state: str) -> Callable[[str], str]:
+    """A rewriter for every form of the host paths to hide, longest first so the gate dir wins
+    over the state dir and home it usually sits under. A match must end at a path boundary:
+    /home/craig must not eat the start of /home/craigpar."""
+    home = str(Path.home())
+    state = state or os.environ.get("AGENT_POOL_STATE") or os.path.join(home, ".local/state/agent-pool")
+    labels: dict[str, str] = {}
+    for path, label in ((gate_dir, "/work"), (state, "<state>"), (home, "<home>")):
+        if not path:
+            continue
+        for form in (os.path.abspath(path), os.path.realpath(path)):
+            form = form.rstrip("/")
+            if form and form not in labels:
+                labels[form] = label
+    if not labels:
+        return lambda text: text
+    ordered = sorted(labels, key=len, reverse=True)
+    rx = re.compile("(" + "|".join(re.escape(p) for p in ordered) + r")(?![\w.-])")
+    return lambda text: rx.sub(lambda m: labels[m.group(1)], text)
+
+
+def sanitize(body: str, rewrite: Callable[[str], str]) -> str:
+    out = []
+    for line in body.splitlines(keepends=True):
+        text = line.rstrip("\r\n")
+        out.append((REDACTED if leaks_secret(text) else rewrite(text)) + line[len(text):])
+    return "".join(out)
+
+
 def main() -> int | None:
     p = argparse.ArgumentParser()
     p.add_argument("job", choices=["review", "resolve", "plan", "prototype", "test-author", "scan", "summary",
-                                   "stamp-head"])
+                                   "stamp-head", "sanitize"])
     p.add_argument("--marker-module")
     p.add_argument("--file", required=True)
     p.add_argument("--sha", default="")
@@ -187,9 +224,19 @@ def main() -> int | None:
     p.add_argument("--findings", type=int)
     p.add_argument("--head", default="")
     p.add_argument("--fallback", default="")
+    p.add_argument("--gate-dir", default="")
+    p.add_argument("--state", default="")
     a = p.parse_args()
     if a.job == "stamp-head":
         return stamp_head(a.file, a.head)
+    if a.job == "sanitize":
+        try:
+            body = Path(a.file).read_text(errors="replace")
+        except OSError as error:
+            print(f"sanitize: cannot read {a.file}: {error.strerror}", file=sys.stderr)
+            return 2
+        sys.stdout.write(sanitize(body, host_paths(a.gate_dir, a.state)))
+        return 0
     try:
         body = open(a.file, errors="replace").read()
     except OSError:

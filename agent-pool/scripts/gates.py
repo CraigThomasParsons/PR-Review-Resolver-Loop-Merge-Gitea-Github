@@ -489,7 +489,9 @@ def sandbox_argv(tools: dict[str, str], limits: dict, seconds: int, status_fd: i
     cmd += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home", "--dir", SANDBOX_HOME]
     for bind in binds:
         cmd += ["--ro-bind", bind, bind]
-    cmd += ["--bind", gate_dir, "/work", "--chdir", posixpath.join("/work", cwd) if cwd else "/work"]
+    # bwrap's own root is a writable tmpfs; only /work, /tmp and the tmpfs home stay writable.
+    cmd += ["--bind", gate_dir, "/work", "--remount-ro", "/",
+            "--chdir", posixpath.join("/work", cwd) if cwd else "/work"]
     env = {"HOME": SANDBOX_HOME, "PATH": ":".join(_gate_path(binds)), "CI": "1", "LANG": "C.UTF-8",
            "TERM": "dumb", "TMPDIR": "/tmp", "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "DOTNET_NOLOGO": "1"}
     for key, value in env.items():
@@ -537,23 +539,29 @@ def _log_tail(path: Path) -> str:
     return lines[-1][:200] if lines else ""
 
 
-def classify(rc: int, status: dict, elapsed: float, seconds: int, hard_killed: bool, tail: str) -> tuple[str, str]:
+def classify(rc: int, status: dict, elapsed: float, seconds: int, hard_killed: bool,
+             tail: str) -> tuple[str, str, str | None]:
+    """(result, reason, kill): kill is which kill fired, if any -- "timeout" (timeout's TERM),
+    "timeout-kill" (the KILL after the -k grace, or the runner's own last resort) or "resource"."""
     if "child-pid" not in status:
-        return "infra", f"the sandbox did not start (exit {rc}): {tail or 'no output'}"
-    if hard_killed or rc == 124 or (rc in (137, -9) and elapsed >= seconds):
-        return "gate-timeout", f"timed out after {seconds}s"
+        return "infra", f"the sandbox did not start (exit {rc}): {tail or 'no output'}", None
+    if rc == 124 and not hard_killed:
+        return "gate-timeout", f"timed out after {seconds}s", "timeout"
+    if hard_killed or (rc in (137, -9) and elapsed >= seconds):
+        return "gate-timeout", f"timed out after {seconds}s", "timeout-kill"
     code = status.get("exit-code")
     if code is None:
         if rc < 0 or rc in (137, 143):
-            return "gate-resource", f"was killed by signal {abs(rc) if rc < 0 else rc - 128} (likely its memory or task limit)"
-        return "infra", f"the sandbox failed after it started (exit {rc}): {tail or 'no output'}"
+            return ("gate-resource", f"was killed by signal {abs(rc) if rc < 0 else rc - 128} "
+                    "(likely its memory or task limit)", "resource")
+        return "infra", f"the sandbox failed after it started (exit {rc}): {tail or 'no output'}", None
     if code in (126, 127):
-        return "infra", f"exited {code}: the toolchain is not available inside the sandbox"
+        return "infra", f"exited {code}: the toolchain is not available inside the sandbox", None
     if code == 137:
-        return "gate-resource", "was killed (likely its memory or task limit)"
+        return "gate-resource", "was killed (likely its memory or task limit)", "resource"
     if code != 0:
-        return "gate-fail", f"exited {code}"
-    return "pass", ""
+        return "gate-fail", f"exited {code}", None
+    return "pass", "", None
 
 
 def _runner_found(argv0: str, binds: list[str]) -> bool:
@@ -568,7 +576,7 @@ def run_one(gate: dict, limits: dict, seconds: int, gate_dir: str, binds: list[s
     stem = runs / f"gate-{tag}-{poolstate.slug(name)}"
     log_path, status_path = Path(f"{stem}.log"), Path(f"{stem}.status")
     record = {"name": name, "argv": gate["argv"], "cwd": gate.get("cwd", ""), "rc": None,
-              "exit_code": None, "secs": 0, "result": "", "reason": "", "log": log_path.name}
+              "exit_code": None, "secs": 0, "kill": None, "result": "", "reason": "", "log": log_path.name}
     if not _runner_found(gate["argv"][0], binds):
         record.update(result="infra", reason=f"gate {name!r}: {gate['argv'][0]!r} is not on the sandbox PATH "
                                              "(add its toolchain to AGENT_POOL_GATE_RO_BINDS)")
@@ -595,12 +603,13 @@ def run_one(gate: dict, limits: dict, seconds: int, gate_dir: str, binds: list[s
     elapsed = time.monotonic() - started
     _cap_log(log_path)
     status = _read_status(status_path)
-    result, reason = classify(rc, status, elapsed, seconds, hard_killed, _log_tail(log_path))
+    result, reason, kill = classify(rc, status, elapsed, seconds, hard_killed, _log_tail(log_path))
     if result == "infra":
         reason = f"gate {name!r}: {reason}"
     elif result != "pass":
         reason = f"gate {name!r} {reason}"
-    record.update(rc=rc, exit_code=status.get("exit-code"), secs=round(elapsed), result=result, reason=reason)
+    record.update(rc=rc, exit_code=status.get("exit-code"), secs=round(elapsed), kill=kill, result=result,
+                  reason=reason)
     poolstate.save(Path(f"{stem}.json"), record)
     return record
 
