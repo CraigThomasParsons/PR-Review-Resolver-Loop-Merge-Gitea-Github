@@ -53,7 +53,38 @@ cat > "$STUB" <<'SH'
 printf '%s\n' "$@" > "$STUB_STATE/argv"
 cp .cursor/cli.json "$STUB_STATE/cli.json" 2>/dev/null
 echo '{"type":"system","subtype":"init"}'
+# plant: the worker's edit plus a verify suite (body on stdin) that the launcher's own test run
+# executes after the worker exited and its commit check passed, before the push.
+plant() {
+  echo widget > widget.txt
+  { printf '#!/usr/bin/env bash\nset -e\n'
+    echo 'export GIT_AUTHOR_NAME=w GIT_AUTHOR_EMAIL=w@example.invalid GIT_COMMITTER_NAME=w GIT_COMMITTER_EMAIL=w@example.invalid'
+    cat; } > agent-pool/tests/verify-sneak.sh
+  echo '{"type":"result","subtype":"success","result":"done"}'
+}
 case "${STUB_MODE:-edit}" in
+  historyenv) plant <<'SUITE' ;;
+scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
+GIT_INDEX_FILE="$scratch/index" git read-tree HEAD
+blob="$(echo "TOKEN=x" | git hash-object -w --stdin)"
+GIT_INDEX_FILE="$scratch/index" git update-index --add --cacheinfo "100644,$blob,.env"
+added="$(git commit-tree "$(GIT_INDEX_FILE="$scratch/index" git write-tree)" -p HEAD -m "add env")"
+git update-ref HEAD "$(git commit-tree "HEAD^{tree}" -p "$added" -m "remove env")"
+SUITE
+  historymsg) plant <<'SUITE' ;;
+git update-ref HEAD "$(git commit-tree "HEAD^{tree}" -p HEAD -m "note gh""p_$(printf '%036d' 7)")"
+SUITE
+  historyrewrite) plant <<'SUITE' ;;
+git update-ref HEAD "$(git commit-tree "HEAD^{tree}" -m "rewritten")"
+SUITE
+  hooks) echo widget > widget.txt
+    hooks="$(git rev-parse --git-path hooks)"; mkdir -p "$hooks"
+    for hook in pre-push pre-commit; do
+      printf '#!/usr/bin/env bash\ntouch "%s/hook-ran"\ngit push -q --no-verify origin HEAD:refs/heads/hook-leak\nexit 1\n' \
+        "$STUB_STATE" > "$hooks/$hook"
+      chmod +x "$hooks/$hook"
+    done
+    echo '{"type":"result","subtype":"success","result":"done"}' ;;
   # The worker is edit-only: it writes files and never stages or commits (workercommit aside).
   edit) echo widget > widget.txt
     echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"git commit -m \"add widget\""}}}}}'
@@ -97,7 +128,8 @@ SEED="$TMP/seed"
 mkdir -p "$SEED/scripts/tools" "$SEED/agent-pool/scripts" "$SEED/agent-pool/tests" "$SEED/skills/pr-loops-common"
 cp "$ROOT/scripts/tools/night_shift.sh" "$ROOT/scripts/tools/night_shift_maintenance.sh" \
   "$ROOT/scripts/tools/night_shift_gitea.py" "$SEED/scripts/tools/"
-cp "$ROOT/agent-pool/scripts/policy.py" "$ROOT/agent-pool/scripts/classify.py" "$SEED/agent-pool/scripts/"
+cp "$ROOT/agent-pool/scripts/policy.py" "$ROOT/agent-pool/scripts/classify.py" "$ROOT/agent-pool/scripts/report.py" \
+  "$SEED/agent-pool/scripts/"
 cp "$ROOT/AGENTS.md" "$SEED/"
 printf '#!/usr/bin/env bash\n[ -z "${AGENT_POOL_MAIN:-}" ]\n' > "$SEED/agent-pool/tests/verify-ok.sh"
 touch "$SEED/skills/pr-loops-common/gitea-pr.py"
@@ -596,6 +628,35 @@ same "the park is recorded" "$(state_of 19)" "parked limit"
 same "nothing committed for a parked run whose suites fail" "$(on_base 19)" yes
 same "its edits are kept in the worktree" "$(cat "$PROJECT/logs/worktrees/issue-19/edited.txt" 2>/dev/null)" edited
 drop_issue 19
+
+echo
+echo "pre-push checks cover the whole history the push would publish"
+before="$(created_count)"
+STUB_MODE=historyenv run "$PROJECT" 21
+same "a .env added in one commit and removed in a later one -> exit 1" "$CODE" 1
+same "it is recorded as a forbidden path" "$(state_of 21)" "failed forbidden-path"
+same "nothing pushed for a credential file in the history" "$(remote_has_branch feature/21-nightcrew)" no
+drop_issue 21
+STUB_MODE=historymsg run "$PROJECT" 22
+same "a token-shaped string in a commit message -> exit 1" "$CODE" 1
+same "it is recorded as a leaked secret" "$(state_of 22)" "failed secret-in-history"
+same "nothing pushed for a token in a commit message" "$(remote_has_branch feature/22-nightcrew)" no
+drop_issue 22
+STUB_MODE=historyrewrite run "$PROJECT" 24
+same "a history that no longer descends from the run's start -> exit 1" "$CODE" 1
+same "it is recorded as a rewritten history" "$(state_of 24)" "failed history-rewritten"
+same "nothing pushed for a rewritten history" "$(remote_has_branch feature/24-nightcrew)" no
+drop_issue 24
+same "no PR opened for any of them" "$(created_count)" "$before"
+rm -f "$STUB_STATE/hook-ran"
+STUB_MODE=hooks run "$PROJECT" 23
+rm -f "$PROJECT/.git/hooks/pre-push" "$PROJECT/.git/hooks/pre-commit"
+same "hooks the worker planted do not stop the launcher's commit or push -> exit 0" "$CODE" 0
+same "the planted hooks never ran" "$( [ -e "$STUB_STATE/hook-ran" ] && echo ran || echo none)" none
+same "nothing pushed by a planted hook" "$(remote_has_branch hook-leak)" no
+same "the branch is pushed from the project checkout" \
+  "$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/23-nightcrew 2>/dev/null)" "$(git -C "$PROJECT" rev-parse feature/23-nightcrew)"
+drop_issue 23
 
 echo
 echo "the launcher refuses a cli.json that is not edit-only"

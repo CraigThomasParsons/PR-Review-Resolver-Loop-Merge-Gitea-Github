@@ -126,6 +126,7 @@ WORKTREE="$LOG_DIR/worktrees/issue-${ISSUE_NUMBER}"
 WORKTREE_OWNED=0
 CONTEXT_FILE=""
 PR_BODY=""
+SCAN_FILE=""
 cleanup() {
   # Only a worktree this run created: a leftover one an abort refused to touch is kept for a human.
   if [ "$WORKTREE_OWNED" = 1 ] && [ -d "$WORKTREE" ]; then
@@ -140,6 +141,7 @@ cleanup() {
   fi
   [ -n "$CONTEXT_FILE" ] && rm -f "$CONTEXT_FILE"
   [ -n "$PR_BODY" ] && rm -f "$PR_BODY"
+  [ -n "$SCAN_FILE" ] && rm -f "$SCAN_FILE"
   rm -f "$SHIFT_LOCK"
 }
 trap cleanup EXIT
@@ -355,7 +357,8 @@ commit_edits() {
   fi
   run_tests || return 3
   log "committing the worker's edits on ${BRANCH}: $(git -C "$WORKTREE" diff --cached --name-only | wc -l | tr -d ' ') file(s)"
-  git -C "$WORKTREE" commit -q -m "$COMMIT_SUBJECT" \
+  # Hooks live in the git directory the worker could write; none runs with the launcher's credentials.
+  git -C "$WORKTREE" -c core.hooksPath=/dev/null commit --no-verify -q -m "$COMMIT_SUBJECT" \
     -m "Edited by the ${AGENT} worker (model ${MODEL}) under the edit-only policy; scripts/tools/night_shift.sh committed the edits after the offline test suites passed." \
     -m "Agent-Pool-Agent: ${AGENT}"$'\n'"Agent-Pool-Provider: ${PROVIDER}" || return 4
 }
@@ -406,14 +409,31 @@ esac
 if [ -n "$(git -C "$WORKTREE" status --porcelain)" ]; then
   log "WARN worktree has uncommitted changes; only commits are published"
 fi
-FORBIDDEN="$(git -C "$WORKTREE" diff --name-only "origin/${BASE_BRANCH}...HEAD" | grep -Ei '(\.env|gitea_token|id_rsa|\.pem$)' || true)"
-if [ -n "$FORBIDDEN" ]; then
-  fail forbidden-path "ERROR the branch adds a credential-shaped filename; nothing published"
+# The worker's suites ran after its commit check, so the branch is checked again here, from the
+# project checkout: the push publishes every commit in the range, not just the net diff.
+HEAD_SHA="$(git -C "$PROJECT_DIR" rev-parse --verify -q "refs/heads/${BRANCH}^{commit}" || true)"
+if [ -z "$HEAD_SHA" ] || [ "$(git -C "$WORKTREE" symbolic-ref -q HEAD || true)" != "refs/heads/${BRANCH}" ] \
+  || [ "$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)" != "$HEAD_SHA" ]; then
+  fail head-mismatch "ERROR ${WORKTREE} is not on ${BRANCH} at ${HEAD_SHA:-nothing} in ${PROJECT_DIR}; nothing published"
+fi
+if ! git -C "$PROJECT_DIR" merge-base --is-ancestor "$START_SHA" "$HEAD_SHA"; then
+  fail history-rewritten "ERROR ${BRANCH} at ${HEAD_SHA} no longer descends from the run's start ${START_SHA}; nothing published"
+fi
+RANGE="origin/${BASE_BRANCH}..${HEAD_SHA}"
+CHANGED="$(git -C "$PROJECT_DIR" -c core.quotePath=false log --no-renames --diff-filter=AM --name-only --pretty=format: "$RANGE")"
+if grep -qEi '(\.env|gitea_token|id_rsa|\.pem$)|(^"?|/)\.(cursor|grok|claude)/' <<<"$CHANGED"; then
+  fail forbidden-path "ERROR a commit on ${BRANCH} adds a credential-shaped filename or tool configuration; nothing published"
+fi
+SCAN_FILE="$(mktemp "${TMPDIR:-/tmp}/night_shift_scan_${ISSUE_NUMBER}.XXXXXX")"
+git -C "$PROJECT_DIR" log --format=%B "$RANGE" > "$SCAN_FILE"
+git -C "$PROJECT_DIR" log -p --no-renames --no-ext-diff --no-textconv --format= "$RANGE" | sed -n '/^+++ /d; /^+/p' >> "$SCAN_FILE"
+if ! "$PYTHON_BIN" "$PROJECT_DIR/agent-pool/scripts/report.py" scan --file "$SCAN_FILE" >/dev/null; then
+  fail secret-in-history "ERROR a commit message or added line on ${BRANCH} contains a credential or token-shaped string; nothing published"
 fi
 
-HEAD_SHA="$(git -C "$WORKTREE" rev-parse HEAD)"
 log "publishing ${NEW_COMMITS} commit(s) at ${HEAD_SHA}"
-if ! git -C "$WORKTREE" push -q origin "HEAD:refs/heads/${BRANCH}"; then
+# From the project checkout with no hooks: nothing the worker wrote runs with the launcher's credentials.
+if ! git -C "$PROJECT_DIR" -c core.hooksPath=/dev/null push -q --no-verify origin "${HEAD_SHA}:refs/heads/${BRANCH}"; then
   fail push-rejected "ERROR push of ${BRANCH} rejected; commits stay on the local branch, nothing published"
 fi
 
