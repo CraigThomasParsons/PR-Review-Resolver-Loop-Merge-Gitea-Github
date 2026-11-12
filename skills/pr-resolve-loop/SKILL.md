@@ -18,14 +18,14 @@ Operator setup, prerequisites, and cron are in
    findings are stale: the PR goes back to `review:requested` and is not touched.
 3. For up to `MAX_PARALLEL` of them: relabels to `review:resolving`, makes a detached worktree at
    the head, runs `composer install` in each directory of it that holds a `composer.lock` so the
-   gate can run (a failure sends the PR to `review:needs-human` with composer's output and starts
+   gate can run (a failure sends the PR to `fail` with composer's output and starts
    no worker; see `pr-loops-common/README.md` for `PR_LOOP_COMPOSER_*`), then starts `prloop-resolve-<n>` running `claude --permission-mode auto` with the review
    allow list plus Edit/Write, `git add/commit`, `git push origin HEAD:*`, and the gate commands;
    the deny list still refuses merge, auto-merge, force-push, reset, branch deletion, and any
    `gh pr edit`. Pastes the worker prompt and waits for `PR_RESOLVE_DONE`.
 4. Verifies with `tea` + the Gitea adapter: the worker's `pulse-resolve:v1` marker must answer the review that
    triggered the run and account for every finding; a claimed fix must have moved the PR head as
-   a fast-forward. Then relabels `review:resolved`, or `review:needs-human` with a comment
+   a fast-forward. Then relabels `review:resolved`, or `fail` with a comment
    (findings deferred to a person, nothing pushed, non-fast-forward, timeout, stall, parked pane).
 5. Kills the session. Removes the worktree only if it is clean; a worktree with uncommitted work
    is left in place and named in the log so nothing is lost.
@@ -37,7 +37,7 @@ or resolves threads itself.
 Each finding ends up **fixed**, **noted** or **deferred** (marker
 `fixed= noted= deferred=`). Noted findings are suggestions and preferences that would be fine to
 merge as they are: they are listed for the author in the comment and do not block, so a PR with
-only fixed and noted findings reaches `review:resolved`. `review:needs-human` means at least one
+only fixed and noted findings reaches `review:resolved`. `fail` means at least one
 finding is **blocking** (a defect or contradiction the resolver could not fix safely, or a parity
 observation), and the comment's Blocking section says which.
 

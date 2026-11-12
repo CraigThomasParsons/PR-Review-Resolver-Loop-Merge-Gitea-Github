@@ -4,9 +4,9 @@ name: Label a brand-new PR for the review loop
 # from "up to an hour" (pr-pipeline.timer's cadence) to seconds.
 #
 # Scope is deliberately narrow: this only ever touches a PR that carries NO
-# review:* or agent:* label yet, i.e. one the pipeline has genuinely never
+# review:*, agent:* or fail label yet, i.e. one the pipeline has genuinely never
 # seen. Every other decision (refreshing a stale verdict after a new head,
-# granting review:automerge, handling review:needs-human/night:hold) stays
+# granting review:automerge, handling fail/night:hold) stays
 # with TheNightCrew's LabelPullRequests action (php artisan nightcrew:label-prs,
 # still running hourly via pr-pipeline.timer) so there is exactly one place
 # that owns those rules, not two that can disagree.
@@ -64,7 +64,7 @@ jobs:
             if (SKIP_TITLE_PATTERN.test(HEAD_REF || "")) skip(`branch matches the skip pattern: ${HEAD_REF}`);
 
             const existing = pr.labels.map((l) => l.name);
-            if (existing.some((name) => name.startsWith("review:") || name.startsWith("agent:") || name === "night:hold")) {
+            if (existing.some((name) => name.startsWith("review:") || name.startsWith("agent:") || name === "fail" || name === "night:hold")) {
               skip(`already labelled (${existing.join(", ")}); the pipeline already knows about this PR`);
             }
 

@@ -26,7 +26,7 @@ no `SKILL.md` on purpose.
   `review:findings`
 - `marker.py` reads the hidden `pulse-review:v1` and `pulse-resolve:v1` markers off a PR. A
   resolve marker counts each finding as `fixed`, `noted` (non-blocking, left for the author) or
-  `deferred` (blocking); only `deferred` sends a PR to `review:needs-human`
+  `deferred` (blocking); only `deferred` sends a PR to `fail`
 - `gitea-pr.py` the Gitea adapter (list, head, labels, state, label, comment, comments,
   threads, diff, merge)
 - `classify-pane.sh` classifies a worker pane (WORKING, BLOCKED, RATE_LIMITED, EXITED, PARKED,
@@ -82,7 +82,7 @@ only when there is something to install, so a worktree with no `composer.lock` i
 The PR stops when an install exits non-zero or times out, when a lock exists but the composer
 binary is not on PATH, or when an entry in `PR_LOOP_COMPOSER_DIRS` is absolute, contains `..`, or
 has no lock. Installing stops at the first failure. The loop then logs the reason, moves the PR from its claim label to
-`review:needs-human` with a comment giving the reason (for example
+`fail` with a comment giving the reason (for example
 `composer install failed in apps/game (exit 2)`) and an excerpt of composer's output, and removes
 the worktree. At the end of any run, a worktree whose only uncommitted files are untracked ones
 under the `vendor/` of a directory the loop installed in is removed with `--force`, so a `vendor/`

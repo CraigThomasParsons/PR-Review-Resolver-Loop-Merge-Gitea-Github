@@ -62,8 +62,11 @@ check() { # name expected
 
 echo "merge tick gates"
 write_marker "$SHA"
+write_adapter '["review:clean", "review:automerge", "fail"]' true
+check "fail wins" "no eligible open PR"
+
 write_adapter '["review:clean", "review:automerge", "review:needs-human"]' true
-check "needs-human wins" "no eligible open PR"
+check "a PR still on the old review:needs-human label stays blocked" "no eligible open PR"
 
 write_adapter '["review:clean"]' true
 check "missing automerge skips" "no eligible open PR"
@@ -142,7 +145,9 @@ write_adapter '["agent:done", "agent:prototype", "review:automerge"]' false
 : > "$TMP/label-calls.log"
 check "#31: a failed merge with a leftover ability label still fails closed" "FAILED: not mergeable"
 expect "#31: the failure relabel strips the ability labels too" \
-  "$(grep -- '--add review:needs-human' "$TMP/label-calls.log")" "agent:prototype"
+  "$(grep -- '--add fail' "$TMP/label-calls.log")" "agent:prototype"
+expect "a failed merge relabels to fail, never review:needs-human" \
+  "[$(grep -c -- 'review:needs-human' "$TMP/label-calls.log")]" "[0]"
 
 echo "#31: one label vocabulary across gitea-labels.py, pr-merge.sh and capabilities.py"
 POOL_SCRIPTS="$ROOT/../../agent-pool/scripts"
@@ -153,10 +158,12 @@ labels = importlib.util.module_from_spec(spec); spec.loader.exec_module(labels)
 sys.path.insert(0, sys.argv[2])
 import capabilities
 want = set(capabilities.ABILITY_LABELS) | {"agent:promote"}
+want.add("fail")
 print("missing:" + ",".join(sorted(want - set(labels.LABELS))))
+print("stale:" + ",".join(sorted({"review:needs-human"} & set(labels.LABELS))))
 PY
 )"
-expect "#31: gitea-labels.py LABELS carries every ability label and agent:promote" "[$vocab]" "[missing:]"
+expect "#31: gitea-labels.py LABELS carries every ability label, agent:promote and fail" "[$vocab]" "[missing:"$'\n'"stale:]"
 for l in "${ABILITY_LABELS[@]}"; do
   expect "#31: pr-merge.sh knows $l" "$(cat "$ROOT/pr-merge.sh")" "$l"
 done

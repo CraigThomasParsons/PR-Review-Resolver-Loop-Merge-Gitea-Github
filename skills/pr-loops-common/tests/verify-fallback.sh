@@ -239,7 +239,8 @@ expect "weekly limit: the review lands on review:findings" [ "$(labels)" = "revi
 expect "  ... from Agy's response, marker contract unchanged" has "$(comments)" "<!-- pulse-review:v1 head=$SHA findings=2 -->"
 expect "  ... posted as the whole comment, heading first" [ "$(comments | head -1)" = "## Automated review" ]
 expect "  ... with no generic no-marker failure" lacks "$(comments)" "no review comment carrying the marker"
-expect "  ... and no needs-human" lacks "$(labels)" "needs-human"
+expect "  ... and no fail" lacks ",$(labels)," ",fail,"
+expect "  ... nor the retired review:needs-human" lacks "$(labels)" "needs-human"
 expect "  ... the Claude session was killed" eval 'grep -q "^kill-session -t prloop-review-7" "$TMUXD/calls" && [ ! -e "$TMUXD/sess-prloop-review-7" ]'
 expect "  ... promptly, not after WORKER_TIMEOUT" [ "$took" -lt 30 ]
 expect "  ... nothing was typed into the limit menu" lacks "$(grep '^send-keys' "$TMUXD/calls")" "continue"
@@ -273,19 +274,19 @@ same "  ... a zero-finding Agy review is review:clean" "$(labels)" "review:clean
 # --- Agy fails: the PR says what Agy said
 reset '["review:requested"]' '[]' "$SHA2"
 loop review AGY_BEHAVE=limit
-same "agy limited too: review:needs-human" "$(labels)" "review:needs-human"
+same "agy limited too: fail" "$(labels)" "fail"
 expect "  ... the comment quotes Agy's own error" has "$(comments)" "RESOURCE_EXHAUSTED: Agy quota exceeded for today"
 expect "  ... not the generic no-marker message" lacks "$(comments)" "no review comment carrying the marker"
 expect "  ... and so does the log" has "$(log_)" "RESOURCE_EXHAUSTED"
 
 reset '["review:requested"]' '[]' "$SHA2"
 loop review AGY_BEHAVE=nomarker
-expect "agy without a marker: needs-human quoting its response" eval \
-  '[ "$(labels)" = "review:needs-human" ] && has "$(comments)" "I could not finish the review."'
+expect "agy without a marker: fail quoting its response" eval \
+  '[ "$(labels)" = "fail" ] && has "$(comments)" "I could not finish the review."'
 
 reset '["review:requested"]' '[]' "$SHA2"
 start=$(date +%s); loop review AGY_BEHAVE=hang WORKER_TIMEOUT=2; took=$(( $(date +%s) - start ))
-expect "agy hangs: the worker timeout ends it" eval '[ "$(labels)" = "review:needs-human" ] && has "$(comments)" "worker timeout"'
+expect "agy hangs: the worker timeout ends it" eval '[ "$(labels)" = "fail" ] && has "$(comments)" "worker timeout"'
 expect "  ... without hanging the tick" [ "$took" -lt 20 ]
 
 reset '["review:requested"]' '[]' "$SHA2"
@@ -308,7 +309,7 @@ rm -f "$LIMIT"
 reset '["review:findings"]' "$REVIEWED"
 scenario "$(printf '  ⎿  API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Claude AI usage limit reached|%s"}}\n> ' "$(( $(date +%s) + 5400 ))")"
 loop resolve
-expect "resolve hits the limit: back to review:findings, not needs-human" [ "$(labels)" = "review:findings" ]
+expect "resolve hits the limit: back to review:findings, not fail" [ "$(labels)" = "review:findings" ]
 expect "  ... the comment quotes Claude's own error" has "$(comments)" "rate_limit_error"
 expect "  ... the limit is recorded" eval '[ -n "$(limit_until)" ]'
 expect "  ... and Agy is never asked to resolve" [ ! -s "$AGY_CALLS" ]
@@ -321,14 +322,14 @@ scenario $'  ⎿  API Error: 500 {"type":"error","error":{"type":"api_error","me
 loop review
 expect "expired limit: Claude runs again" grep -q '^new-session -d -s prloop-review-7' "$TMUXD/calls"
 expect "  ... and the stale record is gone" [ ! -e "$LIMIT" ]
-expect "no marker: needs-human" [ "$(labels)" = "review:needs-human" ]
+expect "no marker: fail" [ "$(labels)" = "fail" ]
 expect "  ... quoting Claude's own error line" has "$(comments)" "API Error: 500"
 
 reset '["review:requested"]'
 scenario $'Error: something broke\n\nPR_LOOP_WORKER_EXIT=1'
 loop review
-expect "claude exits: needs-human with its last words" eval \
-  '[ "$(labels)" = "review:needs-human" ] && has "$(comments)" "Claude exited before finishing" && has "$(comments)" "something broke"'
+expect "claude exits: fail with its last words" eval \
+  '[ "$(labels)" = "fail" ] && has "$(comments)" "Claude exited before finishing" && has "$(comments)" "something broke"'
 
 expect "the user's real HOME was never used" [ ! -e "$HOME/.claude.json" ]
 

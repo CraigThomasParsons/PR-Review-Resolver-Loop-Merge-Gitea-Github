@@ -85,7 +85,9 @@ import poolstate
 
 DEFAULT_DEADLINE = 2700
 DEFAULT_GRACE = 3600
-HUMAN_LABELS = {"agent:needs-human", "review:needs-human"}
+# fail is the review loop's human stop; review:needs-human is the label it replaced, kept so a
+# PR still carrying it stays held.
+HUMAN_LABELS = {"agent:needs-human", "fail", "review:needs-human"}
 
 
 def iso(ts: float) -> str:

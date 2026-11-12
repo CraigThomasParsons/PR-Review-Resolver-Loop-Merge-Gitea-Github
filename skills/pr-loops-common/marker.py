@@ -23,7 +23,7 @@ labelled the pull request resolved, because all it checked was that the head had
 
 `noted` counts findings left for the author that do not block merging: suggestions, conventions,
 process ideas. It was split out of `deferred` on 2026-10-05 after a docs PR with eight findings,
-three fixed and five of them preferences, landed on review:needs-human although nothing in it was
+three fixed and five of them preferences, landed on review:needs-human (the human-stop label, renamed fail since) although nothing in it was
 wrong. Only `deferred` (a blocking problem the resolver could not fix) stops a PR now. `noted` is
 optional so markers written before the split still parse, as noted=0.
 

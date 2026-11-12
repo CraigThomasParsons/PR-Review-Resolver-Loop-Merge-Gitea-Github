@@ -56,8 +56,8 @@ Open, non-draft PRs that have **either**:
 - `review:clean` (review found 0 findings), or  
 - `review:resolved` (resolve FF-pushed + marker ok)
 
-**Never** merge if any of: `review:needs-human`, `review:in-progress`, `review:resolving`, `review:findings`, `review:requested`.  
-If `needs-human` is present **alongside** clean/resolved, **needs-human wins** (skip / fail closed).
+**Never** merge if any of: `fail` (formerly `review:needs-human`, which still blocks), `review:in-progress`, `review:resolving`, `review:findings`, `review:requested`.  
+If `fail` is present **alongside** clean/resolved, **fail wins** (skip / fail closed).
 
 ### Phase 1 opt-in (required)
 
@@ -66,7 +66,7 @@ Also require label **`review:automerge`** so humans can leave clean/resolved PRs
 ### Flow (`pr-loop.sh merge` **or** sibling `pr-merge.sh` — prefer sibling if it keeps `pr-loop.sh` MODE case smaller)
 
 1. List open PRs via existing adapter.
-2. Filter: has (`review:clean` OR `review:resolved`) AND `review:automerge`; not needs-human; not draft; not bot (same skips as review).
+2. Filter: has (`review:clean` OR `review:resolved`) AND `review:automerge`; not `fail`; not draft; not bot (same skips as review).
 3. Claim: remove clean/resolved (and keep or strip automerge — prefer strip automerge on claim) → add **`review:merging`**.
 4. Gates (bash only — **no Claude worker** in phase 1):
    - Head SHA still matches last verified marker (`pulse-review:v1` for clean path, `pulse-resolve:v1` for resolved path) — same philosophy as today’s label moves.
@@ -75,7 +75,7 @@ Also require label **`review:automerge`** so humans can leave clean/resolved PRs
    - **Defer CI:** NightCrew currently has **no** branch protection and **no** commit statuses on develop. Phase 1 = label + mergeable + marker only. Leave a clear TODO hook for required status contexts later.
 5. Merge **only** via new entrypoint: `gitea-pr.py merge --repo O/R --pr N --style …` wrapping `tea pr merge`.
 6. Success: strip `review:merging` (+ any leftover review labels) → add **`review:merged`**; comment with head SHA + style + utc time.
-7. Fail: strip `review:merging` → `review:needs-human` + comment with reason (conflict, head moved, API error, not mergeable).
+7. Fail: strip `review:merging` → `fail` + comment with reason (conflict, head moved, API error, not mergeable).
 
 ### New pieces
 
@@ -106,7 +106,7 @@ Also require label **`review:automerge`** so humans can leave clean/resolved PRs
 
 1. `gitea-labels.py --repo ElasticGun/TheNightCrew` dry-run shows new labels; `--apply` creates them.
 2. `DRY_RUN=1 PR_LOOP_REPO=ElasticGun/TheNightCrew PR_LOOP_MAIN=/home/craigpar/Code/TheNightCrew ./pr-merge.sh` (or `pr-loop.sh merge`) lists only PRs with automerge+clean|resolved.
-3. Offline unit/shell tests for: needs-human wins; missing automerge skips; head-moved fails to needs-human; mergeable false fails; marker mismatch fails.
+3. Offline unit/shell tests for: fail wins; missing automerge skips; head-moved fails to `fail`; mergeable false fails; marker mismatch fails.
 4. Live smoke (only if Craig authorizes): open a tiny throwaway PR, label `review:clean` + `review:automerge`, run tick, confirm merged + `review:merged` + comment; confirm a second PR with only `review:resolved` (no automerge) is left alone.
 5. Confirm `pr-loop.sh review` / `resolve` still refuse merge (DENY + prompts unchanged).
 
@@ -114,7 +114,7 @@ Also require label **`review:automerge`** so humans can leave clean/resolved PRs
 
 - Merging without CI while NightCrew has no protection — mitigated by opt-in label.
 - Race: human pushes after resolve marker → marker/head gate must refuse.
-- Claiming (`review:merging`) then crash mid-merge → leave needs-human, never silent half-state.
+- Claiming (`review:merging`) then crash mid-merge → leave `fail`, never silent half-state.
 - Accidental call from Claude worker — keep merge out of ALLOW; only the merge tick’s bash calls `gitea-pr.py merge`.
 - Editing `pr-loop.sh` while a long tick runs — existing pin-to-temp pattern; new script should follow same if it can run long (merge tick should be short).
 

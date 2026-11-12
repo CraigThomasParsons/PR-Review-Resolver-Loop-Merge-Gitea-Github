@@ -240,7 +240,7 @@ else
   {
     echo 'set -uo pipefail'
     echo 'MODE=resolve; REPO=o/r; CLAIM=review:resolving; OK=review:resolved; CLEAN=""'
-    echo 'FAIL=review:needs-human; TRIGGER=review:findings; CONTEXT_FILE=.pr-loop-context.md'
+    echo 'FAIL=fail; TRIGGER=review:findings; CONTEXT_FILE=.pr-loop-context.md'
     echo "LOG=$TMP/finish.log; STATE=$TMP/fstate; MAIN=$REPO_DIR"
     echo 'declare -A W_SESS=() W_WT=() W_SHA=() W_HEADREF=() W_BASE=() W_PROV=() W_PID=() W_START=() W_STALLS=() W_BLOCKS=() W_VENDOR=()'
     echo 'relabel() { :; }; comment() { :; }; stop_agy() { :; }'
@@ -384,7 +384,7 @@ log_() { cat "$TMP/out.txt"; }
 
 reset
 loop WT_SEED=apps/game FAKE_FAIL_IN=apps/game
-same "install fails: the PR goes to review:needs-human" "$(labels)" "review:needs-human"
+same "install fails: the PR goes to fail" "$(labels)" "fail"
 expect "  ... the comment gives the reason" has "$(comments)" "composer install failed in apps/game (exit 3)"
 expect "  ... and quotes composer" eval 'has "$(comments)" "composer said:" && has "$(comments)" "PHP extension gd is missing"'
 expect "  ... no worker is started" eval '! grep -q "^new-session" "$TMUXD/calls"'

@@ -28,7 +28,8 @@ The tick claims eligible PRs as `review:merging`. It verifies the path-specific 
 current head, requires the configured base, and calls the adapter's explicit merge subcommand,
 which rechecks the live head, base, draft/open state, and `mergeable == true` immediately before
 wrapping `tea pr merge`. Success becomes `review:merged`; any gate or merge failure becomes
-`review:needs-human` with a reason comment.
+`fail` with a reason comment. A PR carrying `fail` (or the retired `review:needs-human`) is
+never a candidate.
 
 Configuration: `PR_LOOP_REPO`, `PR_MERGE_ALLOW_REPOS` (comma-separated), `PR_MERGE_BASE`,
 `PR_MERGE_STYLE`, and `PR_LOOP_STATE`. Required-status-context enforcement is deferred until the

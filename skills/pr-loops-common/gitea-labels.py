@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gitea-labels.py — roll the review:* label set out across Gitea repositories.
+"""gitea-labels.py — roll the loops' label set (review:*, agent:*, fail) out across Gitea repositories.
 
 The PR review/resolve loops hand off through labels only, so every repo the loops
 run against needs the same set (LABELS below). Creating them by hand across 32 repos is exactly
@@ -42,7 +42,10 @@ LABELS = {
     "review:automerge":   ("1f77b4", "Opt this PR into the mechanical merge tick"),
     "review:merging":     ("ff7f0e", "The mechanical merge tick has claimed this PR"),
     "review:merged":      ("2ca02c", "The mechanical merge tick merged this PR"),
-    "review:needs-human": ("b10026", "Automation stopped and a person must look"),
+    # The loops' human stop. Unprefixed on purpose (Craig's pick); it replaced
+    # review:needs-human, which is no longer created. pr-merge.sh still treats a leftover
+    # review:needs-human as a block so a PR parked before the rename is never merged.
+    "fail":               ("b10026", "Automation stopped and a person must look"),
     # agent-pool-core's own vocabulary (agent-pool/bin/prod-common.sh). Narrower than the
     # review:* set above -- derive_job() decides review vs. resolve vs. settled from markers,
     # not a separate label per stage. pr-merge.sh accepts agent:done the same way it accepts
@@ -136,7 +139,7 @@ def main():
             print(f"  {repo:<48} already complete")
             continue
         todo += len(missing)
-        print(f"  {repo:<48} missing {len(missing)}: {', '.join(s.split(':')[1] for s in missing)}")
+        print(f"  {repo:<48} missing {len(missing)}: {', '.join(s.split(':')[-1] for s in missing)}")
         if a.apply:
             for n in missing:
                 colour, desc = LABELS[n]

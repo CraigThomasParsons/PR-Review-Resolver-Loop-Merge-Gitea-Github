@@ -162,6 +162,8 @@ at 4050 claimrec hold --repo $R --pr 8 --labels '["agent:ready"]' --assignees '[
 expect "a human assignee is a human hold" "$(cat "$TMP/h")" "human"
 at 4050 claimrec hold --repo $R --pr 8 --labels '["agent:ready","agent:needs-human"]' "${H[@]}" > "$TMP/h"
 expect "an agent:needs-human label is a human hold" "$(cat "$TMP/h")" "human"
+at 4050 claimrec hold --repo $R --pr 8 --labels '["agent:ready","fail"]' "${H[@]}" > "$TMP/h"
+expect "the review loop's fail label is a human hold" "$(cat "$TMP/h")" "human"
 at 4050 claimrec hold --repo $R --pr 8 --labels '["agent:ready"]' --assignees '["pool-bot"]' "${H[@]}" > "$TMP/h"
 expect "the bot's own assignment is not a human hold" "$(cat "$TMP/h")" "free"
 at 5000 claimrec hold --repo $R --pr 8 --labels '["status: in-progress"]' --grace 600 "${H[@]}" > "$TMP/h"

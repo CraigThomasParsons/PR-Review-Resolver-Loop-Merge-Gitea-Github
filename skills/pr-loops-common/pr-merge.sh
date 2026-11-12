@@ -51,9 +51,10 @@ if ! flock -n 9; then log "previous merge tick still running; exiting"; exit 0; 
 if ! LISTING="$(python3 "$ADAPTER" list --repo "$REPO" --state open | python3 -c '
 import json, re, sys
 # agent:ready/agent:claimed/agent:needs-human block the same way review:findings/
-# in-progress/needs-human do -- agent-pool-core has queued this PR for work, still owns
-# it, or has already flagged it for a human.
-blocked = {"review:needs-human", "review:in-progress", "review:resolving",
+# in-progress/fail do -- agent-pool-core has queued this PR for work, still owns
+# it, or has already flagged it for a human. review:needs-human is the label fail
+# replaced; it still blocks so a PR parked on it before the rename is never merged.
+blocked = {"fail", "review:needs-human", "review:in-progress", "review:resolving",
            "review:findings", "review:requested", "review:merging",
            "agent:ready", "agent:claimed", "agent:needs-human"}
 # Ability requirement labels (and agent:promote) are a pending job only beside agent:ready or
@@ -99,8 +100,8 @@ comment() { # pr body
 }
 fail_pr() { # pr reason; called only after a real claim
   local pr="$1" reason="$2"
-  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,agent:ready,agent:claimed,agent:done,$ABILITY_LABELS" "review:needs-human"; then
-    log "#$pr FAILED: $reason; additionally failed to move claim to review:needs-human"
+  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,agent:ready,agent:claimed,agent:done,$ABILITY_LABELS" "fail"; then
+    log "#$pr FAILED: $reason; additionally failed to move claim to fail"
   else
     comment "$pr" "Automated merge stopped: $reason" || log "warning: failed to comment on #$pr"
     log "#$pr FAILED: $reason"
@@ -149,9 +150,9 @@ for row in "${CANDIDATES[@]}"; do
   marker_head="${marker%% *}"
   if [ "$DRY_RUN" = "1" ]; then
     if [ "$marker_head" != "$sha" ]; then
-      log "DRY: #$pr would fail needs-human: $path marker head ${marker_head:-missing} != current $sha"
+      log "DRY: #$pr would label fail: $path marker head ${marker_head:-missing} != current $sha"
     elif [ "$base" != "$BASE" ]; then
-      log "DRY: #$pr would fail needs-human: base $base != allowed $BASE"
+      log "DRY: #$pr would label fail: base $base != allowed $BASE"
     else
       log "DRY: #$pr candidate ($path); would claim and merge head $sha into $base with style $STYLE"
     fi
@@ -178,7 +179,7 @@ for row in "${CANDIDATES[@]}"; do
     fail_pr "$pr" "$merge_out"
     continue
   fi
-  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,review:requested,review:findings,review:in-progress,review:resolving,review:needs-human,agent:ready,agent:claimed,agent:done,$ABILITY_LABELS" "review:merged"; then
+  if ! labels "$pr" "review:merging,review:automerge,review:clean,review:resolved,review:requested,review:findings,review:in-progress,review:resolving,fail,agent:ready,agent:claimed,agent:done,$ABILITY_LABELS" "review:merged"; then
     log "#$pr merged but terminal relabel failed; manual label repair required"
     continue
   fi

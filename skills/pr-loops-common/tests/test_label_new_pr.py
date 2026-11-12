@@ -56,7 +56,7 @@ global.fetch = async (url, options) => {
     def test_current_state_prevents_labeling(self) -> None:
         cases = [{'draft': True}, {'state': 'closed'}, {'user': {'login': 'tool[bot]'}},
                  {'title': 'docblock-backfill'}, {'head': {'ref': 'docblock-backfill/run'}}]
-        cases += [{'labels': [{'name': name}]} for name in ['agent:claimed', 'review:needs-human', 'night:hold']]
+        cases += [{'labels': [{'name': name}]} for name in ['agent:claimed', 'fail', 'review:needs-human', 'night:hold']]
         for change in cases:
             with self.subTest(change=change):
                 result, calls = self.run_workflow(change)

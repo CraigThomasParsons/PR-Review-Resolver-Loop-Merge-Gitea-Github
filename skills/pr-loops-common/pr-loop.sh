@@ -33,7 +33,7 @@
 # Environment knobs (all optional):
 #   DRY_RUN=1          list candidates and print what would happen; spawn nothing, relabel nothing
 #   MAX_PARALLEL=2     workers per tick (memory is the constraint on this box)
-#   WORKER_TIMEOUT=2700  seconds before a worker is abandoned and the PR marked needs-human
+#   WORKER_TIMEOUT=2700  seconds before a worker is abandoned and the PR labelled fail
 #   POLL=30            seconds between pane checks
 #   MIN_FREE_GB=6      skip the tick when less memory than this is available
 #   SKIP_BUSY_GUARD=1  run even if another pulse-* tmux worker is mid-task
@@ -53,7 +53,7 @@
 #                      directory holding a composer.lock (vendor/, node_modules/ and .git are not
 #                      searched). No lock, no install. 0 skips the step. A failed or timed-out
 #                      install, or a lock with no composer to run it, stops the PR at
-#                      review:needs-human with composer's output, and no worker is started
+#                      fail with composer's output, and no worker is started
 #   PR_LOOP_COMPOSER_DIRS  space-separated directories, relative to the worktree, to install in
 #                      instead of discovering them; each must hold a composer.lock, and an
 #                      absolute path or one with a .. component is refused; either stops the PR
@@ -153,7 +153,7 @@ case "$MODE" in
     TRIGGER="review:findings"; CLAIM="review:resolving"; OK="review:resolved"; CLEAN=""
     SENTINEL="PR_RESOLVE_DONE"; PROMPT_TMPL="$COMMON/prompts/resolve.txt" ;;
 esac
-FAIL="review:needs-human"
+FAIL="fail"
 
 # Tools the worker may use without a prompt. Auto mode's classifier covers the rest; the deny list
 # below is what it may never do, whatever mode it is in.
@@ -304,7 +304,7 @@ agy_ready() { # -> 0 when the Agy review fallback can run; otherwise AGY_WHY say
   [ -f "$FALLBACK" ] || AGY_WHY="${AGY_WHY:-missing $FALLBACK}"
   [ -z "$AGY_WHY" ]
 }
-# The provider's own last words, for the log and the needs-human comment: its error lines when it
+# The provider's own last words, for the log and the fail comment: its error lines when it
 # printed any, otherwise its last lines. Home paths are shortened and code fences defused.
 text_excerpt() { # text
   local pick line
@@ -370,7 +370,7 @@ spawned=0
 
 # Mark a worktree path trusted in ~/.claude.json so Claude Code skips the
 # "I trust this folder" dialog (default No/exit) that otherwise kills the pane
-# and produces a false review:needs-human. Claude stores trust per exact path;
+# and produces a false fail label. Claude stores trust per exact path;
 # trusting the parent WT_ROOT alone is not enough for a new prloop-* worktree.
 pretrust_worktree() {
   local wt="$1"
@@ -780,7 +780,7 @@ verify() { # pr -> prints ok|clean|fail:<reason>
     # findings (suggestions, conventions, process ideas) do not block: they are listed in the
     # resolver's comment for the author, and the PR still reaches review:resolved. Before this
     # split every design-flavoured remark counted as deferred, so a sound docs PR with five
-    # preferences in its review landed on needs-human.
+    # preferences in its review landed on the human-stop label (review:needs-human then, fail now).
     if [ "$r_deferred" -gt 0 ]; then
       echo "fail:$r_deferred of $review_count finding(s) are blocking and need a human decision; $r_fixed fixed, $r_noted noted"; return
     fi

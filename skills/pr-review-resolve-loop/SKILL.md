@@ -14,7 +14,7 @@ See `/pr-review-loop` and `/pr-resolve-loop` for what each tick does, and
 
 `pr-loop.sh` waits for every worker it spawned before it exits, and relabels only after `tea` + the Gitea adapter has
 verified the result. When the review tick returns, every PR it reviewed already carries
-`review:findings`, `review:clean`, or `review:needs-human`. The resolve tick that follows sees
+`review:findings`, `review:clean`, or `fail`. The resolve tick that follows sees
 those labels. Running the two ticks one after the other also keeps a workstation to one heavy job
 at a time.
 
@@ -49,7 +49,7 @@ After both ticks, read `~/.local/state/pulse-pr-loops/pr-loop.log`. The `[review
 - each PR the review tick touched, and its label afterwards
 - each PR the resolve tick touched: the new head it pushed, its label afterwards, and any
   worktree it left behind
-- any `review:needs-human` result with the reason from the log line and the PR comment
+- any `fail` result with the reason from the log line and the PR comment
 - a tick that skipped itself (lock held, `pulse-*` session busy, under `MIN_FREE_GB`), so a quiet
   run isn't mistaken for "nothing queued"
 

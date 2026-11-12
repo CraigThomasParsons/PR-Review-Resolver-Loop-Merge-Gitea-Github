@@ -25,7 +25,7 @@ End that comment with this line exactly, on its own, as the last line of the fil
 
 Read the reviewed head and the finding count from the review marker: PR_LOOP_REPO=__REPO__ python3 __COMMON__/marker.py latest __PR__ (prints "<head> <findings>").
 
-fixed plus noted plus deferred must equal the number of findings that review raised. The loop labels the PR review:resolved when deferred is 0, and review:needs-human when anything is deferred, so deferred is the count of things a person must decide before this PR can merge, and nothing else.
+fixed plus noted plus deferred must equal the number of findings that review raised. The loop labels the PR review:resolved when deferred is 0, and fail when anything is deferred, so deferred is the count of things a person must decide before this PR can merge, and nothing else.
 
 When the push has landed (confirm with python3 __ADAPTER__ head --repo __REPO__ --pr __PR__, which must no longer be __SHA__), or when you pushed nothing because every finding was noted or deferred and the comment is posted, print exactly this line on its own with nothing else on it:
 
