@@ -378,9 +378,9 @@ mkdir -p "$FAKEHOME/.ssh" "$FAKEHOME/.config/tea" "$TMP/tc/bin" "$TMP/gd" "$TMP/
 echo "-----BEGIN OPENSSH PRIVATE KEY----- fixture" > "$FAKEHOME/.ssh/id_test"
 echo "token: fixture-tea-token" > "$FAKEHOME/.config/tea/config.yml"
 echo g > "$TMP/select"
-gate_manifest() { # argv-json [extra top-level json]
-  printf '{"version": 1, "defaults": {"timeout": 3, "budget": 20, "memory": "64M"}, "gate": [{"name": "g", "argv": %s, "paths": ["**"]}]%s}' \
-    "$1" "${2:-}" > "$TMP/run-manifest.json"
+gate_manifest() { # argv-json [extra top-level json]; GATE_DEFAULTS adds keys to [defaults]
+  printf '{"version": 1, "defaults": {"timeout": 3, "budget": 20, "memory": "64M"%s}, "gate": [{"name": "g", "argv": %s, "paths": ["**"]}]%s}' \
+    "${GATE_DEFAULTS:-}" "$1" "${2:-}" > "$TMP/run-manifest.json"
 }
 run_gate() { # tag [VAR=value...]: run the manifest in $TMP/run-manifest.json against $TMP/gd
   local tag="$1"; shift
@@ -422,6 +422,30 @@ out="$(run_gate gitdir "${NOOP[@]}")"
 expect "a gate checkout that has a .git is infra" "$out" "is a git checkout"
 rmdir "$TMP/gd/.git"
 
+echo "classify reads the scope's cgroup events for gate-resource"
+classify() { # rc exit-code events-json
+  python3 -c '
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import gates
+status = {"child-pid": 5, "exit-code": json.loads(sys.argv[3])}
+limits = {"memory": "64M", "tasks": 12}
+print(gates.classify(int(sys.argv[2]), status, 1.0, 3, False, "", json.loads(sys.argv[4]), limits))
+' "$ROOT/agent-pool/scripts" "$@" 2>&1
+}
+out="$(classify 1 1 '{"oom_kill": 1, "pids_max": 0}')"
+expect "an oom_kill in memory.events is gate-resource, whatever the exit code" "$out" "'gate-resource'"
+expect "naming the memory limit" "$out" "MemoryMax"
+out="$(classify 1 1 '{"oom_kill": 0, "pids_max": 4}')"
+expect "a TasksMax hit in pids.events is gate-resource" "$out" "'gate-resource'"
+expect "naming the task limit" "$out" "TasksMax"
+out="$(classify 127 127 '{"oom_kill": 0, "pids_max": 2}')"
+expect "a fork refused by TasksMax wins over a 127 that would read as infra" "$out" "'gate-resource'"
+out="$(classify 1 1 '{"oom_kill": 0, "pids_max": 0}')"
+expect "no cgroup event and a non-zero exit stays gate-fail" "$out" "'gate-fail'"
+out="$(classify 137 137 '{}')"
+expect "unreadable events fall back to treating a SIGKILLed child as a resource kill" "$out" "'gate-resource'"
+
 # ---------------------------------------------------------------- run: the real sandbox
 echo "run in the real sandbox (bwrap inside a systemd user scope)"
 real_sandbox_ok() {
@@ -461,6 +485,13 @@ except OSError as e: print("NET=blocked", e)' ;;
   argv)  shift; printf 'ARG=%s\n' "\$@" ;;
   sleep) sleep 30 ;;
   hog)   exec python3 -c "x = b'a' * (300 * 1024 * 1024); import time; time.sleep(2)" ;;
+  forks) exec python3 -c 'import os, time
+try:
+    for _ in range(64):
+        if os.fork() == 0:
+            time.sleep(5); os._exit(0)
+except OSError as e:
+    print("FORK=refused", e); raise SystemExit(1)' ;;
   fail)  echo "red"; exit 3 ;;
   notool) exec no-such-toolchain-binary ;;
 esac
@@ -475,6 +506,7 @@ SH
   expect "its per-gate record has the exit code" "$(cat "$TMP/runs/gate-env-g.json")" '"exit_code": 0'
   expect "and its duration" "$(cat "$TMP/runs/gate-env-g.json")" '"secs": '
   expect "and says no kill fired" "$(cat "$TMP/runs/gate-env-g.json")" '"kill": null'
+  expect "with the scope's cgroup events read before the scope went away" "$(cat "$TMP/runs/gate-env-g.json")" '"oom_kill": 0'
   expect_not "it never sees the Gitea token" "$(log_of env)" "GITEA_TOKEN"
   expect_not "nor its value" "$(log_of env)" "fixture-gitea-token"
   expect_not "nor the ssh agent socket" "$(log_of env)" "SSH_AUTH_SOCK"
@@ -534,6 +566,13 @@ SH
     skipped=$((skipped + 1)); printf '  SKIP  a gate over MemoryMax is gate-resource: set AGENT_POOL_TEST_OOM=1 to run (it OOM-kills a scope on purpose)\n'
   fi
 
+  GATE_DEFAULTS=', "tasks": 12' gate_manifest '["just", "forks"]'
+  out="$(run_gate forks)"
+  expect "a gate that forks past TasksMax is gate-resource, not gate-fail" "$out" '"result": "gate-resource"'
+  expect "naming the task limit" "$out" "TasksMax=12"
+  expect "after its fork was refused inside" "$(log_of forks)" "FORK=refused"
+  expect "its record says a resource kill fired" "$(cat "$TMP/runs/gate-forks-g.json")" '"kill": "resource"'
+
   gate_manifest '["vendor/bin/phpunit"]'
   out="$(run_gate missing)"
   expect "a runner that is not in the tree is infra, not a gate failure" "$out" '"result": "infra"'
@@ -574,6 +613,7 @@ else
               "a gate exiting non-zero is gate-fail" \
               "a gate past its timeout is gate-timeout" \
               "a gate over MemoryMax is gate-resource" \
+              "a gate over TasksMax is gate-resource" \
               "a missing argv[0] is infra (127)" \
               "a bwrap that cannot start is infra" \
               "the gate budget and the host-wide gate lock"; do
@@ -587,7 +627,7 @@ if [ "${AGENT_POOL_TEST_REAL_SANDBOX:-1}" != 0 ]; then
   out="$(AGENT_POOL_TEST_REAL_SANDBOX=0 bash "$ROOT/agent-pool/tests/verify-gates.sh" 2>&1)"; rc=$?
   expect "it still exits 0" "$rc" "0"
   expect "printing SKIP (bwrap missing) per case" "$out" "SKIP (bwrap missing)  a host loopback listener is unreachable"
-  expect "with the skip count in the summary line" "$(printf '%s\n' "$out" | tail -1)" "0 failed, 11 skipped (11 of them: bwrap missing)"
+  expect "with the skip count in the summary line" "$(printf '%s\n' "$out" | tail -1)" "0 failed, 12 skipped (12 of them: bwrap missing)"
 fi
 
 printf '\n%d passed, %d failed, %d skipped (%d of them: bwrap missing)\n' "$pass" "$fail" "$skipped" "$sandbox_skipped"

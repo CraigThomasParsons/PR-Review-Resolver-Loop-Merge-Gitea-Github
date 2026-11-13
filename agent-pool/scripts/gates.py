@@ -40,6 +40,9 @@ Subcommands:
                                         gate-fail | gate-timeout | gate-resource | infra,
                                         "reason": ..., "gates": [...]}. Holds flock L for the
                                         whole run; the wait counts against the budget N
+  scope-guard --events-out E -- ARGV...   (internal to run) run ARGV inside the gate's scope,
+                                        then, while the scope still exists, write its cgroup's
+                                        oom_kill and pids max counts to E; exit with ARGV's code
   receipt --state S --repo O/R --pr N --attempt A --provider P --base-sha B --pr-head H
           --head NEW --source SRC --blob SHA --result RES [--reason W] [--run J]
                                         write S/gates/<repo>__<pr>__<attempt>.json once (exit 3
@@ -59,6 +62,7 @@ one, and its bin/, goes first on the gate's PATH; $HOME, its parents and anythin
 credential directory are refused), AGENT_POOL_GATE_BUDGET (the cap on any manifest's budget).
 """
 import argparse
+import ctypes
 import fcntl
 import fnmatch
 import json
@@ -68,6 +72,7 @@ import re
 import resource
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -106,6 +111,8 @@ LOG_CAP = 10 * 1024 * 1024
 FILE_SIZE_LIMIT = 4 * 1024 ** 3  # RLIMIT_FSIZE for everything under the runner: no disk-filling gate
 KILL_GRACE = 30
 SANDBOX_HOME = "/home/gate"
+CGROUP_ROOT = "/sys/fs/cgroup"
+PR_SET_PDEATHSIG = 1
 # Read-only from the host if present. None holds a secret; passwd and group carry no hashes.
 ETC_RO = ("/etc/ssl", "/etc/ca-certificates", "/etc/ld.so.cache", "/etc/alternatives",
           "/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/localtime")
@@ -475,10 +482,13 @@ def _gate_path(binds: list[str]) -> list[str]:
 
 
 def sandbox_argv(tools: dict[str, str], limits: dict, seconds: int, status_fd: int, gate_dir: str,
-                 cwd: str, binds: list[str], argv: list[str]) -> list[str]:
+                 cwd: str, binds: list[str], argv: list[str], events_out: str) -> list[str]:
     cmd = [tools["scope"], "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
            "-p", f"MemoryMax={limits['memory']}", "-p", "MemorySwapMax=0",
            "-p", f"TasksMax={limits['tasks']}", "-p", f"CPUQuota={limits['cpu']}", "--",
+           # --collect removes the scope's cgroup the moment it empties, so its memory.events and
+           # pids.events can only be read from a process still inside it.
+           sys.executable, os.path.abspath(__file__), "scope-guard", "--events-out", events_out, "--",
            # --foreground keeps timeout in the runner's process group, so the claim watcher's
            # group kill reaches it; bwrap --die-with-parent then takes the sandbox down too.
            tools["timeout"], "--foreground", "-k", str(KILL_GRACE), str(seconds),
@@ -507,6 +517,44 @@ def _scope_env() -> dict[str, str]:
 
 def _limit_file_size() -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (FILE_SIZE_LIMIT, FILE_SIZE_LIMIT))
+
+
+def _die_with_guard() -> None:
+    """The runner's last-resort kill hits the guard; the timeout (and, through bwrap's
+    --die-with-parent, the sandbox) must go with it."""
+    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+
+
+def _events(path: str) -> dict[str, int]:
+    counts = {}
+    for line in Path(path).read_text().splitlines():
+        key, _, value = line.partition(" ")
+        if value.strip().isdigit():
+            counts[key] = int(value)
+    return counts
+
+
+def cgroup_events() -> dict[str, int]:
+    """This process's cgroup v2 oom_kill and pids max counts; {} when they can't be read."""
+    try:
+        rel = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                   if line.startswith("0::"))
+        base = os.path.join(CGROUP_ROOT, rel.strip().lstrip("/"))
+        return {"oom_kill": _events(os.path.join(base, "memory.events")).get("oom_kill", 0),
+                "pids_max": _events(os.path.join(base, "pids.events")).get("max", 0)}
+    except (OSError, StopIteration):
+        return {}
+
+
+def cmd_scope_guard(a: argparse.Namespace) -> int:
+    try:
+        proc = subprocess.Popen(a.rest, close_fds=False, preexec_fn=_die_with_guard)
+    except OSError as error:
+        print(f"gates: scope-guard: {error}", file=sys.stderr)
+        return 126
+    rc = proc.wait()
+    poolstate.save(Path(a.events_out), cgroup_events())
+    return 128 - rc if rc < 0 else rc
 
 
 def _read_status(path: Path) -> dict:
@@ -540,15 +588,20 @@ def _log_tail(path: Path) -> str:
 
 
 def classify(rc: int, status: dict, elapsed: float, seconds: int, hard_killed: bool,
-             tail: str) -> tuple[str, str, str | None]:
+             tail: str, events: dict, limits: dict) -> tuple[str, str, str | None]:
     """(result, reason, kill): kill is which kill fired, if any -- "timeout" (timeout's TERM),
-    "timeout-kill" (the KILL after the -k grace, or the runner's own last resort) or "resource"."""
+    "timeout-kill" (the KILL after the -k grace, or the runner's own last resort) or "resource".
+    `events` is the scope's cgroup counts from scope-guard, {} if they could not be read."""
     if "child-pid" not in status:
         return "infra", f"the sandbox did not start (exit {rc}): {tail or 'no output'}", None
     if rc == 124 and not hard_killed:
         return "gate-timeout", f"timed out after {seconds}s", "timeout"
     if hard_killed or (rc in (137, -9) and elapsed >= seconds):
         return "gate-timeout", f"timed out after {seconds}s", "timeout-kill"
+    if events.get("oom_kill", 0) > 0:
+        return "gate-resource", f"hit its memory limit (MemoryMax={limits.get('memory')}) and was OOM-killed", "resource"
+    if events.get("pids_max", 0) > 0:
+        return "gate-resource", f"hit its task limit (TasksMax={limits.get('tasks')})", "resource"
     code = status.get("exit-code")
     if code is None:
         if rc < 0 or rc in (137, 143):
@@ -574,18 +627,21 @@ def run_one(gate: dict, limits: dict, seconds: int, gate_dir: str, binds: list[s
             tools: dict[str, str], runs: Path, tag: str) -> dict:
     name = gate["name"]
     stem = runs / f"gate-{tag}-{poolstate.slug(name)}"
-    log_path, status_path = Path(f"{stem}.log"), Path(f"{stem}.status")
+    log_path, status_path, events_path = Path(f"{stem}.log"), Path(f"{stem}.status"), Path(f"{stem}.cgroup")
     record = {"name": name, "argv": gate["argv"], "cwd": gate.get("cwd", ""), "rc": None,
-              "exit_code": None, "secs": 0, "kill": None, "result": "", "reason": "", "log": log_path.name}
+              "exit_code": None, "secs": 0, "kill": None, "cgroup": None, "result": "", "reason": "",
+              "log": log_path.name}
     if not _runner_found(gate["argv"][0], binds):
         record.update(result="infra", reason=f"gate {name!r}: {gate['argv'][0]!r} is not on the sandbox PATH "
                                              "(add its toolchain to AGENT_POOL_GATE_RO_BINDS)")
         return record
+    events_path.unlink(missing_ok=True)
     status_fd = os.open(status_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     started = time.monotonic()
     hard_killed = False
     try:
-        cmd = sandbox_argv(tools, limits, seconds, status_fd, gate_dir, gate.get("cwd", ""), binds, gate["argv"])
+        cmd = sandbox_argv(tools, limits, seconds, status_fd, gate_dir, gate.get("cwd", ""), binds, gate["argv"],
+                           str(events_path))
         with open(log_path, "wb") as log:
             try:
                 proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=_scope_env(),
@@ -603,13 +659,15 @@ def run_one(gate: dict, limits: dict, seconds: int, gate_dir: str, binds: list[s
     elapsed = time.monotonic() - started
     _cap_log(log_path)
     status = _read_status(status_path)
-    result, reason, kill = classify(rc, status, elapsed, seconds, hard_killed, _log_tail(log_path))
+    events = poolstate.load(events_path)
+    events = events if isinstance(events, dict) and not events.get("_unreadable") else {}
+    result, reason, kill = classify(rc, status, elapsed, seconds, hard_killed, _log_tail(log_path), events, limits)
     if result == "infra":
         reason = f"gate {name!r}: {reason}"
     elif result != "pass":
         reason = f"gate {name!r} {reason}"
-    record.update(rc=rc, exit_code=status.get("exit-code"), secs=round(elapsed), kill=kill, result=result,
-                  reason=reason)
+    record.update(rc=rc, exit_code=status.get("exit-code"), secs=round(elapsed), kill=kill, cgroup=events or None,
+                  result=result, reason=reason)
     poolstate.save(Path(f"{stem}.json"), record)
     return record
 
@@ -783,23 +841,28 @@ def cmd_annotate(a: argparse.Namespace) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("action", choices=["validate", "load", "select", "protected", "changes", "docs-only", "run",
-                                      "receipt", "check-receipt", "annotate"])
+                                      "receipt", "check-receipt", "annotate", "scope-guard"])
     for flag in ("--file", "--main", "--base-sha", "--repo", "--manifest", "--changed", "--raw", "--changed-out",
                  "--gitlinks-out", "--gate-dir", "--select", "--runs", "--tag", "--lock", "--state", "--pr",
                  "--attempt", "--provider", "--pr-head", "--head", "--source", "--blob", "--result", "--run",
-                 "--report", "--receipt", "--out"):
+                 "--report", "--receipt", "--out", "--events-out"):
         p.add_argument(flag)
     p.add_argument("--gitlinks", default="")
     p.add_argument("--reason", default="")
     p.add_argument("--budget", type=int)
-    a = p.parse_args()
+    argv = sys.argv[1:]
+    cut = argv.index("--") if "--" in argv else len(argv)
+    a = p.parse_args(argv[:cut])
+    a.rest = argv[cut + 1:]
+    if a.action == "scope-guard" and not a.rest:
+        p.error("scope-guard needs a command after --")
     required = {"validate": ["file"], "load": ["main", "base_sha", "repo"],
                 "select": ["manifest", "changed"], "protected": ["manifest", "changed"],
                 "changes": ["raw", "changed_out", "gitlinks_out"], "docs-only": ["changed"],
                 "run": ["manifest", "gate_dir", "select", "runs", "tag", "budget"],
                 "receipt": ["state", "repo", "pr", "attempt", "provider", "base_sha", "pr_head", "head", "result"],
                 "check-receipt": ["state", "repo", "pr", "attempt", "head"],
-                "annotate": ["report", "receipt", "out"]}
+                "annotate": ["report", "receipt", "out"], "scope-guard": ["events_out"]}
     for name in required[a.action]:
         if getattr(a, name) in (None, ""):
             p.error(f"--{name.replace('_', '-')} is required for {a.action}")
