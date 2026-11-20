@@ -104,6 +104,8 @@
 #                                  resolve jobs (faults/gates-cache/<owner>__<name>.json)
 #   AGENT_POOL_GATES_DIR           controller-owned manifest overrides (~/.config/agent-pool/gates)
 #   AGENT_POOL_GATE_RO_BINDS       colon list of toolchain dirs bound read-only into the gate sandbox
+#                                  (each and its bin/ go first on the gate PATH; /usr/local/bin
+#                                  is always on it after them, so it needs no entry here)
 #   AGENT_POOL_GATE_SANDBOX AGENT_POOL_GATE_SCOPE   bwrap and systemd-run paths (default: /usr/bin)
 #   AGENT_POOL_SIGNING_KEY (required for resolve)  absolute path of the controller-only,
 #                                  passphrase-less SSH private key (mode 0600) every controller

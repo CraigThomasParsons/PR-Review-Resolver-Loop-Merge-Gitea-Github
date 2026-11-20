@@ -263,7 +263,7 @@ systemd-run --user --scope --quiet --collect
         --tmpfs /home --dir /home/gate
         --bind "$GATE_DIR" /work --chdir /work/<cwd>
         --ro-bind "$CACHE" /cache
-        --setenv HOME /home/gate --setenv PATH /usr/bin:/bin:<toolchain bins>
+        --setenv HOME /home/gate --setenv PATH <toolchain bins>:/usr/local/bin:/usr/bin:/bin
         --setenv CI 1 --setenv LANG C.UTF-8 --setenv TERM dumb
         --setenv NPM_CONFIG_CACHE /cache/npm --setenv NUGET_PACKAGES /cache/nuget
         --setenv COMPOSER_CACHE_DIR /cache/composer --setenv DOTNET_CLI_TELEMETRY_OPTOUT 1
@@ -297,6 +297,10 @@ systemd-run --user --scope --quiet --collect
 - **Toolchains under `$HOME`.** Dirs such as `~/.dotnet` or `~/.npm-global` are bound read-only,
   one directory at a time, from `AGENT_POOL_GATE_RO_BINDS`. `gates.py` refuses any entry that is
   `$HOME` itself or a parent of a `SENSITIVE` path.
+- **Host toolchains in `/usr/local/bin`** (composer, for one) need no bind: `/usr` is already
+  bound read-only, so `/usr/local/bin` goes on the PATH after the `AGENT_POOL_GATE_RO_BINDS`
+  dirs and before `/usr/bin`, when it exists and resolves inside `/usr`. Binding `/usr/local` as
+  well is harmless; the PATH lists each directory once.
 - A manifest can't add env vars in v1. If a gate needs one, Craig adds it to the controller-owned
   override (§7, Q5).
 

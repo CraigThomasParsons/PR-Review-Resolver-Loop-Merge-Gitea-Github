@@ -84,8 +84,9 @@ Subcommands:
 
 Knobs: AGENT_POOL_GATE_SANDBOX (bwrap path), AGENT_POOL_GATE_SCOPE (systemd-run path),
 AGENT_POOL_GATE_RO_BINDS (colon list of toolchain dirs bound read-only at the same path; each
-one, and its bin/, goes first on the gate's PATH; $HOME, its parents and anything holding a
-credential directory are refused), AGENT_POOL_GATE_BUDGET (the cap on any manifest's budget),
+one, and its bin/, goes first on the gate's PATH, then /usr/local/bin when it exists under
+/usr, then /usr/bin:/bin; $HOME, its parents and anything holding a credential directory are
+refused), AGENT_POOL_GATE_BUDGET (the cap on any manifest's budget),
 AGENT_POOL_GATE_CACHE_PAUSE_SECS (how long a gate cache fault pauses its repo; default 3600).
 `--cache-root` follows the same rules, except that it may live under
 `$AGENT_POOL_STATE/gate-cache` (default ~/.local/state/agent-pool/gate-cache): only a single
@@ -557,11 +558,27 @@ def _root_links() -> list[str]:
     return args
 
 
+# Host-wide toolchains (composer, a hand-installed node...) live here. The sandbox already sees
+# it through --ro-bind /usr /usr, so it needs no AGENT_POOL_GATE_RO_BINDS entry; it is only on
+# the PATH when it is a real directory under /usr (a symlink out of /usr would dangle inside).
+HOST_LOCAL_BIN = "/usr/local/bin"
+
+
+def _host_local_bin() -> list[str]:
+    local = HOST_LOCAL_BIN
+    if not os.path.isdir(local):
+        return []
+    usr = os.path.realpath("/usr")
+    return [local] if _inside(os.path.realpath(local), usr) else []
+
+
 def _gate_path(binds: list[str]) -> list[str]:
+    """The sandbox PATH: each RO_BINDS dir's bin/ and the dir itself, then /usr/local/bin (when
+    present), then /usr/bin:/bin, each once."""
     dirs = []
     for bind in binds:
         dirs += [d for d in (os.path.join(bind, "bin"), bind) if os.path.isdir(d)]
-    return dirs + ["/usr/bin", "/bin"]
+    return list(dict.fromkeys(dirs + _host_local_bin() + ["/usr/bin", "/bin"]))
 
 
 def sandbox_argv(tools: dict[str, str], limits: dict, seconds: int, status_fd: int, gate_dir: str,
@@ -670,7 +687,8 @@ def run_one(gate: dict, limits: dict, seconds: int, gate_dir: str, binds: list[s
               "exit_code": None, "secs": 0, "result": "", "reason": "", "log": log_path.name}
     if not _runner_found(gate["argv"][0], binds):
         record.update(result="infra", reason=f"{kind} {name!r}: {gate['argv'][0]!r} is not on the sandbox PATH "
-                                             "(add its toolchain to AGENT_POOL_GATE_RO_BINDS)")
+                                             f"(searched {':'.join(_gate_path(binds))}; add the directory "
+                                             "holding it to AGENT_POOL_GATE_RO_BINDS)")
         return record
     status_fd = os.open(status_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     started = time.monotonic()

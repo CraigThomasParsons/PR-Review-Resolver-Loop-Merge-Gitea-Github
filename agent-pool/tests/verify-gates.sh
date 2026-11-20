@@ -777,10 +777,11 @@ SH
   gate_manifest '["vendor/bin/phpunit"]'
   out="$(run_gate missing)"
   expect "a runner that is not in the tree is infra, not a gate failure" "$out" '"result": "infra"'
-  if [ ! -e /usr/bin/just ] && [ ! -e /bin/just ]; then
+  if [ ! -e /usr/bin/just ] && [ ! -e /bin/just ] && [ ! -e /usr/local/bin/just ]; then
     gate_manifest '["just", "env"]'
     out="$(run_gate nopath AGENT_POOL_GATE_RO_BINDS=)"
     expect "a runner not on the sandbox PATH is infra" "$out" "is not on the sandbox PATH"
+    expect "naming the PATH it searched" "$out" "searched "
   fi
 
   printf '#!/bin/sh\necho "bwrap: setting up uid map: Permission denied" >&2\nexit 1\n' > "$TMP/broken-bwrap"
@@ -809,6 +810,45 @@ SH
   expect "logging it beside the dep's cache" "$(cat "$TMP/real-cache/owner_repo/web/warm-latest-web.log" 2>/dev/null)" "NET=connected"
 else
   skipped=$((skipped + 1)); printf '  SKIP  real sandbox cases: %s\n' "$why"
+fi
+
+echo "the gate PATH: RO_BINDS dirs, then /usr/local/bin, then /usr/bin:/bin, each once"
+mkdir -p "$TMP/pathtc/bin" "$TMP/fakeusr/local/bin" "$TMP/outside/bin"
+ln -sfn "$TMP/outside" "$TMP/fakeusr/linked"
+gate_path() { # host-local-bin usr-root binds...
+  python3 -c '
+import os, sys
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import gates
+gates.HOST_LOCAL_BIN = sys.argv[2]
+real = os.path.realpath
+gates.os.path.realpath = lambda p: real(sys.argv[3]) if p == "/usr" else real(p)
+print(":".join(gates._gate_path(sys.argv[4:])))' "$GATES" "$@"
+}
+expect "/usr/local/bin sits after the binds and before /usr/bin" \
+  "$(gate_path "$TMP/fakeusr/local/bin" "$TMP/fakeusr" "$TMP/pathtc")" \
+  "$TMP/pathtc/bin:$TMP/pathtc:$TMP/fakeusr/local/bin:/usr/bin:/bin"
+expect "with no binds it is first" "$(gate_path "$TMP/fakeusr/local/bin" "$TMP/fakeusr")" \
+  "$TMP/fakeusr/local/bin:/usr/bin:/bin"
+got="$(gate_path "$TMP/fakeusr/local/bin" "$TMP/fakeusr" "$TMP/fakeusr/local")"
+expect "binding /usr/local as well lists /usr/local/bin once" "$got" \
+  "$TMP/fakeusr/local/bin:$TMP/fakeusr/local:/usr/bin:/bin"
+expect "  ... exactly once" "$(printf '%s' "$got" | tr ':' '\n' | grep -cx "$TMP/fakeusr/local/bin")" "1"
+expect "a missing /usr/local/bin is left off" "$(gate_path "$TMP/fakeusr/nosuch/bin" "$TMP/fakeusr")" "/usr/bin:/bin"
+got="$(gate_path "$TMP/fakeusr/linked/bin" "$TMP/fakeusr")"
+expect "a /usr/local/bin that resolves outside /usr is left off (it would dangle in the sandbox)" "$got" "/usr/bin:/bin"
+expect_not "  ... not listed" "$got" "linked"
+if [ -d /usr/local/bin ]; then
+  expect "on this host the real PATH includes /usr/local/bin" "$(python3 -c 'import os,sys; sys.path.insert(0, os.path.dirname(sys.argv[1])); import gates; print(":".join(gates._gate_path([])))' "$GATES")" "/usr/local/bin:/usr/bin:/bin"
+fi
+if [ ! -e /usr/bin/just ] && [ ! -e /bin/just ] && [ ! -e /usr/local/bin/just ]; then
+  gate_manifest '["just", "env"]'
+  out="$(run_gate nopath2 "${NOOP[@]}" AGENT_POOL_GATE_RO_BINDS="$TMP/pathtc")"
+  expect "a runner on no sandbox PATH dir is infra" "$out" '"result": "infra"'
+  expect "and the reason names the PATH it searched" "$out" "searched $TMP/pathtc/bin:$TMP/pathtc"
+  expect "  ... through /usr/bin:/bin" "$out" "/usr/bin:/bin; add the directory holding it to AGENT_POOL_GATE_RO_BINDS"
+else
+  skipped=$((skipped + 1)); printf '  SKIP  the missing-runner reason: just is installed system-wide on this host\n'
 fi
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skipped"
