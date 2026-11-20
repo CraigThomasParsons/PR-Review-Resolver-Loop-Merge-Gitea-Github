@@ -748,7 +748,10 @@ for fam in glob prefix; do
   expect "$fam/resolve: r4#5 staging the context file is denied" "$(pol $fam resolve 'git add ./.agent-pool-context.md')" deny
 done
 # Symlinks are resolved: a link in the PR cannot point a read or a write outside the worktree.
-mkdir -p "$TMP/swt/src"; ln -s /etc "$TMP/swt/etclink"; echo x > "$TMP/swt/src/a.txt"
+# The link target is a fixture outside the worktree, not /etc: the gate sandbox binds only part of
+# /etc, and a wildcard that matches nothing is not a symlink test.
+mkdir -p "$TMP/swt/src" "$TMP/outside-etc"; echo host > "$TMP/outside-etc/hostname"
+ln -s "$TMP/outside-etc" "$TMP/swt/etclink"; echo x > "$TMP/swt/src/a.txt"
 spol() { python3 "$SCRIPTS/policy.py" check --family glob --job "$1" --adapter "$AD_ABS" --worktree "$TMP/swt" --report /runs/r.md -- "$2"; }
 expect "r4#2 a read through a symlink out of the worktree is denied" "$(spol review 'cat etclink/hostname')" deny
 expect "r4#2 a wildcard that matches a symlink out of the worktree is denied" "$(spol review 'cat etc*/hostname')" deny
