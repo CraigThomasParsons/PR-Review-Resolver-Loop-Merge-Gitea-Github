@@ -344,13 +344,33 @@ if [ "${#QUEUE[@]}" -eq 0 ]; then log "nothing to do after skips"; exit 0; fi
 # a PR with no label at all the one time a pool-managed repo was missing agent:ready (#52,
 # 2026-10-26). Ordering add-then-remove means a failed add leaves $TRIGGER in place instead of
 # orphaning the PR.
+#
+# A PR the pool already holds (agent:ready, agent:claimed, agent:needs-human) is left alone. The
+# pool writes the review result itself (review:findings beside agent:ready, review:clean or
+# review:resolved beside agent:done), so the resolve stage would otherwise "hand off" a PR the
+# pool had just queued and strip the review:findings it had just written: the review label drop
+# of 2026-11-20 (FF #175/#180/#182/#183, PRR #69/#71/#72). Only review mode consumes its trigger;
+# resolve mode keeps review:findings visible until the pool's verified resolve replaces it with
+# review:resolved.
 if pool_owns_repo; then
   for row in "${QUEUE[@]}"; do
     IFS=$'\t' read -r pr _ sha _ <<<"$row"
+    if ! current="$(python3 "$ADAPTER" labels --repo "$REPO" --pr "$pr" 2>/dev/null)"; then
+      log "warning: hand-off of #$pr skipped: could not read its labels; it stays at $TRIGGER"; continue
+    fi
+    held=""
+    for l in agent:ready agent:claimed agent:needs-human; do
+      [[ "$current" == *"\"$l\""* ]] && { held="$l"; break; }
+    done
+    if [ -n "$held" ]; then
+      log "#$pr: already held by the agent pool ($held); leaving $TRIGGER in place"; continue
+    fi
     if [ "$DRY_RUN" = "1" ]; then log "DRY: #$pr would hand off to the agent pool ($TRIGGER -> agent:ready) at $sha"; continue; fi
     python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --add agent:ready >/dev/null 2>&1
     if python3 "$ADAPTER" labels --repo "$REPO" --pr "$pr" 2>/dev/null | grep -q '"agent:ready"'; then
-      if python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" >/dev/null 2>&1; then
+      if [ "$MODE" != "review" ]; then
+        log "#$pr: handed off to the agent pool (+agent:ready, $TRIGGER kept) at $sha"
+      elif python3 "$ADAPTER" label --repo "$REPO" --pr "$pr" --remove "$TRIGGER" >/dev/null 2>&1; then
         log "#$pr: handed off to the agent pool ($TRIGGER -> agent:ready) at $sha"
       else
         log "warning: #$pr: agent:ready landed but $TRIGGER could not be removed; retry on the next tick"
