@@ -113,10 +113,19 @@ json.dump({"prs": {n: {"head_ref": h, "labels": labels.get(n, ["agent:done", "re
 PY
 }
 
-tick() {
-  PR_LOOP_REPO=o/r PR_LOOP_MAIN="$MAIN" PR_LOOP_STATE="$TMP/state" PR_UPDATE_WORKTREES="$TMP/wt" \
-    PR_LOOP_POOL_ROOT="$POOL" AGENT_POOL_STATE="$TMP/poolstate" PR_UPDATE_RESOLVER="${RESOLVER-$TMP/resolver.sh}" \
-    PR_LOOP_SKIP_PATTERN="" bash "$COMMON/pr-update.sh" > "$TMP/out.txt" 2>&1
+tick() { # [script [pool-root]]
+  # No pool-root argument forces the stub pool, which is what every existing case wants. An empty
+  # pool-root leaves PR_LOOP_POOL_ROOT unset so the script resolves it from .deployed-from or its path.
+  local script="${1:-$COMMON/pr-update.sh}" pool_env=()
+  if [ "$#" -ge 2 ] && [ -z "$2" ]; then
+    pool_env=(env -u PR_LOOP_POOL_ROOT)
+  else
+    pool_env=(env "PR_LOOP_POOL_ROOT=${2:-$POOL}")
+  fi
+  "${pool_env[@]}" \
+    PR_LOOP_REPO=o/r PR_LOOP_MAIN="$MAIN" PR_LOOP_STATE="$TMP/state" PR_UPDATE_WORKTREES="$TMP/wt" \
+    AGENT_POOL_STATE="$TMP/poolstate" PR_UPDATE_RESOLVER="${RESOLVER-$TMP/resolver.sh}" \
+    PR_LOOP_SKIP_PATTERN="" bash "$script" > "$TMP/out.txt" 2>&1
   TICK_RC=$?
 }
 labels_of() { python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["prs"][sys.argv[2]]["labels"]))' "$STUB_GITEA" "$1"; }
@@ -257,6 +266,35 @@ STUB_CLAUDE=limit ANTHROPIC_API_KEY=stale CLAUDE_BIN="$TMP/bin/claude" PR_UPDATE
   RESOLVER="$ROOT/pr-update-resolve.sh" tick
 expect "a limited provider: needs-human, nothing pushed" "$(contains_develop feature/conflict)" "no"
 expect "  ... and the limit is recorded as a pool cooldown" "$(cat "$TMP/poolstate/cooldowns/claude.json" 2>/dev/null)" "pr-update conflict resolve"
+
+echo
+echo "installed layout (POOL_ROOT from .deployed-from, not two levels above the script)"
+INSTALLED="$TMP/home/.claude/skills/pr-loops-common"
+mkdir -p "$INSTALLED"
+cp "$ROOT/pr-update.sh" "$INSTALLED/pr-update.sh"
+cp "$COMMON/gitea-pr.py" "$INSTALLED/gitea-pr.py"
+printf 'commit %s\nref %s\ndeployed_at %s\nsource %s\n' abc refs/heads/develop 2026-01-01T00:00:00Z "$POOL" \
+  > "$INSTALLED/.deployed-from"
+build
+RESOLVER="" tick "$INSTALLED/pr-update.sh" ""
+expect "a deployed copy finds the pool via .deployed-from" "$(cat "$TMP/gate-calls" 2>/dev/null)" "run unit in .agent-pool src"
+expect "  ... and updates the clean PR" "$(contains_develop feature/clean)" "yes"
+expect "  ... rather than an infra skip" "$(labels_of 7)" "review:requested"
+
+printf 'commit %s\nref %s\ndeployed_at %s\nsource %s\n' abc refs/heads/develop 2026-01-01T00:00:00Z "$TMP/bogus" \
+  > "$INSTALLED/.deployed-from"
+build
+RESOLVER="" tick "$INSTALLED/pr-update.sh" ""
+fallback="$(cd -- "$(dirname -- "$(readlink -f -- "$INSTALLED/pr-update.sh")")/../.." && pwd)"
+expect "a bad .deployed-from source falls back above the script" "$(cat "$TMP/out.txt")" \
+  "the gate runner $fallback/agent-pool/scripts/gates.py is missing"
+expect_not "  ... and does not use the bogus source" "$(cat "$TMP/out.txt")" "$TMP/bogus"
+expect "  ... so the clean PR is left alone" "$(contains_develop feature/clean)" "no"
+
+build
+RESOLVER="" tick "$INSTALLED/pr-update.sh" "$POOL"
+expect "PR_LOOP_POOL_ROOT wins over a bad .deployed-from" "$(cat "$TMP/gate-calls" 2>/dev/null)" "run unit in .agent-pool src"
+expect "  ... and the clean PR is updated" "$(contains_develop feature/clean)" "yes"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

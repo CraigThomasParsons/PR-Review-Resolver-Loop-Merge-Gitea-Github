@@ -39,8 +39,9 @@
 #   PR_UPDATE_REQUIRE_GATES=0      1: a code change with no gate manifest is needs-human instead
 #                                  of pushed untested (an AI-resolved conflict always needs gates)
 #   PR_UPDATE_GATE_BUDGET=1200     seconds for the gate run
-#   PR_LOOP_POOL_ROOT              the checkout holding agent-pool/ (default: two levels above
-#                                  this file's real path, as pr-loop.sh finds it)
+#   PR_LOOP_POOL_ROOT              the checkout holding agent-pool/ (default: the "source" in
+#                                  COMMON/.deployed-from when it holds agent-pool/scripts/gates.py,
+#                                  else two levels above this file's real path)
 #   AGENT_POOL_STATE               the pool's state (gate cache and gate lock are shared with it)
 #   PR_LOOP_STATE                  lock and log (default ~/.local/state/gitea-pr-loops)
 #   PR_UPDATE_WORKTREES            scratch worktrees (default .prupdate-worktrees beside the clone)
@@ -78,7 +79,15 @@ RESOLVER_TIMEOUT="${PR_UPDATE_RESOLVER_TIMEOUT:-1800}"
 REQUIRE_GATES="${PR_UPDATE_REQUIRE_GATES:-0}"
 GATE_BUDGET="${PR_UPDATE_GATE_BUDGET:-1200}"
 POOL_STATE="${AGENT_POOL_STATE:-$HOME/.local/state/agent-pool}"
-POOL_ROOT="${PR_LOOP_POOL_ROOT:-$(cd -- "$(dirname -- "$PR_UPDATE_REAL")/../.." 2>/dev/null && pwd)}"
+# A deployed copy (install.sh) is a plain directory under ~/.claude/skills with no agent-pool/
+# beside it, so prefer the checkout its .deployed-from names when that path has the gate runner;
+# otherwise two levels above this file's real path (a checkout, or a symlink to one).
+POOL_ROOT="${PR_LOOP_POOL_ROOT:-}"
+if [ -z "$POOL_ROOT" ]; then
+  POOL_ROOT="$(awk '$1=="source" {sub(/^source /, ""); print; exit}' "$COMMON/.deployed-from" 2>/dev/null || true)"
+  [ -n "$POOL_ROOT" ] && [ -f "$POOL_ROOT/agent-pool/scripts/gates.py" ] \
+    || POOL_ROOT="$(cd -- "$(dirname -- "$PR_UPDATE_REAL")/../.." 2>/dev/null && pwd)"
+fi
 GATES="$POOL_ROOT/agent-pool/scripts/gates.py"
 PROTECTED="${AGENT_POOL_PROTECTED_BRANCHES:-develop,main,master,release}"
 NEEDS_HUMAN="review:needs-human"
