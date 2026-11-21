@@ -27,7 +27,9 @@ only through claim-record.py under the job lock. It must not itself be rate-limi
 2. Queue: every open agent:ready PR in a configured repo a prod could claim (not a draft, a bot
    PR or a skipped title, no human hold, no claim record, not already settled by its markers).
    Its job kind is derived as prod-common.sh derives it (a review marker for the head with
-   findings means resolve, anything else review) and matched against the roster in repos.toml:
+   findings means resolve; a resolve at the head that check_resolve accepts — including
+   fast-forward when the repo has a main clone — means settled; otherwise review). Without a
+   clone the fast-forward gate is skipped (best-effort). Matched against the roster in repos.toml:
      no roster provider has the ability enabled on the repo  agent:needs-human with the reason
      enabled providers exist but none is installed here      agent:needs-human with the reason
      every enabled, installed provider is cooling down       left queued (waiting-cooldown)
@@ -141,8 +143,35 @@ def installed(provider: str) -> bool:
     return os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
-def derive_job(marker: types.ModuleType, comments: list[dict], head: str) -> tuple[str, str]:
-    """(review|resolve|settled, why) the way prod-common.sh's derive_job reads the markers."""
+def fast_forward(main: str, base: str, head: str) -> bool | None:
+    """Whether head descends from base, the way prod-common.sh's verify() decides --fast-forward.
+
+    With a configured main clone, uses `git merge-base --is-ancestor` and fails closed when git
+    cannot answer (same as verify: a non-zero exit means not a fast-forward). Without a clone,
+    returns None so check_resolve skips the gate: the doctor's view is best-effort for that case
+    until a compare API or clone is available.
+    """
+    if head == base:
+        return True
+    if not main:
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", main, "merge-base", "--is-ancestor", base, head],
+            capture_output=True, text=True, timeout=CALL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.returncode == 0
+
+
+def derive_job(marker: types.ModuleType, comments: list[dict], head: str,
+               main: str = "") -> tuple[str, str]:
+    """(review|resolve|settled, why) the way prod-common.sh's derive_job reads the markers.
+
+    A resolve that moved the head is settled only when check_resolve accepts it, including the
+    fast-forward gate when `main` is the repo's configured clone. Without a clone the
+    fast-forward check is skipped (best-effort); prod-common.sh always has a clone and does not.
+    """
     reviews = [(m.group(1), int(m.group(2))) for c in comments
                for m in [marker.MARKER.search(c.get("body") or "")] if m]
     latest = reviews[-1] if reviews else None
@@ -152,7 +181,9 @@ def derive_job(marker: types.ModuleType, comments: list[dict], head: str) -> tup
         return "settled", "the review of its head is already posted and clean"
     resolves = [r for c in comments for r in [marker.parse_resolve(c.get("body") or "")] if r]
     if latest and resolves and resolves[-1][0] == head and resolves[-1][1] == latest[0] \
-            and pool_marker.check_resolve(latest, resolves[-1], latest[0], head) == "ok":
+            and pool_marker.check_resolve(
+                latest, resolves[-1], latest[0], head,
+                fast_forward(main, latest[0], head)) == "ok":
         return "settled", "a resolve at its head already answers the latest review and verifies"
     return "review", ""
 
@@ -315,7 +346,8 @@ class Doctor:
             entry["state"] = "error"
             self.error(f"{repo}#{pr}: cannot read comments ({error})")
             return
-        job, why = derive_job(self.marker, comments, entry["head"])
+        main = (self.cfg["repos"].get(repo) or {}).get("main", "")
+        job, why = derive_job(self.marker, comments, entry["head"], main)
         entry["job"] = job
         if job == "settled":
             entry.update(state="settled", reason=f"{why}; the next prod tick settles it without a provider")

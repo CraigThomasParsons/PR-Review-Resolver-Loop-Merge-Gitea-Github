@@ -370,6 +370,30 @@ done
 expect "marker.py check-resolve: a non-fast-forward fix fails" \
   "$(python3 "$ROOT/agent-pool/scripts/marker.py" check-resolve --review "$SHA_A 1" --resolve "$SHA_B $SHA_A 1 0 0" --base "$SHA_A" --head "$SHA_B" --fast-forward no)" \
   "fail:the PR head moved to $SHA_B but not as a fast-forward of $SHA_A"
+# A resolve that moved the head without a fast-forward must be a review job (prod-common.sh
+# verify passes --fast-forward no). The doctor checks ancestry against the repo's main clone.
+CLONE="$TMP/ff-clone"
+rm -rf "$CLONE"
+git init -q "$CLONE"
+git -C "$CLONE" config user.email "doctor-test@example.com"
+git -C "$CLONE" config user.name "doctor-test"
+printf 'root\n' > "$CLONE/f"
+git -C "$CLONE" add f
+git -C "$CLONE" commit -q -m root
+ROOT="$(git -C "$CLONE" rev-parse HEAD)"
+printf 'reviewed\n' > "$CLONE/f"
+git -C "$CLONE" commit -q -am reviewed
+REV="$(git -C "$CLONE" rev-parse HEAD)"
+git -C "$CLONE" checkout -q -b other "$ROOT"
+printf 'diverged\n' > "$CLONE/f"
+git -C "$CLONE" commit -q -am diverged
+NEW="$(git -C "$CLONE" rev-parse HEAD)"
+git -C "$CLONE" checkout -q -
+reset "[repos.\"owner/repo\"]" "main = \"$CLONE\"" 'abilities = ["review", "resolve"]'
+addpr 11 '["agent:ready"]' "$(resolve_thread "$REV" 1 "$NEW" 1 0 0)" '[]' "$NEW"
+doctor
+expect "a non-fast-forward resolve is a review job, not settled" "$(q 11 job)" "review"
+expect "so the queue still checks providers for it" "$(q 11 state)" "claimable"
 reset
 addpr 8 '["agent:ready"]' "$(review_marker "$SHA_A" 2)"
 claim 8 claude w1 >/dev/null
