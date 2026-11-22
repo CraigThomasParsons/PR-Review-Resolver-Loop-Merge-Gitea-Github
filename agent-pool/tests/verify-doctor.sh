@@ -281,6 +281,19 @@ expect "a claim made after the doctor read the records is re-read, not no-record
 expect "and is left alone" "$(labels 7)" "agent:claimed"
 expect "with no comment" "$(comments 7)" "[]"
 expect "and no escalation attempted" "$(rq 'r["claims"][0]["action"]')" "none"
+for body in '{}' '[]'; do
+  reset
+  addpr 7 '["agent:claimed"]'
+  cat > "$STUB_GITEA.on-list" <<SH
+mkdir -p "$TMP/state/claims"
+printf '%s' '$body' > "$TMP/state/claims/owner_repo__7.json"
+SH
+  doctor
+  expect "a $body claim file that appears during the listing is unreadable, not no-record" "$(rq 'r["claims"][0]["state"]')" "unreadable"
+  expect "and is left alone ($body)" "$(labels 7)" "agent:claimed"
+  expect "with no comment ($body)" "$(comments 7)" "[]"
+  expect "and no escalation attempted ($body)" "$(rq 'r["claims"][0]["action"]')" "none"
+done
 reset
 addpr 7 '["agent:done"]'
 claim 7 claude w1 10000 100 >/dev/null
