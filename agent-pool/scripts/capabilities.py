@@ -29,14 +29,17 @@ separately from the tick's order (--order), and partitions the capable providers
   C_configured  C_roster providers in --order, minus --unconfigured (this tick's preflight
                 failures: missing binary, model or prompt)
   C_eligible    C_configured providers not in a provider cooldown, and none at all while
-                faults/gates.json pauses gate-dependent jobs (resolve, test-author)
+                faults/gates.json pauses gate-dependent jobs (resolve, test-author), or, with
+                --repo, while that repo's unexpired gate cache fault
+                (faults/gates-cache/<owner>__<name>.json) pauses its own
 
 and prints one verdict:
 
   unsatisfiable     C_roster is empty: nobody on this host can ever take it (needs-human)
   elsewhere         C_roster has providers, none of them in --order: another tick's job
   setup-fault       capable providers are in --order but all failed this tick's preflight
-  gates-paused      the job needs the gate sandbox and faults/gates.json is recorded
+  gates-paused      the job needs the gate sandbox and faults/gates.json is recorded, or its
+                    repo's gate cache fault has not expired
   waiting-cooldown  every configured capable provider is cooling down (wait_secs says how long)
   claimable         C_eligible is not empty
 
@@ -54,15 +57,15 @@ Subcommands:
                                <!-- agent-pool-job: requires=a,b --> directive in FILE; else J
                                (a settled default requires nothing and prints an empty line).
                                --labels is a JSON list of names or of {"name": ...} objects.
-  check-queue --order CSV --requires CSV [--roster CSV] [--unconfigured CSV]
+  check-queue --order CSV --requires CSV [--roster CSV] [--unconfigured CSV] [--repo O/R]
                                print the partition and verdict as one JSON object. --roster
                                defaults to the AGENT_POOL_ROSTER environment variable (a CSV
                                the caller exported from `repoconfig.py roster`); with neither,
                                it refuses (exit 2) rather than fall back to --order. An
                                explicit --roster "" is an empty roster (unsatisfiable).
 
-Environment: AGENT_POOL_CEILING_<PROVIDER>, AGENT_POOL_ROSTER, AGENT_POOL_STATE (cooldowns and
-faults/gates.json), AGENT_POOL_NOW.
+Environment: AGENT_POOL_CEILING_<PROVIDER>, AGENT_POOL_ROSTER, AGENT_POOL_STATE (cooldowns,
+faults/gates.json and faults/gates-cache/), AGENT_POOL_NOW, AGENT_POOL_GATE_CACHE_PAUSE_SECS.
 
 Exit codes: 0 done; 1 match found nobody; 2 bad arguments or configuration.
 """
@@ -74,6 +77,7 @@ import sys
 from pathlib import Path
 
 import cooldown
+import gates
 import poolstate
 
 ABILITIES = ("plan", "review", "prototype", "test-author", "resolve")
@@ -169,7 +173,7 @@ def parse_requires(labels: list[str], body: str, default_job: str) -> list[str]:
 
 
 def check_queue(order: list[str], requires: list[str], roster: list[str],
-                unconfigured: list[str] | None = None) -> dict:
+                unconfigured: list[str] | None = None, repo: str = "") -> dict:
     """The C_roster / C_configured / C_eligible partition for one job, and its verdict."""
     unconfigured = unconfigured or []
     c_roster = match(roster, requires)
@@ -179,6 +183,8 @@ def check_queue(order: list[str], requires: list[str], roster: list[str],
     cooling = {p: cooldown.remaining(p, now) for p in c_configured}
     gates_fault = poolstate.state_dir() / "faults" / "gates.json"
     gated = bool(GATED & set(requires)) and gates_fault.exists()
+    if GATED & set(requires) and repo and not gated and gates.cache_pause(poolstate.state_dir(), repo, now):
+        gated, gates_fault = True, gates.cache_fault_path(poolstate.state_dir(), repo)
     c_eligible = [] if gated else [p for p in c_configured if cooling[p] <= 0]
     doc: dict = {"requires": requires, "roster": roster, "order": order,
                  "c_roster": c_roster, "c_configured": c_configured, "c_eligible": c_eligible,
@@ -234,6 +240,7 @@ def main() -> int:
     p.add_argument("--labels", default="[]")
     p.add_argument("--body", default="")
     p.add_argument("--default-job", default="")
+    p.add_argument("--repo", default="")
     a = p.parse_args()
     try:
         if a.action in ("ceiling", "abilities"):
@@ -269,7 +276,7 @@ def main() -> int:
                 print(f"capabilities: {provider} is in --order but not in the roster; it does not count "
                       "for this job", file=sys.stderr)
         unconfigured = _providers_csv("--unconfigured", a.unconfigured)
-        print(json.dumps(check_queue(order, requires, roster, unconfigured), sort_keys=True))
+        print(json.dumps(check_queue(order, requires, roster, unconfigured, a.repo), sort_keys=True))
         return 0
     except CapabilityError as error:
         print(f"capabilities: {error}", file=sys.stderr)

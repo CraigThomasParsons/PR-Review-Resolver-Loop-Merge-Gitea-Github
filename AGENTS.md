@@ -5,8 +5,11 @@ multi-provider worker pool. See `README.md` for what's here, `docs/plans/` for d
 
 ## Branching
 
-PRs target `master`. Never commit directly to `master`. Branch prefixes: `feature/`, `fix/`,
-`docs/`, `chore/`.
+New PRs target `develop`. Never commit directly to `develop` or `master`. Branch
+prefixes: `feature/`, `fix/`, `docs/`, `chore/`. Craig selected `develop` for Conduit
+integration and subsequent delivery (TheConduitAgentPool issue #71, decision Q11;
+this repository issue #67). Older issue text targeting `master` is superseded for
+new work. Nothing auto-merges to `master` or `main`; authors never self-merge.
 
 ## Style
 
