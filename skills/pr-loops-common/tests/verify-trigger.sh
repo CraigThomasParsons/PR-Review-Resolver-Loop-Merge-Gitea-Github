@@ -135,14 +135,15 @@ if sys.argv[1] == "list":
     print(json.dumps([
       {"number": n, "title": "t", "draft": False, "head_sha": s, "head_ref": "feature/%d" % n,
        "base_ref": "develop", "author": "craig", "is_bot": False,
-       "labels": ["review:requested"], "url": ""} for n, s in ((7, "$A"), (8, "$B"))]))
+       "labels": json.loads(os.environ.get("LIST_LABELS", '["review:requested"]')), "url": ""}
+      for n, s in ((7, "$A"), (8, "$B"))]))
 elif sys.argv[1] in ("label", "labels"):
     a = sys.argv[2:]
     arg = lambda n: a[a.index(n) + 1] if n in a else None
     path = os.environ["LABEL_STATE"]
     state = json.load(open(path)) if os.path.exists(path) else {}
     pr = arg("--pr")
-    cur = set(state.get(pr, ["review:requested"]))
+    cur = set(state.get(pr, json.loads(os.environ.get("LIST_LABELS", '["review:requested"]'))))
     if sys.argv[1] == "label":
         add = arg("--add")
         remove = arg("--remove")
@@ -227,8 +228,10 @@ expect "  ... so the PR is never left with no label at all" \
 rm -f "$LABEL_STATE"
 out="$(ADAPTER_LABELS_FAIL=1 PR_LOOP_PR=8 loop_live)"
 expect "a failed verification read reports a failed hand-off" has "$out" "warning: hand-off"
+# The labels are read before anything is written, so a failed read now writes nothing at all.
 expect "a failed verification read preserves the trigger" \
-  python3 -c 'import json, sys; sys.exit(0 if "review:requested" in json.load(open(sys.argv[1]))["8"] else 1)' "$LABEL_STATE"
+  python3 -c 'import json, os, sys; p = sys.argv[1]; st = json.load(open(p)) if os.path.exists(p) else {}
+sys.exit(0 if "review:requested" in st.get("8", ["review:requested"]) else 1)' "$LABEL_STATE"
 
 rm -f "$LABEL_STATE"
 out="$(ADAPTER_REMOVE_FAIL=1 PR_LOOP_PR=8 loop_live)"
@@ -236,6 +239,32 @@ expect "a failed trigger removal reports a warning" has "$out" "could not be rem
 expect "a failed trigger removal never reports success" lacks "$out" "#8: handed off"
 expect "a failed trigger removal preserves both routing labels" \
   [ "$(python3 -c 'import json; print(json.load(open("'"$LABEL_STATE"'"))["8"])')" = "['agent:ready', 'review:requested']" ]
+
+# Regression: the review label drop of 2026-11-20. The pool now writes review:findings beside
+# agent:ready itself; the loop must neither re-hand-off a PR the pool holds nor strip that label.
+loop_live_mode() { PR_LOOP_STATE="$LS" PR_LOOP_MAIN="$TMP/main" PR_LOOP_WORKTREES="$TMP/wt" \
+  PR_LOOP_REPO=o/r PR_LOOP_POOL=1 bash "$LC/pr-loop.sh" "$1" 2>&1; }
+labels_of_8() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["8"])' "$LABEL_STATE"; }
+
+printf '{"8": ["agent:ready", "review:requested"]}' > "$LABEL_STATE"
+out="$(PR_LOOP_PR=8 loop_live)"
+expect "review: a PR the pool already holds is not handed off again" has "$out" "#8: already held by the agent pool (agent:ready)"
+expect "  ... and its labels are untouched" [ "$(labels_of_8)" = "['agent:ready', 'review:requested']" ]
+
+printf '{"8": ["review:findings"]}' > "$LABEL_STATE"
+out="$(LIST_LABELS='["review:findings"]' MARKER_8="$B 2" PR_LOOP_PR=8 loop_live_mode resolve)"
+expect "resolve: a hand-off adds agent:ready" has "$out" "#8: handed off to the agent pool (+agent:ready, review:findings kept)"
+expect "  ... and keeps review:findings visible" [ "$(labels_of_8)" = "['agent:ready', 'review:findings']" ]
+
+printf '{"8": ["agent:ready", "review:findings"]}' > "$LABEL_STATE"
+out="$(LIST_LABELS='["review:findings"]' MARKER_8="$B 2" PR_LOOP_PR=8 loop_live_mode resolve)"
+expect "resolve: findings the pool queued itself are left alone" has "$out" "#8: already held by the agent pool (agent:ready)"
+expect "  ... review:findings is not dropped" [ "$(labels_of_8)" = "['agent:ready', 'review:findings']" ]
+
+printf '{"8": ["agent:needs-human", "review:findings"]}' > "$LABEL_STATE"
+out="$(LIST_LABELS='["review:findings"]' MARKER_8="$B 2" PR_LOOP_PR=8 loop_live_mode resolve)"
+expect "resolve: a PR the pool flagged for a human is not re-queued" has "$out" "already held by the agent pool (agent:needs-human)"
+expect "  ... and stays unqueued" [ "$(labels_of_8)" = "['agent:needs-human', 'review:findings']" ]
 
 # ================================================================ pr-drain
 echo
