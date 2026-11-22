@@ -354,6 +354,16 @@ cat > "$BIN/stub-systemd-run" <<'SH'
 printf '%s\n' "$*" >> "@CALLS@/scope.log"
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
+# Same peel as verify-gates.sh's fake scope: not a cgroup, so don't publish the host's counters.
+if [ "${3:-}" = scope-guard ]; then
+  shift 3
+  events=""
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+    if [ "$1" = --events-out ]; then events=$2; shift 2; else shift; fi
+  done
+  shift
+  if [ -n "$events" ]; then printf '%s\n' '{"oom_kill": 0, "pids_max": 0}' > "$events"; fi
+fi
 exec "$@"
 SH
 cat > "$BIN/stub-bwrap" <<'PY'
