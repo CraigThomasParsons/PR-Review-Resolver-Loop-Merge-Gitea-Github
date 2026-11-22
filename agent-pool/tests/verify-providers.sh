@@ -232,6 +232,9 @@ case "$behave" in
   resolve-noted)    resolve_text 0 1 0 > "$report"; success ;;
   resolve-deferred) resolve_text 0 0 1 > "$report"; success ;;
   resolve-fix)      commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"; success ;;
+  resolve-fix-denied)
+    commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"done","permission_denials":[{"tool_name":"Bash"}]}' ;;
   resolve-repoint)
     # Commit, then point the worktree's .git at a gitdir of the worker's choosing.
     commit_fix; resolve_text 1 $(( ${findings:-1} - 1 )) 0 > "$report"
@@ -399,11 +402,18 @@ PY
 sed -i "s|@CALLS@|$TMP/calls|; s|@BEHAVE@|$TMP/behave|" "$BIN/stub-systemd-run" "$BIN/stub-bwrap"
 chmod +x "$BIN/stub-systemd-run" "$BIN/stub-bwrap"
 # The only gate runner the fixture manifest names. The sandbox env is cleared, so every path it
-# needs is baked in here.
+# needs is baked in here. `just warm` and `just install` stand in for a [[deps]] entry's commands.
 mkdir -p "$TMP/toolchain/bin"
 cat > "$TMP/toolchain/bin/just" <<'SH'
 #!/bin/sh
 T="@TMP@"
+echo "$1" >> "$T/calls/just-order"
+case "$1" in
+  warm|install)
+    echo "$* in $PWD" >> "$T/calls/$1-ran"
+    [ "$(cat "$T/behave/$1" 2>/dev/null)" = fail ] && { echo "$1 broke"; exit 1; }
+    exit 0 ;;
+esac
 echo "$*" >> "$T/calls/gate-ran"
 { echo "--- gate $*"; env | sort; echo "PWD=$PWD"; echo "LS=$(ls -A | tr '\n' ' ')"
   [ -f payload.txt ] && echo "PAYLOAD=$(cat payload.txt)"; } >> "$T/calls/gate-seen"
@@ -533,8 +543,11 @@ tick
 expect "the worker was told where to write its report" "$(calls claude)" "REPORT=$TMP/state/runs/report-7-"
 expect "the controller posted the report" "$(comments)" "## Automated review"
 expect "with the review marker for the head" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
-expect "the claim flip, the comment and the release are the only writes" "$(writes | tr '\n' ' ')" \
-  "label 7 -agent:ready +agent:claimed comment 7 label 7 -agent:claimed +agent:ready"
+expect "the claim flip, the comment, the review result and the release are the only writes" "$(writes | tr '\n' ' ')" \
+  "label 7 -agent:ready +agent:claimed comment 7 label 7 -None +review:findings label 7 -agent:claimed +agent:ready"
+# Regression (FF #175/#180/#182/#183, PRR #69/#71/#72): a review with findings must leave
+# review:findings on the PR beside agent:ready, not agent:ready alone.
+expect "a review with findings is labelled review:findings" "$(labels)" "review:findings,agent:ready"
 expect "the session id is logged" "$(cat "$TMP/out.txt")" "session sess-claude"
 behave claude resolve-push
 tick
@@ -547,11 +560,20 @@ expect_not "the controller pushed its own commit of the worker's edits" "$newhea
 expect "as a fast-forward of the reviewed head" "$(git --git-dir "$ORIGIN" merge-base --is-ancestor "$SHA" "$newhead" && echo ff)" "ff"
 expect "and posted the resolve report" "$(comments)" "pulse-resolve:v1 head=$newhead reviewed=$SHA fixed=1"
 expect "a verified resolve is agent:done" "$(labels)" "agent:done"
+expect "and review:resolved, in place of review:findings" "$(labels)" "review:resolved,agent:done"
+expect_not "  ... review:findings is gone" "$(labels)" "review:findings"
 expect "the push is logged" "$(cat "$TMP/out.txt")" "pushed $SHA..$newhead to feature/x"
 reset '["agent:ready"]'
 behave claude clean
 tick
 expect "a clean review is agent:done" "$(labels)" "agent:done"
+expect "and review:clean" "$(labels)" "review:clean,agent:done"
+# A PR handed off by pr-loop.sh while it still carried review:requested (or a stale result):
+# the result label replaces both.
+reset '["agent:ready", "review:requested", "review:findings"]'
+behave claude clean
+tick
+expect "a clean review replaces review:requested and a stale review:findings" "$(labels)" "review:clean,agent:done"
 reset '["agent:ready"]'
 behave claude final-only
 tick
@@ -649,6 +671,11 @@ body="$(last_comment)"
 expect "the posted report carries the controller's gate section" "$body" "### Gates (run by the pool controller)"
 expect "with the gate marker before the resolve marker" "${body%%pulse-resolve:v1*}" "agent-pool-gates:v1 head=$newhead manifest="
 expect "and the resolve marker still last" "$(printf '%s\n' "$body" | sed '/^$/d' | tail -1)" "pulse-resolve:v1 head=$newhead"
+expect_not "#60: a manifest without [[deps]] warms nothing" "$(cat "$TMP/calls/just-order")" "warm"
+expect_not "#60: nor installs anything" "$(cat "$TMP/calls/just-order")" "install"
+expect_not "#60: no sandbox gets the network" "$(cat "$TMP/calls/bwrap.log")" "ARG --share-net"
+expect "#60: no dependency cache is made" "$([ -e "$TMP/state/gate-cache" ] && echo made || echo none)" "none"
+expect "#60: and the receipt lists no deps" "$(receipt)" '"deps": []'
 
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
 behave claude resolve-fix; behave gate fail
@@ -726,6 +753,15 @@ expect "a base with no manifest: a code fix is never pushed" "$(origin_head)" "$
 expect "it goes to needs-human" "$(labels)" "agent:needs-human"
 expect "saying there is no manifest" "$(comments)" "has no gate manifest"
 reset '["agent:ready"]' '[]' "$REVIEW_MARKER" feature/x bare
+behave claude resolve-fix-denied
+tick
+expect "#58: no manifest plus a denied tool call: still never pushed" "$(origin_head)" "$SHA"
+expect "#58: it goes to needs-human" "$(labels)" "agent:needs-human"
+expect_not "#58: not back to agent:ready" "$(labels)" "agent:ready"
+expect "#58: saying there is no manifest" "$(comments)" "has no gate manifest"
+expect "#58: the denial is still recorded as a setup fault" "$(cat "$TMP/state/faults/claude.json" 2>/dev/null)" "rejected the candidate anyway"
+expect "#58: and logged" "$(cat "$TMP/out.txt")" "SETUP FAULT [claude]"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER" feature/x bare
 behave claude resolve-docs
 tick
 expect "a base with no manifest: a docs-only fix is pushed" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "docs: note"
@@ -745,6 +781,104 @@ tick
 rm -rf "$TMP/gates-override"
 expect "a controller-owned override wins over the base manifest" "$(gate_ran)" "override"
 expect "and the receipt says so" "$(receipt)" '"source": "override"'
+
+# [[deps]] through the override, with the base's justfile as the lockfile: the real gates.py
+# warms it from the base tree and installs it offline, through the same stub sandbox.
+mkdir -p "$TMP/gates-override"
+printf 'version = 1\n[defaults]\ntimeout = 4\nbudget = 30\n[[deps]]\nname = "tools"\nlockfile = "justfile"\nwarm = ["just", "warm"]\ninstall = ["just", "install"]\n[[gate]]\nname = "unit"\nargv = ["just", "gate"]\npaths = ["*.txt", "src/**"]\n' \
+  > "$TMP/gates-override/owner__repo.toml"
+just_order() { tr '\n' ' ' < "$TMP/calls/just-order" 2>/dev/null; }
+DEPDIR="$TMP/state/gate-cache/owner_repo/tools"
+LOCKBLOB="$(git --git-dir "$ORIGIN" rev-parse master:justfile)"
+BASESHA="$(git --git-dir "$ORIGIN" rev-parse master)"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix
+tick
+expect "#60: a manifest with [[deps]] warms, then installs, then gates" "$(just_order)" "warm install gate "
+expect "#60: warm runs in an export of the base tree under the dep's cache dir" "$(cat "$TMP/calls/warm-ran" 2>/dev/null)" "/gate-cache/owner_repo/tools/work-"
+expect "#60: with the network" "$(cat "$TMP/calls/bwrap.log")" "ARG --share-net"
+expect "#60: recording the base's lockfile blob in \$STATE/gate-cache" "$(cat "$DEPDIR/warmed.json" 2>/dev/null)" "\"blob\": \"$LOCKBLOB\""
+expect "#60: and the base SHA it was warmed from" "$(cat "$DEPDIR/warmed.json" 2>/dev/null)" "\"base_sha\": \"$BASESHA\""
+expect "#60: run gets --cache-root and --repo, so install sees a copy of the cache" "$(tr '\n' ' ' < "$TMP/calls/bwrap.log")" "/state/runs/gate-cache-"
+expect "#60: the green gate lets the controller push" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "#60: and the resolve is done" "$(labels)" "agent:done"
+expect "#60: the receipt names the dep" "$(receipt)" '"name": "tools"'
+expect "#60: its lockfile" "$(receipt)" '"lockfile": "justfile"'
+expect "#60: the lockfile blob its cache was warmed from" "$(receipt)" "\"blob\": \"$LOCKBLOB\""
+expect "#60: and that it was warmed for this job" "$(receipt)" '"status": "warmed"'
+expect "#60: the posted gate section names the dep's blob" "$(last_comment)" "tools (\`justfile\` blob \`${LOCKBLOB:0:12}\`)"
+
+mv "$TMP/state/gate-cache" "$TMP/gate-cache.keep"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+mkdir -p "$TMP/state"; mv "$TMP/gate-cache.keep" "$TMP/state/gate-cache"
+behave claude resolve-fix
+tick
+expect "#60: a cache already warmed at the base's lockfile blob is not warmed again" "$(just_order)" "install gate "
+expect_not "#60: (no warm ran)" "$(just_order)" "warm"
+expect "#60: the log says it was fresh" "$(cat "$TMP/out.txt")" "dependency caches ready (tools=fresh)"
+expect "#60: the receipt says so, with the same blob" "$(receipt)" '"status": "fresh"'
+expect "#60: (blob)" "$(receipt)" "\"blob\": \"$LOCKBLOB\""
+expect "#60: and the resolve is done" "$(labels)" "agent:done"
+
+CACHE_FAULT="$TMP/state/faults/gates-cache/owner__repo.json"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+behave claude resolve-fix; behave warm fail
+AGENT_POOL_GATE_CACHE_PAUSE_SECS=600 tick
+expect "#60: a failed warm pushes nothing" "$(origin_head)" "$SHA"
+expect "#60: and runs no install or gate after it" "$(just_order)" "warm "
+expect_not "#60: (no install)" "$(just_order)" "install"
+expect "#60: (no gate)" "$(gate_ran)" "none"
+expect "#60: the job is requeued" "$(labels)" "agent:ready"
+expect_not "#60: not a needs-human (no gate refused the candidate)" "$(labels)" "agent:needs-human"
+expect "#60: as a gate cache fault of this repo, naming the warm" "$(cat "$TMP/out.txt")" "GATE CACHE FAULT [owner/repo]: warming dependency cache tools"
+expect_not "#60: not a global gates setup fault" "$(cat "$TMP/out.txt")" "SETUP FAULT [gates]"
+expect "#60: so faults/gates.json is not written" "$([ -e "$TMP/state/faults/gates.json" ] && echo written || echo absent)" "absent"
+expect "#60: the repo's own fault is" "$(cat "$CACHE_FAULT" 2>/dev/null)" '"repo": "owner/repo"'
+expect "#60: naming the failed dep" "$(cat "$CACHE_FAULT" 2>/dev/null)" '"name": "tools"'
+expect "#60: its lockfile" "$(cat "$CACHE_FAULT" 2>/dev/null)" '"lockfile": "justfile"'
+expect "#60: and that lockfile's blob at the base" "$(cat "$CACHE_FAULT" 2>/dev/null)" "\"blob\": \"$LOCKBLOB\""
+expect "#60: the base SHA" "$(cat "$CACHE_FAULT" 2>/dev/null)" "\"base_sha\": \"$BASESHA\""
+expect "#60: the warm's reason" "$(cat "$CACHE_FAULT" 2>/dev/null)" "warming dependency cache tools: warm 'tools' exited 1"
+expect "#60: expiring after AGENT_POOL_GATE_CACHE_PAUSE_SECS" \
+  "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(round(d["expires_at"] - d["at"]))' "$CACHE_FAULT" 2>/dev/null)" "600"
+expect "#60: the tick exits 2" "$TICK_RC" "2"
+expect "#60: the provider is not cooled down" "$(cooldown_doc claude)" "none"
+expect "#60: nor charged a setup fault" "$(cat "$TMP/state/faults/claude.json" 2>/dev/null || echo none)" "none"
+expect_not "#60: no comment is posted" "$(comments)" "pool stopped"
+expect "#60: the receipt records the warm as infra" "$(receipt)" '"result": "infra"'
+expect "#60: with the warm's reason" "$(receipt)" "warming dependency cache tools: warm 'tools' exited 1"
+expect "#60: and the dep marked failed" "$(receipt)" '"status": "failed"'
+expect "#60: no cache was swapped in" "$([ -e "$DEPDIR/cache" ] && echo swapped || echo none)" "none"
+
+tick
+expect "#60: while the repo's fault stands, its resolve jobs are not claimed" "$(cat "$TMP/out.txt")" "owner/repo: resolve jobs for this repo are paused"
+expect "#60: saying why and how to retry sooner" "$(cat "$TMP/out.txt")" "delete $CACHE_FAULT to retry sooner"
+expect "#60: so the provider is not run again" "$(ncalls claude)" "1"
+expect "#60: and the job stays queued" "$(labels)" "agent:ready"
+
+AGENT_POOL_REPO=other/repo tick
+expect_not "#60: another repo's resolve jobs are not paused" "$(cat "$TMP/out.txt")" "are paused"
+expect "#60: its provider runs" "$(ncalls claude)" "2"
+expect "#60: and its fix is gated and published" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "#60: (done)" "$(labels)" "agent:done"
+expect "#60: (with its own passing receipt)" "$(cat "$TMP/state/gates/other_repo__7__"*.json 2>/dev/null)" '"result": "pass"'
+expect "#60: the first repo's fault still stands" "$([ -e "$CACHE_FAULT" ] && echo present || echo gone)" "present"
+
+cp "$CACHE_FAULT" "$TMP/cache-fault.keep"
+reset '["agent:ready"]' '[]' "$REVIEW_MARKER"
+mkdir -p "$(dirname "$CACHE_FAULT")"
+python3 -c 'import json,sys,time; d=json.load(open(sys.argv[1])); d["expires_at"]=time.time()-1; json.dump(d, open(sys.argv[2], "w"))' \
+  "$TMP/cache-fault.keep" "$CACHE_FAULT"
+rm -f "$TMP/cache-fault.keep"
+behave claude resolve-fix
+tick
+expect_not "#60: an expired fault no longer pauses the repo" "$(cat "$TMP/out.txt")" "are paused"
+expect "#60: the next resolve warms again" "$(just_order)" "warm install gate "
+expect "#60: and is published" "$(git --git-dir "$ORIGIN" log -1 --format=%s feature/x)" "fix: something"
+expect "#60: (done)" "$(labels)" "agent:done"
+expect "#60: the passing warm clears the repo's fault" "$([ -e "$CACHE_FAULT" ] && echo present || echo gone)" "gone"
+expect "#60: and says so" "$(cat "$TMP/out.txt")" "gate cache fault is cleared"
+rm -rf "$TMP/gates-override"
 
 reset '["agent:ready"]' '[]' "$(marker_for "$ATTR_SHA")" feature/attr
 printf '[filter "evil"]\n\tsmudge = sed s/ORIGINAL/PWNED-GLOBAL/\n\tclean = cat\n' > "$HOME/.gitconfig"
@@ -1032,6 +1166,7 @@ echo "pre-verify: already-done work is settled without a provider"
 reset '["agent:ready"]' '[]' "$CLEAN_MARKER"
 tick
 expect "a PR whose head already has a clean review is agent:done" "$(labels)" "agent:done"
+expect "  ... and review:clean" "$(labels)" "review:clean,agent:done"
 expect "without spawning a provider" "$(ncalls claude)" "0"
 RESOLVE_DONE="$(python3 -c 'import json,sys; s,r=sys.argv[1:]; print(json.dumps([
   {"id":1,"user":"bot","created_at":"","body":f"## Automated review\n1. x\n<!-- pulse-review:v1 head={s} findings=1 -->"},
@@ -1040,6 +1175,7 @@ reset '["agent:ready"]' '[]' "$RESOLVE_DONE"
 git --git-dir "$ORIGIN" update-ref refs/heads/feature/x "$RESOLVED"
 PROVIDER_ORDER=agy tick
 expect "G6: an already-verified resolve is settled even when no provider takes resolve jobs" "$(labels)" "agent:done"
+expect "G6: and review:resolved" "$(labels)" "review:resolved,agent:done"
 expect "G6: the log says why" "$(cat "$TMP/out.txt")" "already verified at $RESOLVED"
 expect_not "G6: it is not skipped for want of a resolve provider" "$(cat "$TMP/out.txt")" "no eligible provider takes resolve"
 expect "G6: and no provider ran" "$(ncalls agy)" "0"

@@ -10,7 +10,9 @@ Setup faults (a permission the pool's own configuration denied, a missing binary
 model) are NOT limits: retrying later will fail the same way until a person fixes the
 setup, and a cooldown would only hide that. They go to faults/<provider>.json instead,
 which nothing reads to gate selection, except faults/gates.json (the controller's gate
-sandbox): while it exists, prod-common.sh claims no resolve job.
+sandbox): while it exists, prod-common.sh claims no resolve job. A repo's failed dependency warm
+is not recorded here: gates.py cache-fault writes faults/gates-cache/<owner>__<name>.json,
+which pauses only that repo's resolve jobs, and only until it expires.
 
 Ability-level cooldowns live in the same document, under "abilities": {"<ability>": {strikes,
 since, until, seconds, reason}}, with the same strike, lapse and fixed-pause rules. A

@@ -488,6 +488,19 @@ expect "#31: a gate sandbox fault pauses resolve" "$(at 60000 caps check-queue -
 expect "#31: and test-author" "$(at 60000 caps check-queue --order claude --requires test-author --roster claude | field verdict)" "gates-paused"
 expect "#31: but not review" "$(at 60000 caps check-queue --order claude --requires review --roster claude | field verdict)" "claimable"
 rm -f "$CAPSTATE/faults/gates.json"
+mkdir -p "$CAPSTATE/faults/gates-cache"
+echo '{"repo": "owner/a", "reason": "warm failed", "at": 59000, "expires_at": 62600}' > "$CAPSTATE/faults/gates-cache/owner__a.json"
+expect "#60: a repo's gate cache fault pauses that repo's resolve" \
+  "$(at 60000 caps check-queue --order claude --requires resolve --roster claude --repo owner/a | field verdict)" "gates-paused"
+expect "#60: naming its fault file" \
+  "$(at 60000 caps check-queue --order claude --requires resolve --roster claude --repo owner/a | field reason)" "gates-cache/owner__a.json"
+expect "#60: but not another repo's" \
+  "$(at 60000 caps check-queue --order claude --requires resolve --roster claude --repo owner/b | field verdict)" "claimable"
+expect "#60: nor a review on that repo" \
+  "$(at 60000 caps check-queue --order claude --requires review --roster claude --repo owner/a | field verdict)" "claimable"
+expect "#60: and it lapses at expires_at" \
+  "$(at 62600 caps check-queue --order claude --requires resolve --roster claude --repo owner/a | field verdict)" "claimable"
+rm -rf "$CAPSTATE/faults/gates-cache"
 
 echo
 echo "#31: repoconfig roster (AGENT_POOL_ROSTER = [pool].providers) and per-repo REPO_ROSTER"

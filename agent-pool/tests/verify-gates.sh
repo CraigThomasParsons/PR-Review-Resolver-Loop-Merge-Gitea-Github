@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Offline cases for agent-pool/scripts/gates.py, issue #14, docs/plans/controller-gates.md:
 # the pinned manifest (load/validate/select/protected), the diff and receipt helpers the
-# controller uses, and the sandboxed runner (`run`). The runner's real-sandbox cases need an
+# controller uses, the sandboxed runner (`run`) and the [[deps]] cache (`warm` and run's
+# install, issue #60, through a fake sandbox). The runner's real-sandbox cases need an
 # unprivileged bwrap and a systemd user manager; without them (or with
 # AGENT_POOL_TEST_REAL_SANDBOX=0) they are reported as SKIP and counted, never passed. They talk
 # only to a loopback listener this script opens and to fixture credentials in a temp HOME.
@@ -139,6 +140,61 @@ expect "an argv[0] outside GATE_RUNNERS" "$out" "'rustc' is outside GATE_RUNNERS
 
 validate "$EXAMPLE" > /dev/null 2>"$TMP/example.err"
 expect "the shipped example manifest itself validates clean" "$(cat "$TMP/example.err")" ""
+
+echo "validate checks [[deps]] (issue #60)"
+cat > "$TMP/deps-good.toml" <<'EOF'
+version = 1
+[[deps]]
+name     = "web_npm-1"
+cwd      = "web"
+lockfile = "web/package-lock.json"
+warm     = ["npm", "ci", "--ignore-scripts"]
+install  = ["npm", "ci", "--offline"]
+[[deps]]
+name     = "php"
+lockfile = "composer.lock"
+warm     = ["composer", "install", "--no-scripts", "--no-plugins"]
+install  = ["composer", "install"]
+EOF
+validate "$TMP/deps-good.toml" > /dev/null 2>"$TMP/deps-good.err"; rc=$?
+expect "two well-formed deps validate clean" "$(cat "$TMP/deps-good.err")" ""
+expect "exit 0" "$rc" "0"
+
+cat > "$TMP/deps-bad.toml" <<'EOF'
+version = 1
+[[deps]]
+name     = "a b"
+lockfile = "../package-lock.json"
+warm     = ["sh", "-c", "npm ci"]
+install  = "npm ci"
+[[deps]]
+name     = "dup"
+cwd      = "/abs"
+lockfile = "/etc/passwd"
+warm     = ["npm", "ci"]
+install  = ["npm", "ci"]
+[[deps]]
+name     = "dup"
+lockfile = "./a//lock"
+warm     = ["npm", "ci"]
+[[deps]]
+lockfile = "."
+warm     = ["npm", "ci"]
+install  = ["npm", "ci"]
+EOF
+out="$(validate "$TMP/deps-bad.toml" 2>&1)"; rc=$?
+expect "a dep name outside [A-Za-z0-9_-]" "$out" "deps[0]: name 'a b' must match [A-Za-z0-9_-]+"
+expect "a lockfile escaping the tree" "$out" "deps[0].lockfile: lockfile '../package-lock.json' must be a relative path inside the tree"
+expect "a warm argv[0] outside GATE_RUNNERS" "$out" "deps[0].warm: argv[0] 'sh' is outside GATE_RUNNERS"
+expect "an install given as a shell string" "$out" "deps[0].install: argv must be a non-empty list of strings"
+expect "a dep cwd that is absolute" "$out" "deps[1].cwd: cwd '/abs' must be a relative path inside the tree"
+expect "an absolute lockfile" "$out" "deps[1].lockfile: lockfile '/etc/passwd' must be a relative path inside the tree"
+expect "a duplicate dep name" "$out" "deps[2]: duplicate deps name 'dup'"
+expect "an unnormalised lockfile" "$out" "deps[2].lockfile: lockfile './a//lock' must be normalised"
+expect "a missing install" "$out" "deps[2].install: argv must be a non-empty list of strings"
+expect "a missing dep name" "$out" "deps[3]: name is required"
+expect "a lockfile of ." "$out" "deps[3].lockfile: lockfile '.' must name a file in the tree"
+expect "exits 2" "$rc" "2"
 
 # ---------------------------------------------------------------- load
 echo "load reads only the base blob, by SHA, never the worktree or PR head"
@@ -335,6 +391,65 @@ expect "annotate adds the gate section" "$body" "### Gates (run by the pool cont
 expect "and the gate marker before the resolve marker" "${body%%pulse-resolve*}" "agent-pool-gates:v1 head=$H1 manifest=abc123 result=pass"
 expect "keeping the resolve marker as the last line" "$(tail -1 "$TMP/report.gated")" "pulse-resolve:v1 head=$H1"
 expect "keeping the worker's text" "$body" "Fixed: 1"
+expect "a receipt with no warm lists no deps" "$(cat "$ST/gates/owner_repo__7__att-a.json")" '"deps": []'
+expect_not "and its gate section names none" "$body" "Dependencies were installed"
+
+H3=3333333333333333333333333333333333333333; H4=4444444444444444444444444444444444444444
+printf '{"result": "pass", "reason": "", "deps": [{"name": "web", "lockfile": "web/package-lock.json", "status": "warmed", "blob": "b10b5ea", "base_sha": "%s", "secs": 3, "log": "warm-latest-web.log"}]}' \
+  "$H2" > "$TMP/warm.json"
+python3 "$GATES" receipt --state "$ST" --repo owner/repo --pr 7 --attempt att-d --provider claude --base-sha "$H2" \
+  --pr-head "$H2" --head "$H3" --source base --blob abc123 --result pass --warm "$TMP/warm.json" >/dev/null
+out="$(cat "$ST/gates/owner_repo__7__att-d.json")"
+expect "#60: a receipt given warm's output lists each dep" "$out" '"name": "web"'
+expect "with its lockfile" "$out" '"lockfile": "web/package-lock.json"'
+expect "the lockfile blob its cache was warmed from" "$out" '"blob": "b10b5ea"'
+expect "and the commit it was warmed at" "$out" "\"base_sha\": \"$H2\""
+expect_not "but none of warm's log details" "$out" "warm-latest-web.log"
+check att-d "$H3" >/dev/null
+expect "check-receipt passes it like any other" "$?" "0"
+python3 "$GATES" annotate --report "$TMP/report.md" --receipt "$ST/gates/owner_repo__7__att-d.json" --out "$TMP/report.deps"
+expect "annotate names the dep's lockfile blob" "$(cat "$TMP/report.deps")" "web (\`web/package-lock.json\` blob \`b10b5ea\`)"
+echo 'not json' > "$TMP/warm-bad.json"
+python3 "$GATES" receipt --state "$ST" --repo owner/repo --pr 7 --attempt att-e --provider claude --base-sha "$H2" \
+  --pr-head "$H2" --head "$H4" --source base --blob abc123 --result infra --warm "$TMP/warm-bad.json" >/dev/null
+expect "an unreadable warm output still writes the receipt, with no deps" "$(cat "$ST/gates/owner_repo__7__att-e.json" 2>/dev/null)" '"deps": []'
+# A receipt written before [[deps]] existed has no "deps" key at all.
+python3 -c 'import json, sys
+json.dump({"version": 1, "repo": "owner/repo", "pr": 7, "attempt_id": "att-old", "provider": "claude", "base_sha": sys.argv[2],
+           "pr_head": sys.argv[2], "head": sys.argv[2], "manifest": {"source": "base", "blob": "abc123"}, "result": "pass",
+           "reason": "", "gates": [], "created_at": ""}, open(sys.argv[1], "w"))' "$ST/gates/owner_repo__7__att-old.json" "$H4"
+check att-old "$H4" >/dev/null
+expect "check-receipt still accepts a receipt with no deps key" "$?" "0"
+python3 "$GATES" annotate --report "$TMP/report.md" --receipt "$ST/gates/owner_repo__7__att-old.json" --out "$TMP/report.old"
+expect "and annotate still renders it" "$(cat "$TMP/report.old")" "agent-pool-gates:v1 head=$H4 manifest=abc123 result=pass"
+
+echo "#60: a failed warm pauses only its own repo, until the fault expires or is cleared"
+cf() { python3 "$GATES" "$@" --state "$ST" --repo owner/repo 2>&1; }
+CF="$ST/faults/gates-cache/owner__repo.json"
+printf '{"result": "infra", "reason": "warming dependency cache web: x", "deps": [{"name": "web", "lockfile": "web/package-lock.json", "status": "failed", "blob": "b10b5ea", "base_sha": ""}, {"name": "ok", "lockfile": "ok.lock", "status": "fresh", "blob": "0kb10b", "base_sha": "%s"}]}' \
+  "$H2" > "$TMP/warm-fail.json"
+out="$(AGENT_POOL_NOW=1000 cf cache-fault --base-sha "$H2" --warm "$TMP/warm-fail.json")"
+expect "cache-fault writes faults/gates-cache/<owner>__<name>.json" "$out" "$CF"
+expect "naming the repo" "$(cat "$CF")" '"repo": "owner/repo"'
+expect "the warm's reason" "$(cat "$CF")" "warming dependency cache web: x"
+expect "the base SHA" "$(cat "$CF")" "\"base_sha\": \"$H2\""
+expect "the failed dep's lockfile blob" "$(cat "$CF")" '"blob": "b10b5ea"'
+expect_not "but not a dep that was fine" "$(cat "$CF")" '"name": "ok"'
+expect "expiring an hour later by default" "$(cat "$CF")" '"expires_at": 4600'
+expect "cache-pause reports it before then" "$(AGENT_POOL_NOW=4599 cf cache-pause)" "paused"
+expect "with its reason" "$(AGENT_POOL_NOW=4599 cf cache-pause)" "warming dependency cache web: x"
+expect "but another repo is clear" "$(AGENT_POOL_NOW=4599 python3 "$GATES" cache-pause --state "$ST" --repo owner/other)" "clear"
+expect "and it lapses at expires_at" "$(AGENT_POOL_NOW=4600 cf cache-pause)" "clear"
+AGENT_POOL_NOW=5000 AGENT_POOL_GATE_CACHE_PAUSE_SECS=60 cf cache-fault --base-sha "$H2" --warm "$TMP/warm-fail.json" >/dev/null
+expect "a second failure is counted" "$(cat "$CF")" '"count": 2'
+expect "and AGENT_POOL_GATE_CACHE_PAUSE_SECS sets the pause" "$(cat "$CF")" '"expires_at": 5060'
+echo 'not json' > "$CF"
+expect "an unreadable fault still pauses" "$(cf cache-pause)" "paused"
+expect "but expires from its mtime" "$(AGENT_POOL_NOW=$(( $(date +%s) + 3700 )) cf cache-pause)" "clear"
+expect "cache-clear deletes it" "$(cf cache-clear)" "$CF"
+expect "(gone)" "$([ -e "$CF" ] && echo present || echo gone)" "gone"
+expect "and then it is clear" "$(cf cache-pause)" "clear"
+expect "cache-clear with no fault is a quiet no-op" "[$(cf cache-clear)] rc=$?" "[] rc=0"
 
 # ---------------------------------------------------------------- run: refusals before any sandbox
 echo "run fails closed (infra) before running anything"
@@ -371,9 +486,10 @@ out="$(run_gate cfg "${NOOP[@]}" AGENT_POOL_GATE_RO_BINDS="$FAKEHOME/.config/som
 expect "and anything under a credential directory" "$out" "overlaps $FAKEHOME/.config"
 out="$(run_gate rel "${NOOP[@]}" AGENT_POOL_GATE_RO_BINDS="tc")"
 expect "and a relative path" "$out" "is not an absolute path"
-gate_manifest '["just", "env"]' ', "deps": [{"name": "d", "lockfile": "package-lock.json", "install": ["npm", "ci"]}]'
+gate_manifest '["just", "env"]' ', "deps": [{"name": "d", "lockfile": "package-lock.json", "warm": ["npm", "ci", "--ignore-scripts"], "install": ["npm", "ci", "--offline"]}]'
 out="$(run_gate deps "${NOOP[@]}")"
-expect "a manifest with [[deps]] is infra until the dependency cache exists" "$out" "declares [[deps]]"
+expect "a manifest with [[deps]] is infra without --cache-root and --repo" "$out" "run needs --cache-root and --repo"
+expect_not "and is no longer refused as not built" "$out" "not built yet"
 gate_manifest '["sh", "-c", "true"]'
 out="$(run_gate badargv "${NOOP[@]}")"
 expect "run re-validates the manifest it is given" "$out" "the manifest fails validation"
@@ -386,6 +502,179 @@ mkdir -p "$TMP/gd/.git"
 out="$(run_gate gitdir "${NOOP[@]}")"
 expect "a gate checkout that has a .git is infra" "$out" "is a git checkout"
 rmdir "$TMP/gd/.git"
+
+# ---------------------------------------------------------------- warm and install: a fake sandbox
+echo "warm and run's install with [[deps]] (issue #60), through a fake systemd-run and bwrap"
+# The fake bwrap logs its argv, reports child-pid and exit-code on --json-status-fd like the real
+# one, honours --clearenv/--setenv/--chdir, and emulates each --bind by rewriting the sandbox path
+# to the host path, so the fake runners below touch the real staging dir, cache copy and tree.
+cat > "$TMP/fake-bwrap" <<PY
+#!$(python3 -c 'import sys; print(sys.executable)')
+import json, os, subprocess, sys
+args = sys.argv[1:]
+with open("$TMP/bwrap-argv", "a") as log:
+    log.write(" ".join(args) + "\n")
+binds, env, chdir, fd, i = {}, {}, "/", None, 0
+while args[i] != "--":
+    flag = args[i]
+    if flag in ("--ro-bind", "--ro-bind-try", "--bind", "--symlink", "--setenv"):
+        if flag == "--bind":
+            binds[args[i + 2]] = args[i + 1]
+        elif flag == "--setenv":
+            env[args[i + 1]] = args[i + 2]
+        i += 3
+    elif flag in ("--json-status-fd", "--chdir", "--proc", "--dev", "--tmpfs", "--dir"):
+        if flag == "--json-status-fd":
+            fd = int(args[i + 1])
+        elif flag == "--chdir":
+            chdir = args[i + 1]
+        i += 2
+    else:
+        i += 1
+def host(path):
+    for dst in sorted(binds, key=len, reverse=True):
+        if path == dst or path.startswith(dst + "/"):
+            return binds[dst] + path[len(dst):]
+    return path
+os.write(fd, b'{"child-pid": 1}\n')
+rc = subprocess.call(args[i + 1:], cwd=host(chdir), env={k: host(v) for k, v in env.items()})
+os.write(fd, json.dumps({"exit-code": rc}).encode() + b"\n")
+sys.exit(rc)
+PY
+printf '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n' > "$TMP/fake-scope"
+mkdir -p "$TMP/dtc/bin"
+cat > "$TMP/dtc/bin/npm" <<SH
+#!/bin/sh
+case "\$1" in
+  warm)        echo "warm \$(cat package-lock.json)" >> "$TMP/npm-calls"
+               mkdir -p "\$npm_config_cache" && cat package-lock.json > "\$npm_config_cache/pkg" ;;
+  warmfail)    mkdir -p "\$npm_config_cache" && echo junk > "\$npm_config_cache/pkg"; exit 4 ;;
+  install)     [ -f "\$npm_config_cache/pkg" ] || { echo "cache miss"; exit 1; }
+               cp "\$npm_config_cache/pkg" node_modules-pkg
+               echo scratch > "\$npm_config_cache/scratch"
+               echo "DISABLE=\$COMPOSER_DISABLE_NETWORK" ;;
+  installfail) echo "ENOTCACHED"; exit 5 ;;
+  gate)        [ -f "\$npm_config_cache/pkg" ] && echo CACHE=bound
+               echo "NODE_PKG=\$(cat node_modules-pkg)"
+               echo "DISABLE=\$COMPOSER_DISABLE_NETWORK" ;;
+esac
+SH
+chmod +x "$TMP/fake-bwrap" "$TMP/fake-scope" "$TMP/dtc/bin/npm"
+FAKE=(AGENT_POOL_GATE_SANDBOX="$TMP/fake-bwrap" AGENT_POOL_GATE_SCOPE="$TMP/fake-scope" AGENT_POOL_GATE_RO_BINDS="$TMP/dtc")
+
+DREPO="$TMP/deps-repo"
+mkdir -p "$DREPO/web"
+git -C "$DREPO" init -q
+echo lock-v1 > "$DREPO/web/package-lock.json"
+git -C "$DREPO" add web/package-lock.json
+git -C "$DREPO" -c user.email=t@e -c user.name=t commit -q -m v1
+DBASE="$(git -C "$DREPO" rev-parse HEAD)"
+DBLOB1="$(git -C "$DREPO" rev-parse HEAD:web/package-lock.json)"
+# The normal home of the cache: under the state dir, which is otherwise refused.
+DCACHE="$FAKEHOME/.local/state/agent-pool/gate-cache"
+DWEB="$DCACHE/owner_repo/web"
+deps_manifest() { # warm-verb install-verb
+  printf '{"version": 1, "defaults": {"timeout": 10, "budget": 30}, "deps": [{"name": "web", "cwd": "web", "lockfile": "web/package-lock.json", "warm": ["npm", "%s"], "install": ["npm", "%s"]}], "gate": [{"name": "g", "cwd": "web", "argv": ["npm", "gate"], "paths": ["**"]}]}' \
+    "$1" "$2" > "$TMP/deps-manifest.json"
+}
+warm() { # [VAR=value...]
+  env HOME="$FAKEHOME" AGENT_POOL_STATE= "${FAKE[@]}" "$@" python3 "$GATES" warm --manifest "$TMP/deps-manifest.json" \
+    --main "$DREPO" --base-sha "$DBASE" --cache-root "$DCACHE" --repo owner/repo 2>&1
+}
+calls() { wc -l < "$TMP/npm-calls" 2>/dev/null | tr -d ' ' || echo 0; }
+
+deps_manifest warm install
+: > "$TMP/bwrap-argv"
+out="$(warm)"
+expect "the first warm passes" "$out" '"result": "pass"'
+expect "and warms the dep" "$out" '"status": "warmed"'
+expect "reporting the lockfile blob it warmed from" "$out" "\"blob\": \"$DBLOB1\""
+expect "and the base SHA it warmed at" "$out" "\"base_sha\": \"$DBASE\""
+expect "running warm once, in the BASE_SHA tree" "$(cat "$TMP/npm-calls")" "warm lock-v1"
+expect "into the swapped-in cache" "$(cat "$DWEB/cache/npm/pkg" 2>/dev/null)" "lock-v1"
+expect "recording the lockfile blob" "$(cat "$DWEB/warmed.json")" "\"blob\": \"$DBLOB1\""
+expect "and the base SHA" "$(cat "$DWEB/warmed.json")" "\"base_sha\": \"$DBASE\""
+expect "warm keeps the network (--share-net)" "$(cat "$TMP/bwrap-argv")" "--unshare-all --share-net"
+expect "still with --clearenv" "$(cat "$TMP/bwrap-argv")" "--clearenv"
+expect "and a tmpfs home" "$(cat "$TMP/bwrap-argv")" "--tmpfs /home"
+expect "its staging dir is bound at /cache" "$(cat "$TMP/bwrap-argv")" "/cache --bind"
+expect "with the cache env" "$(cat "$TMP/bwrap-argv")" "--setenv npm_config_cache /cache/npm"
+expect_not "but not COMPOSER_DISABLE_NETWORK" "$(cat "$TMP/bwrap-argv")" "COMPOSER_DISABLE_NETWORK"
+expect_not "never the cache root itself" "$(cat "$TMP/bwrap-argv")" "--bind $DCACHE /"
+expect "the export dir is gone afterwards" "$(ls -d "$DWEB"/work-* 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+out="$(warm)"
+expect "a second warm at the same lockfile blob is fresh" "$out" '"status": "fresh"'
+expect "still reporting the base SHA its cache was warmed from" "$out" "\"base_sha\": \"$DBASE\""
+expect "and runs nothing" "$(calls)" "1"
+
+echo lock-v2 > "$DREPO/web/package-lock.json"
+git -C "$DREPO" -c user.email=t@e -c user.name=t commit -q -am v2
+DBASE="$(git -C "$DREPO" rev-parse HEAD)"
+DBLOB2="$(git -C "$DREPO" rev-parse HEAD:web/package-lock.json)"
+echo "worktree-only edit" > "$DREPO/web/package-lock.json"
+out="$(warm)"
+expect "a changed lockfile blob re-warms" "$out" '"status": "warmed"'
+expect "running warm again" "$(calls)" "2"
+expect "from the committed blob, never the worktree" "$(cat "$DWEB/cache/npm/pkg" 2>/dev/null)" "lock-v2"
+expect "recording the new blob" "$(cat "$DWEB/warmed.json")" "\"blob\": \"$DBLOB2\""
+expect "and only the new cache is left" "$(ls -d "$DWEB"/cache-* | wc -l | tr -d ' ')" "1"
+
+deps_manifest warmfail install
+out="$(warm)"
+expect "a changed warm definition re-warms, and a failing warm is infra" "$out" '"result": "infra"'
+expect "with the dep marked failed" "$out" '"status": "failed"'
+expect "naming the dep" "$out" "warming dependency cache web"
+expect "the previous cache is kept" "$(cat "$DWEB/cache/npm/pkg" 2>/dev/null)" "lock-v2"
+expect "and so is its warmed.json" "$(cat "$DWEB/warmed.json")" "\"blob\": \"$DBLOB2\""
+expect "the failed staging dir is discarded" "$(ls -d "$DWEB"/cache-* | wc -l | tr -d ' ')" "1"
+
+deps_manifest warm install
+out="$(warm)"
+expect "back on the warmed definition, it is fresh again" "$out" '"status": "fresh"'
+out="$(env HOME="$FAKEHOME" AGENT_POOL_STATE= "${FAKE[@]}" python3 "$GATES" warm --manifest "$TMP/deps-manifest.json" \
+  --main "$DREPO" --base-sha "$DBASE" --cache-root "$FAKEHOME/.ssh/cache" --repo owner/repo 2>&1)"
+expect "a cache root under a credential directory is infra" "$out" "overlaps $FAKEHOME/.ssh"
+
+mkdir -p "$TMP/dgd/web" "$TMP/druns" "$TMP/cold-cache"
+echo g > "$TMP/dselect"
+run_deps() { # tag [VAR=value...]
+  local tag="$1"; shift
+  env HOME="$FAKEHOME" AGENT_POOL_STATE= "${FAKE[@]}" "$@" python3 "$GATES" run --manifest "$TMP/deps-manifest.json" \
+    --gate-dir "$TMP/dgd" --select "$TMP/dselect" --runs "$TMP/druns" --tag "$tag" --budget 30 \
+    --cache-root "${DCACHE_RUN:-$DCACHE}" --repo owner/repo 2>&1
+}
+out="$(DCACHE_RUN="$TMP/cold-cache" run_deps cold)"
+expect "run with no warmed.json for a dep is infra" "$out" '"result": "infra"'
+expect "saying so" "$out" "dependency cache for web is not warmed"
+
+: > "$TMP/bwrap-argv"
+out="$(run_deps ok)"
+expect "install then the gate pass" "$out" '"result": "pass"'
+expect "the install is recorded under deps" "$(printf '%s' "$out" | python3 -c 'import json,sys; print([d["name"] for d in json.load(sys.stdin)["deps"]])')" "['web']"
+expect "install ran first, offline, from the cache" "$(cat "$TMP/druns/install-ok-web.log")" "DISABLE=1"
+expect_not "neither install nor the gate gets the network" "$(cat "$TMP/bwrap-argv")" "--share-net"
+expect "both lines are sandboxed" "$(grep -c -- '--unshare-all --die-with-parent' "$TMP/bwrap-argv")" "2"
+expect "the gate sees the cache copy at /cache" "$(tail -1 "$TMP/bwrap-argv")" "/cache --bind $TMP/dgd /work"
+expect "with npm_config_cache" "$(tail -1 "$TMP/bwrap-argv")" "--setenv npm_config_cache /cache/npm"
+expect "NUGET_PACKAGES" "$(tail -1 "$TMP/bwrap-argv")" "--setenv NUGET_PACKAGES /cache/nuget"
+expect "COMPOSER_CACHE_DIR" "$(tail -1 "$TMP/bwrap-argv")" "--setenv COMPOSER_CACHE_DIR /cache/composer"
+expect "COMPOSER_HOME" "$(tail -1 "$TMP/bwrap-argv")" "--setenv COMPOSER_HOME /cache/composer-home"
+expect "and COMPOSER_DISABLE_NETWORK" "$(tail -1 "$TMP/bwrap-argv")" "--setenv COMPOSER_DISABLE_NETWORK 1"
+expect "the gate reads the cache" "$(cat "$TMP/druns/gate-ok-g.log")" "CACHE=bound"
+expect "and what install left in the tree" "$(cat "$TMP/druns/gate-ok-g.log")" "NODE_PKG=lock-v2"
+expect "the per-run cache copy is deleted" "$(ls -d "$TMP/druns"/gate-cache-* 2>/dev/null | wc -l | tr -d ' ')" "0"
+expect "the warmed cache is unchanged" "$(ls -A "$DWEB/cache/npm" | tr '\n' ' ')" "pkg "
+expect "and its content too" "$(cat "$DWEB/cache/npm/pkg")" "lock-v2"
+
+deps_manifest warm installfail
+: > "$TMP/bwrap-argv"
+out="$(run_deps bad)"
+expect "an install failure is gate-fail" "$out" '"result": "gate-fail"'
+expect "saying why" "$out" "dependency install web failed (the cache may be stale or the worker changed dependencies)"
+expect "and no gate runs" "$out" '"gates": []'
+expect "(one sandbox only)" "$(wc -l < "$TMP/bwrap-argv" | tr -d ' ')" "1"
+expect "the cache copy is still deleted" "$(ls -d "$TMP/druns"/gate-cache-* 2>/dev/null | wc -l | tr -d ' ')" "0"
 
 # ---------------------------------------------------------------- run: the real sandbox
 echo "run in the real sandbox (bwrap inside a systemd user scope)"
@@ -509,6 +798,15 @@ SH
   sleep 0.5
   out="$(BUDGET=2 run_gate locked)"
   expect "the host-wide gate lock's wait counts against the budget" "$out" "ran out waiting for the host-wide gate lock"
+
+  printf '{"version": 1, "deps": [{"name": "web", "cwd": "web", "lockfile": "web/package-lock.json", "warm": ["just", "net"], "install": ["just", "env"]}], "gate": []}' \
+    > "$TMP/real-warm.json"
+  out="$(env HOME="$FAKEHOME" AGENT_POOL_STATE= AGENT_POOL_GATE_RO_BINDS="$TMP/tc" python3 "$GATES" warm \
+    --manifest "$TMP/real-warm.json" --main "$DREPO" --base-sha "$DBASE" --cache-root "$TMP/real-cache" \
+    --repo owner/repo --budget 20 2>&1)"
+  expect "a real warm passes" "$out" '"status": "warmed"'
+  expect "and, unlike a gate, reaches the host loopback listener" "$(cat "$TMP/connections" 2>/dev/null || echo none)" "connected"
+  expect "logging it beside the dep's cache" "$(cat "$TMP/real-cache/owner_repo/web/warm-latest-web.log" 2>/dev/null)" "NET=connected"
 else
   skipped=$((skipped + 1)); printf '  SKIP  real sandbox cases: %s\n' "$why"
 fi
