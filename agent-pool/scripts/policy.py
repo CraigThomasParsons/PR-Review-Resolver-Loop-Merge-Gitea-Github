@@ -413,7 +413,9 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
     if a.provider == "claude":
         # Claude rule paths: //abs is an absolute path.
         ab = lambda p: "/" + p if p.startswith("/") else p
-        tools = [f"Read({ab(r)}/**)" for r in read_roots(a)] + ["Grep", "Glob", f"Write({ab(a.report)})"]
+        # Claude Code checks the Write tool against Edit(path) rules only; a path-scoped
+        # Write(path) rule is accepted but never matched, so the report rule must be Edit.
+        tools = [f"Read({ab(r)}/**)" for r in read_roots(a)] + ["Grep", "Glob", f"Edit({ab(a.report)})"]
         if a.job in WRITING_JOBS:
             tools += [f"Edit({ab(wt)}/**)", f"Write({ab(wt)}/**)"]
         # Claude's PreToolUse hook runs the full `check`, which still denies every `$` and
