@@ -46,7 +46,17 @@ if line:
 PY
 }
 
+# Never the real pr-update.sh here: it would fetch and push a real checkout. The stub records
+# that it was called, and with what.
+cat > "$TMP/pr-update.sh" <<'SH'
+#!/usr/bin/env bash
+echo "pr-update called repo=$PR_LOOP_REPO base=$PR_UPDATE_BASE" >> "$UPDATE_CALLS"
+SH
+chmod +x "$TMP/pr-update.sh"
+export UPDATE_CALLS="$TMP/update-calls.log"
+
 run_tick() {
+  PR_UPDATE_BIN="$TMP/pr-update.sh" \
   DRY_RUN="${DRY_RUN_CASE:-0}" PR_LOOP_STATE="$TMP/state" \
     PR_MERGE_ADAPTER="$TMP/adapter.py" PR_MERGE_MARKER="$TMP/marker.py" \
     PR_LOOP_REPO=ElasticGun/TheNightCrew bash "$ROOT/pr-merge.sh" 2>&1
@@ -115,11 +125,31 @@ check "agent:needs-human blocks" "no eligible open PR"
 write_adapter '["agent:ready", "review:clean", "review:automerge"]' true
 check "agent:ready blocks even with review:clean" "no eligible open PR"
 
-echo "#31: ability requirement labels"
+echo "auto-update after a merge"
 expect() { # name got wanted-substring
   if [[ "$2" == *"$3"* ]]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
   else fail=$((fail+1)); printf '  FAIL  %s\n         wanted *%s*\n         got %s\n' "$1" "$3" "$2"; fi
 }
+write_marker_split "" "$SHA 0"
+write_adapter '["agent:done", "review:automerge"]' true
+rm -f "$UPDATE_CALLS"
+check "a merge still merges with the update hook" "merged head"
+expect "a merge runs pr-update.sh for the repo and base" "$(cat "$UPDATE_CALLS" 2>/dev/null)" \
+  "pr-update called repo=ElasticGun/TheNightCrew base=develop"
+rm -f "$UPDATE_CALLS"
+write_adapter '["review:clean"]' true
+check "no merge, no update" "no eligible open PR"
+expect "  ... pr-update.sh is not called" "[$(cat "$UPDATE_CALLS" 2>/dev/null)]" "[]"
+write_marker "$SHA"
+write_adapter '["review:resolved", "review:automerge"]' false
+check "a failed merge" "FAILED: not mergeable"
+expect "  ... does not run pr-update.sh" "[$(cat "$UPDATE_CALLS" 2>/dev/null)]" "[]"
+write_marker_split "" "$SHA 0"
+write_adapter '["agent:done", "review:automerge"]' true
+PR_UPDATE_AFTER_MERGE=0 check "PR_UPDATE_AFTER_MERGE=0 still merges" "merged head"
+expect "  ... without the update" "[$(cat "$UPDATE_CALLS" 2>/dev/null)]" "[]"
+
+echo "#31: ability requirement labels"
 ABILITY_LABELS=(agent:plan agent:review agent:prototype agent:test-author agent:resolve agent:promote)
 write_marker "$SHA"
 for l in "${ABILITY_LABELS[@]}"; do
