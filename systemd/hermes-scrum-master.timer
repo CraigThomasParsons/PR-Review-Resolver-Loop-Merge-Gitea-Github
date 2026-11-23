@@ -1,0 +1,12 @@
+[Unit]
+# Every 10 minutes at :04/:14/..., off the doctor's and the merge tick's minutes.
+Description=Hermes Scrum Master every 10 minutes
+
+[Timer]
+OnCalendar=*:04/10
+AccuracySec=30s
+Persistent=true
+Unit=hermes-scrum-master.service
+
+[Install]
+WantedBy=timers.target

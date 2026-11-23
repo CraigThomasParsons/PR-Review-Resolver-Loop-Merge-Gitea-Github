@@ -1,0 +1,45 @@
+# Hermes Scrum Master config. Copy to ~/.config/hermes-scrum-master/config.toml.
+# No secrets go in this file: tokens live in the files named below (mode 600), or in the
+# environment (GITEA_TOKEN, SLACK_BOT_TOKEN) via ~/.config/hermes-scrum-master/env.
+
+[gitea]
+# API calls go to the LAN address; every link Craig sees is rewritten to the Tailscale one.
+api_base = "http://192.168.2.48:3000"
+public_base = "http://ubuntu-2404.tail99f840.ts.net:3000"
+# The same token the PR loops use (gitea-pr.py). Its user must be able to comment.
+token_file = "~/.config/pulse/gitea_token"
+labels = ["agent:needs-human", "review:needs-human"]
+# Empty means every repo the token can see.
+repos = []
+
+[nightcrew]
+enabled = true
+# Opened with mode=ro and PRAGMA query_only; never written, and NightCrew's HTTP API is not used.
+db_path = "~/Code/TheNightCrew/database/database.sqlite"
+# A claimed/running/parked job with no heartbeat for this long (or a lapsed lease) is stuck.
+stuck_after_minutes = 90
+# Failures older than this (UTC, "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS") are not asked about.
+# Set it on first install so the backlog of old failures does not arrive at once.
+ignore_failed_before = ""
+repos = []
+
+[slack]
+# A Slack bot token (xoxb-...) with chat:write, im:write and im:history.
+token_file = "~/.config/hermes-scrum-master/slack_bot_token"
+# Craig's Slack user id. Only replies from this id are ever relayed.
+craig_user_id = "U046V73R3LN"
+
+[ask]
+# New questions per tick; the rest wait for the next tick.
+max_new_per_tick = 5
+# Replies are looked for this long after a question was asked.
+answer_window_days = 14
+
+[relay]
+# Who a relayed answer is addressed to, by label. A PR whose label has no entry here is
+# addressed to its author.
+nightcrew_mention = ""
+
+[relay.mentions]
+# "agent:needs-human" = "@doctor"
+# "review:needs-human" = "@tea-drinker"

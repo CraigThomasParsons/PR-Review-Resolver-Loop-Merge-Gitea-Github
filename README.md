@@ -51,6 +51,12 @@ An alternate form of this I would like to enable are long living feature branche
   The worker never commits or publishes. `night_shift_maintenance.sh <project_dir> quality` runs the
   offline verify suites (closed allowlist). `night_shift_gitea.py` makes the launcher's
   Gitea calls. See #18.
+- `scrum-master/`: the Hermes Scrum Master, a non-LLM fallback for when Grok Bot is rate
+  limited. Each tick asks Craig by Slack DM about every open PR labelled `agent:needs-human` or
+  `review:needs-human` and every failed or stuck NightCrew job (NightCrew's DB is opened
+  read-only), one lettered question per item, re-asked only when the item changes, and posts his
+  exact reply as a Gitea comment. It never acts on an answer. `systemd/hermes-scrum-master.*` is
+  installed by hand only. See `scrum-master/README.md`.
 - `skills/pr-merge-loop/` — a **third, deliberately separate, mechanical**
   tick. No model worker at all: it merges only PRs an operator has explicitly
   labelled `review:automerge`, that also carry `review:clean`,
@@ -187,6 +193,7 @@ agent-pool/tests/verify-systemd-units.sh
 agent-pool/tests/verify-agent-labels.sh
 agent-pool/tests/verify-conduits.sh
 scripts/tools/tests/verify-night-shift.sh
+scrum-master/tests/verify-scrum-master.sh
 ```
 
 `verify-conduits.sh` also needs Behave: it runs under `${CONDUITS_PYTHON:-python3}` and fails

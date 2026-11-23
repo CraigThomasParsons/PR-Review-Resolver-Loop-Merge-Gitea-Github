@@ -1,0 +1,17 @@
+[Unit]
+# Hermes Scrum Master: asks Craig about Needs-Human items by Slack DM and relays his exact answer
+# to Gitea. Non-LLM, so it keeps working while Grok Bot is rate limited. See
+# scrum-master/README.md. Not installed or enabled by anything in this repo: copy it into
+# ~/.config/systemd/user/ by hand, replacing @HSM_ROOT@ with this checkout's path, once Craig
+# says go.
+Description=Hermes Scrum Master: Needs-Human questions for Craig
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
+EnvironmentFile=-%h/.config/hermes-scrum-master/env
+ExecStart=/usr/bin/python3 @HSM_ROOT@/scrum-master/scrum_master.py tick
+# The JSON report goes to the journal with the error lines.
+TimeoutStartSec=10min
