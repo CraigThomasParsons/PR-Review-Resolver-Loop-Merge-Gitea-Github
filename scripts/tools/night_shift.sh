@@ -20,7 +20,7 @@
 #
 # Environment:
 #   NIGHT_SHIFT_REPO          owner/name (default craigpars/PR-Review-Resolver-Loop-Merge-Gitea-Github)
-#   NIGHT_SHIFT_BASE          base branch (default master)
+#   NIGHT_SHIFT_BASE          base branch (default develop)
 #   NIGHT_SHIFT_CURSOR_MODEL  always passed as --model (default auto)
 #   NIGHT_SHIFT_TIMEOUT       agent wall clock in seconds (default 10800)
 #   CURSOR_AGENT_BIN          default ~/.local/bin/cursor-agent
@@ -86,7 +86,7 @@ fi
 PROJECT_DIR="$(cd -- "$PROJECT_DIR" && pwd -P)"
 
 REPO="${NIGHT_SHIFT_REPO:-craigpars/PR-Review-Resolver-Loop-Merge-Gitea-Github}"
-BASE_BRANCH="${NIGHT_SHIFT_BASE:-master}"
+BASE_BRANCH="${NIGHT_SHIFT_BASE:-develop}"
 MODEL="${NIGHT_SHIFT_CURSOR_MODEL:-auto}"
 AGENT_TIMEOUT="${NIGHT_SHIFT_TIMEOUT:-10800}"
 CURSOR_AGENT_BIN="${CURSOR_AGENT_BIN:-$HOME/.local/bin/cursor-agent}"

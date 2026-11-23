@@ -21,7 +21,7 @@ unset GITEA_TOKEN NIGHT_CREW_TASK_RECEIPT GIT_CONFIG_COUNT http_proxy HTTP_PROXY
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
 export GIT_CONFIG_GLOBAL="$TMP/gitconfig"
-git config --file "$GIT_CONFIG_GLOBAL" init.defaultBranch master
+git config --file "$GIT_CONFIG_GLOBAL" init.defaultBranch develop
 
 pass=0
 fail=0
@@ -161,7 +161,7 @@ state_of() { # issue -> "state reason" from the launcher's state file, or "none"
 }
 state_message() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["message"])' "$PROJECT/logs/runs/issue-$1-state.json" 2>/dev/null; }
 # A local branch that still sits on the base: nothing was committed on it.
-on_base() { [ "$(git -C "$PROJECT" rev-parse "feature/$1-nightcrew" 2>/dev/null)" = "$(git -C "$PROJECT" rev-parse origin/master)" ] && echo yes || echo no; }
+on_base() { [ "$(git -C "$PROJECT" rev-parse "feature/$1-nightcrew" 2>/dev/null)" = "$(git -C "$PROJECT" rev-parse origin/develop)" ] && echo yes || echo no; }
 drop_issue() { # issue: forget a kept worktree and the local branch so the next case starts fresh
   git -C "$PROJECT" worktree remove --force "$PROJECT/logs/worktrees/issue-$1" 2>/dev/null
   git -C "$PROJECT" branch -D "feature/$1-nightcrew" >/dev/null 2>&1
@@ -203,7 +203,7 @@ rm -f "$PROJECT/scratch.txt"
 
 echo
 echo "dirty leftover worktree"
-git -C "$PROJECT" worktree add -q --detach "$PROJECT/logs/worktrees/issue-7" origin/master
+git -C "$PROJECT" worktree add -q --detach "$PROJECT/logs/worktrees/issue-7" origin/develop
 echo "unsaved work" > "$PROJECT/logs/worktrees/issue-7/unsaved.txt"
 run "$PROJECT" 7
 same "a dirty leftover worktree -> exit 1" "$CODE" 1
@@ -227,7 +227,7 @@ rm -rf "$PROJECT/logs/worktrees/issue-7"
 
 echo
 echo "stale worktree whose .git file points at removed metadata"
-git -C "$PROJECT" worktree add -q --detach "$PROJECT/logs/worktrees/issue-7" origin/master
+git -C "$PROJECT" worktree add -q --detach "$PROJECT/logs/worktrees/issue-7" origin/develop
 WT_META="$(git -C "$PROJECT/logs/worktrees/issue-7" rev-parse --absolute-git-dir)"
 rm -rf "$WT_META"
 echo "dangling work" > "$PROJECT/logs/worktrees/issue-7/dangling.txt"
@@ -319,6 +319,7 @@ echo "success"
 RECEIPT="$TMP/receipts/job-1.json"
 GITEA_TOKEN="$SECRET" NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=edit run "$PROJECT" 7
 same "success (with a denied commit along the way) -> exit 0" "$CODE" 0
+case "$OUT" in *"base develop"*) ok "the default base is develop" ;; *) bad "the default base is develop" "$OUT" ;; esac
 same "the worker inherits no Gitea token, token file or task receipt variable" "$(tr '\n' ' ' < "$STUB_STATE/env")" ""
 same "the worker does not inherit the run lock's fd 9" "$(cat "$STUB_STATE/fd9")" closed
 same "a git push from the worker fails" "$(cat "$STUB_STATE/push")" refused
@@ -326,7 +327,7 @@ same "nothing the worker pushed reached the remote" "$(remote_has_branch worker-
 same "branch pushed by the launcher" "$(remote_has_branch feature/7-nightcrew)" yes
 same "one PR opened" "$(created_count)" 1
 pr_fields="$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readline()); print(b["head"], b["base"], b["title"], "Closes #7" in b["body"])' "$GITEA/created.jsonl")"
-same "PR head/base/title/closing reference" "$pr_fields" "feature/7-nightcrew master #7: Add a widget True"
+same "PR head/base/title/closing reference" "$pr_fields" "feature/7-nightcrew develop #7: Add a widget True"
 same "the PR body says the launcher committed the edit-only worker's edits" \
   "$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readline()); print("the launcher committed its edits" in b["body"])' "$GITEA/created.jsonl")" True
 remote_head="$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/7-nightcrew)"
@@ -403,9 +404,9 @@ python3 - "$GITEA/pulls.json" "$REPO" <<'PY'
 import json, sys
 repo = {"full_name": sys.argv[2]}
 others = [{"number": n, "html_url": f"http://gitea.test/p/{n}", "head": {"ref": f"feature/x-{n}", "repo": repo},
-           "base": {"ref": "master", "repo": repo}} for n in range(1, 61)]
+           "base": {"ref": "develop", "repo": repo}} for n in range(1, 61)]
 mine = {"number": 99, "html_url": "http://gitea.test/owner/repo/pulls/99",
-        "head": {"ref": "feature/7-nightcrew", "repo": repo}, "base": {"ref": "master", "repo": repo}}
+        "head": {"ref": "feature/7-nightcrew", "repo": repo}, "base": {"ref": "develop", "repo": repo}}
 json.dump(others + [mine], open(sys.argv[1], "w"))
 PY
 NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=edit run "$PROJECT" 7
@@ -467,9 +468,9 @@ same "the lock file is removed after a failed PR creation" "$( [ -e "$PROJECT/lo
 NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-8.json" STUB_MODE=noedit run "$PROJECT" 8
 same "the rerun reuses the published commit and opens the PR -> exit 0" "$CODE" 0
 same "one PR created by the rerun" "$(created_count)" "$((before + 1))"
-same "the rerun's PR is from the kept branch into master" \
+same "the rerun's PR is from the kept branch into develop" \
   "$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readlines()[-1]); print(b["head"], b["base"])' "$GITEA/created.jsonl")" \
-  "feature/8-nightcrew master"
+  "feature/8-nightcrew develop"
 same "the remote branch was not rewritten" "$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/8-nightcrew)" "$head8"
 same "the receipt names the new PR, the branch and the kept head" \
   "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["pr_number"], r["branch"], r["head"])' "$TMP/receipts/issue-8.json" 2>&1)" \
@@ -504,9 +505,9 @@ path, repo = sys.argv[1], {"full_name": sys.argv[2]}
 fork = {"full_name": "someone/fork"}
 every = json.load(open(path))
 every += [{"number": 501, "html_url": "http://gitea.test/p/501", "head": {"ref": "feature/10-nightcrew", "repo": fork},
-           "base": {"ref": "master", "repo": repo}},
-          {"number": 502, "html_url": "http://gitea.test/p/502", "head": {"ref": "feature/10-nightcrew", "repo": repo},
            "base": {"ref": "develop", "repo": repo}},
+          {"number": 502, "html_url": "http://gitea.test/p/502", "head": {"ref": "feature/10-nightcrew", "repo": repo},
+           "base": {"ref": "master", "repo": repo}},
           {"number": 503, "html_url": "http://gitea.test/p/503", "head": {"ref": "feature/10-nightcrew", "repo": repo},
            "base": {"ref": None, "repo": repo}}]
 json.dump(every, open(path, "w"))
@@ -531,7 +532,7 @@ same "the branch stays on the remote for the rerun" "$(remote_has_branch feature
 echo
 echo "edit-only: the launcher commits every edit with agent and provider trailers"
 before="$(created_count)"
-start12="$(git -C "$TMP/origin.git" rev-parse refs/heads/master)"
+start12="$(git -C "$TMP/origin.git" rev-parse refs/heads/develop)"
 NIGHT_CREW_TASK_RECEIPT="$TMP/receipts/issue-12.json" STUB_MODE=editmany run "$PROJECT" 12
 same "new, nested and modified files -> exit 0" "$CODE" 0
 same "the branch is pushed" "$(remote_has_branch feature/12-nightcrew)" yes
