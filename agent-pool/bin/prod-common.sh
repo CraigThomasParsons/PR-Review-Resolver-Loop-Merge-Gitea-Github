@@ -16,6 +16,13 @@
 # verified resolve go to agent:done; a real verification failure goes to agent:needs-human with a
 # comment; a limit, a timeout or no provider completing goes back to agent:ready.
 #
+# The agent:* labels say who holds the PR; the review:* result labels say what the review found.
+# pr-loop.sh's hand-off consumes review:requested, so the pool writes the result itself, beside
+# the agent:* label: review:findings for a review with findings, review:clean for a clean one,
+# review:resolved for a verified resolve. Without it a reviewed PR showed only agent:ready, the
+# resolve stage and pr-merge.sh's review:* paths never saw it, and a paused resolve was
+# invisible on Gitea (FF #175/#180/#182/#183, PRR #69/#71/#72, 2026-11-20).
+#
 # Claims (scripts/claim-record.py): one write-once record per PR keyed by attempt_id, carrying
 # an absolute expected_deadline_at computed at claim time. Nothing renews it. Every label write,
 # comment and push runs through `claim-record.py guard|release`, which re-reads the record under
@@ -238,6 +245,11 @@ READY="${AGENT_POOL_LABEL_READY:-agent:ready}"
 CLAIMED="${AGENT_POOL_LABEL_CLAIMED:-agent:claimed}"
 DONE="${AGENT_POOL_LABEL_DONE:-agent:done}"
 HUMAN="${AGENT_POOL_LABEL_NEEDS_HUMAN:-agent:needs-human}"
+# The review result labels, shared with pr-loop.sh and pr-merge.sh (see the header).
+REVIEW_REQUESTED="${AGENT_POOL_LABEL_REVIEW_REQUESTED:-review:requested}"
+REVIEW_FINDINGS="${AGENT_POOL_LABEL_REVIEW_FINDINGS:-review:findings}"
+REVIEW_CLEAN="${AGENT_POOL_LABEL_REVIEW_CLEAN:-review:clean}"
+REVIEW_RESOLVED="${AGENT_POOL_LABEL_REVIEW_RESOLVED:-review:resolved}"
 # Opt-in per repo, since most repos this pool runs against aren't tracked by TheNightCrew. Only
 # the explicit off words disable it, so a typo cannot silently drop the protection.
 NIGHTCREW_LEGACY_BOT="${AGENT_POOL_NIGHTCREW_BOT:-}"
@@ -617,8 +629,32 @@ end_job() {
   JOB_PR=""; ATTEMPT=""; JOB_KIND=""; JOB_WT=""; JOB_LOST=0; JOB_LOSTFILE=""
 }
 
-finish_job() { # done|ready|fail reason
-  local outcome="$1" reason="$2" target bf
+# publish_review_result clean|findings|resolved: set the PR's one review result label, under the
+# claim guard, before the release. Only the other result labels and review:requested are removed,
+# and only those the PR carries. Best effort: the agent:* release still decides who holds the PR,
+# so a failed write is logged and the job's outcome stands.
+publish_review_result() {
+  local add current remove="" l
+  case "$1" in
+    clean) add="$REVIEW_CLEAN" ;;
+    findings) add="$REVIEW_FINDINGS" ;;
+    resolved) add="$REVIEW_RESOLVED" ;;
+    *) return 0 ;;
+  esac
+  current="$(python3 "$ADAPTER" labels --repo "$REPO" --pr "$JOB_PR" 2>/dev/null)" || current=""
+  for l in "$REVIEW_REQUESTED" "$REVIEW_FINDINGS" "$REVIEW_CLEAN" "$REVIEW_RESOLVED"; do
+    [ "$l" = "$add" ] && continue
+    [[ "$current" == *"\"$l\""* ]] && remove="${remove:+$remove,}$l"
+  done
+  if guarded "review result label $add" python3 "$ADAPTER" label --repo "$REPO" --pr "$JOB_PR" \
+       --add "$add" ${remove:+--remove "$remove"}; then
+    jlog "review result: $add${remove:+ (removed $remove)}"
+  fi
+  return 0
+}
+
+finish_job() { # done|ready|fail reason [clean|findings|resolved]
+  local outcome="$1" reason="$2" result="${3:-}" target bf
   case "$outcome" in done) target="$DONE" ;; ready) target="$READY" ;; fail) target="$HUMAN" ;; esac
   if [ "$outcome" = fail ] && [ "$JOB_LOST" -eq 0 ]; then
     bf="$(mktemp)"
@@ -626,6 +662,7 @@ finish_job() { # done|ready|fail reason
       "$JOB_KIND" "$reason" > "$bf"
     comment_file "$bf"; rm -f "$bf"
   fi
+  [ "$JOB_LOST" -eq 0 ] && [ -n "$result" ] && publish_review_result "$result"
   [ "$JOB_LOST" -eq 0 ] && release_to "$target"
   if [ "$JOB_LOST" -eq 0 ]; then jlog "$outcome -> $target ($reason)"; else jlog "superseded; touched nothing more ($reason)"; fi
   end_job
@@ -1144,14 +1181,19 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
   esac
   jlog "claimed by $WORKER_ID for $job with $1"
   # derive_job already verified it; the claim re-checked the head, so it is not verified again.
-  if [ "$job" = settled ]; then mark_published; finish_job done "$SETTLED_WHY"; return 0; fi
+  # derive_job sets a review head only for a settled resolve; a settled review is a clean one.
+  if [ "$job" = settled ]; then
+    mark_published
+    if [ -n "$rhead" ]; then finish_job done "$SETTLED_WHY" resolved; else finish_job done "$SETTLED_WHY" clean; fi
+    return 0
+  fi
 
   before="$(verify "$job" "$pr" "$vbase" "$headref")"
   case "$before" in clean|ok) mark_published ;; esac
   case "$before" in
-    clean) finish_job done "the review of $sha is already posted and clean"; return 0 ;;
-    ok) if [ "$job" = resolve ]; then finish_job done "the resolve of $vbase is already verified at $sha"
-        else finish_job ready "the review of $sha is already posted; queued for resolve"; fi
+    clean) finish_job done "the review of $sha is already posted and clean" clean; return 0 ;;
+    ok) if [ "$job" = resolve ]; then finish_job done "the resolve of $vbase is already verified at $sha" resolved
+        else finish_job ready "the review of $sha is already posted; queued for resolve" findings; fi
         return 0 ;;
   esac
 
@@ -1165,8 +1207,9 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
     attempt "$p" "$sha" "$headref" "$base"
     tried+=("$p=$VERDICT")
     case "$VERDICT" in
-      done)     finish_job done "$DETAIL"; return 0 ;;
-      findings) finish_job ready "$DETAIL; findings queued for resolve"; return 0 ;;
+      done)     if [ "$job" = resolve ]; then finish_job done "$DETAIL" resolved; else finish_job done "$DETAIL" clean; fi
+                return 0 ;;
+      findings) finish_job ready "$DETAIL; findings queued for resolve" findings; return 0 ;;
       lost)     JOB_LOST=1; jlog "$DETAIL; touching nothing on Gitea"; end_job; return 0 ;;
       fail)     finish_job fail "$DETAIL"; return 0 ;;
       requeue)  finish_job ready "$DETAIL; back in the queue, not a needs-human"; return 0 ;;
