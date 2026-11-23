@@ -16,6 +16,13 @@
 # verified resolve go to agent:done; a real verification failure goes to agent:needs-human with a
 # comment; a limit, a timeout or no provider completing goes back to agent:ready.
 #
+# The agent:* labels say who holds the PR; the review:* result labels say what the review found.
+# pr-loop.sh's hand-off consumes review:requested, so the pool writes the result itself, beside
+# the agent:* label: review:findings for a review with findings, review:clean for a clean one,
+# review:resolved for a verified resolve. Without it a reviewed PR showed only agent:ready, the
+# resolve stage and pr-merge.sh's review:* paths never saw it, and a paused resolve was
+# invisible on Gitea (FF #175/#180/#182/#183, PRR #69/#71/#72, 2026-11-20).
+#
 # Claims (scripts/claim-record.py): one write-once record per PR keyed by attempt_id, carrying
 # an absolute expected_deadline_at computed at claim time. Nothing renews it. Every label write,
 # comment and push runs through `claim-record.py guard|release`, which re-reads the record under
@@ -98,8 +105,10 @@
 #   CLAUDE_PERMISSION_MODE=default  GROK_PERMISSION_MODE=dontAsk  CODEX_SANDBOX_MODE=workspace-write
 #   AGY_AUTO_APPROVE=1             let agy take resolve jobs (--dangerously-skip-permissions)
 #   AGY_PRINT_TIMEOUT=0            agy's own print timeout; 0 leaves WORKER_TIMEOUT as the only limit
-#   AGENT_POOL_GATE_BUDGET=1200    cap (s) on any manifest's gate budget; a job's gates also stop
-#                                  60s before its claim deadline
+#   AGENT_POOL_GATE_BUDGET=1200    cap (s) on any manifest's gate budget, and separately on a job's
+#                                  [[deps]] warm; both also stop 60s before its claim deadline
+#   AGENT_POOL_GATE_CACHE_PAUSE_SECS=3600   how long a failed [[deps]] warm pauses that repo's
+#                                  resolve jobs (faults/gates-cache/<owner>__<name>.json)
 #   AGENT_POOL_GATES_DIR           controller-owned manifest overrides (~/.config/agent-pool/gates)
 #   AGENT_POOL_GATE_RO_BINDS       colon list of toolchain dirs bound read-only into the gate sandbox
 #   AGENT_POOL_GATE_SANDBOX AGENT_POOL_GATE_SCOPE   bwrap and systemd-run paths (default: /usr/bin)
@@ -126,10 +135,15 @@
 # the PR's base branch by blob (or a controller-owned override), refuses changes to
 # gate-defining files, checks the controller's signed commit out by SHA into a fresh directory with no
 # .git, and runs the selected gates there in a sandbox with no network, home, ssh agent or
-# tokens. The result is a write-once receipt bound to the attempt and the exact head; the push
-# goes ahead only for a receipt that passed. A red gate is a needs-human with nothing pushed; a
-# broken sandbox or manifest is a setup fault [gates] that requeues the job and pauses resolve
-# jobs until a person fixes it and deletes faults/gates.json.
+# tokens. A manifest's [[deps]] are installed offline in that sandbox from a cache under
+# $STATE/gate-cache, which the controller first warms from the base branch's lockfiles (with
+# network, still no credentials). The result is a write-once receipt bound to the attempt and
+# the exact head, naming the lockfile blob each dep's cache was warmed from; the push goes ahead
+# only for a receipt that passed. A red gate is a needs-human with nothing pushed; a broken
+# sandbox or manifest is a setup fault [gates] that requeues the job and pauses resolve jobs
+# until a person fixes it and deletes faults/gates.json. A failed warm requeues the job too, but
+# pauses only this repo's resolve jobs, through faults/gates-cache/<owner>__<name>.json, which
+# expires after AGENT_POOL_GATE_CACHE_PAUSE_SECS and is cleared by the next warm that passes.
 #
 # Exit codes: 0 for a normal tick (including nothing to do); 2 for a setup fault.
 
@@ -231,6 +245,11 @@ READY="${AGENT_POOL_LABEL_READY:-agent:ready}"
 CLAIMED="${AGENT_POOL_LABEL_CLAIMED:-agent:claimed}"
 DONE="${AGENT_POOL_LABEL_DONE:-agent:done}"
 HUMAN="${AGENT_POOL_LABEL_NEEDS_HUMAN:-agent:needs-human}"
+# The review result labels, shared with pr-loop.sh and pr-merge.sh (see the header).
+REVIEW_REQUESTED="${AGENT_POOL_LABEL_REVIEW_REQUESTED:-review:requested}"
+REVIEW_FINDINGS="${AGENT_POOL_LABEL_REVIEW_FINDINGS:-review:findings}"
+REVIEW_CLEAN="${AGENT_POOL_LABEL_REVIEW_CLEAN:-review:clean}"
+REVIEW_RESOLVED="${AGENT_POOL_LABEL_REVIEW_RESOLVED:-review:resolved}"
 # Opt-in per repo, since most repos this pool runs against aren't tracked by TheNightCrew. Only
 # the explicit off words disable it, so a typo cannot silently drop the protection.
 NIGHTCREW_LEGACY_BOT="${AGENT_POOL_NIGHTCREW_BOT:-}"
@@ -328,13 +347,23 @@ ability_enabled() { # job
 # resolves when an operator running this tick directly opted in to it unattended; under an
 # entrypoint (AGENT_POOL_ABILITIES set) it never resolves.
 job_providers() { # job
-  local p
+  local p pause
   JOB_PROVIDERS=()
   ability_enabled "$1" || return 0
   # Another provider would only hit the same broken sandbox after a full WORKER_TIMEOUT.
   if [ "$1" = resolve ] && [ -e "$STATE/faults/gates.json" ]; then
     log "$REPO: resolve jobs are paused: the gate sandbox has a recorded fault ($STATE/faults/gates.json); fix it, then delete that file"
     return 0
+  fi
+  # Only this repo's dependency cache failed to warm; other repos keep resolving. A failed check
+  # reads as paused.
+  if [ "$1" = resolve ]; then
+    pause="$(python3 "$SCRIPTS/gates.py" cache-pause --state "$STATE" --repo "$REPO" 2>>"$LOG")"
+    if [ "$pause" != clear ]; then
+      [[ "$pause" == paused$'\t'* ]] || pause=$'paused\tthe gate cache fault check failed'
+      log "$REPO: resolve jobs for this repo are paused: its dependency cache could not be warmed: ${pause#*$'\t'}"
+      return 0
+    fi
   fi
   # Checked once per tick, before any claim: a resolve's work could never be committed.
   if [ "$1" = resolve ] && [ "$SIGNING_CHECKED" = 0 ]; then
@@ -600,8 +629,32 @@ end_job() {
   JOB_PR=""; ATTEMPT=""; JOB_KIND=""; JOB_WT=""; JOB_LOST=0; JOB_LOSTFILE=""
 }
 
-finish_job() { # done|ready|fail reason
-  local outcome="$1" reason="$2" target bf
+# publish_review_result clean|findings|resolved: set the PR's one review result label, under the
+# claim guard, before the release. Only the other result labels and review:requested are removed,
+# and only those the PR carries. Best effort: the agent:* release still decides who holds the PR,
+# so a failed write is logged and the job's outcome stands.
+publish_review_result() {
+  local add current remove="" l
+  case "$1" in
+    clean) add="$REVIEW_CLEAN" ;;
+    findings) add="$REVIEW_FINDINGS" ;;
+    resolved) add="$REVIEW_RESOLVED" ;;
+    *) return 0 ;;
+  esac
+  current="$(python3 "$ADAPTER" labels --repo "$REPO" --pr "$JOB_PR" 2>/dev/null)" || current=""
+  for l in "$REVIEW_REQUESTED" "$REVIEW_FINDINGS" "$REVIEW_CLEAN" "$REVIEW_RESOLVED"; do
+    [ "$l" = "$add" ] && continue
+    [[ "$current" == *"\"$l\""* ]] && remove="${remove:+$remove,}$l"
+  done
+  if guarded "review result label $add" python3 "$ADAPTER" label --repo "$REPO" --pr "$JOB_PR" \
+       --add "$add" ${remove:+--remove "$remove"}; then
+    jlog "review result: $add${remove:+ (removed $remove)}"
+  fi
+  return 0
+}
+
+finish_job() { # done|ready|fail reason [clean|findings|resolved]
+  local outcome="$1" reason="$2" result="${3:-}" target bf
   case "$outcome" in done) target="$DONE" ;; ready) target="$READY" ;; fail) target="$HUMAN" ;; esac
   if [ "$outcome" = fail ] && [ "$JOB_LOST" -eq 0 ]; then
     bf="$(mktemp)"
@@ -609,6 +662,7 @@ finish_job() { # done|ready|fail reason
       "$JOB_KIND" "$reason" > "$bf"
     comment_file "$bf"; rm -f "$bf"
   fi
+  [ "$JOB_LOST" -eq 0 ] && [ -n "$result" ] && publish_review_result "$result"
   [ "$JOB_LOST" -eq 0 ] && release_to "$target"
   if [ "$JOB_LOST" -eq 0 ]; then jlog "$outcome -> $target ($reason)"; else jlog "superseded; touched nothing more ($reason)"; fi
   end_job
@@ -697,7 +751,25 @@ now = float(os.environ.get("AGENT_POOL_NOW") or time.time())
 print(int(datetime.datetime.strptime(d, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp() - now) if d else 0)'
 }
 
-# gate_receipt provider sha newhead base-sha manifest-json result reason [run-json] -> GATE_RECEIPT
+# gate_secs -> the seconds a gate step may use: AGENT_POOL_GATE_BUDGET, stopping 60s before the
+# claim deadline. Under 1 when no time is left or the claim could not be read.
+gate_secs() {
+  local left budget
+  left="$(claim_secs_left)"; budget=$(( ${left:-0} - 60 ))
+  [ "$budget" -gt "$GATE_BUDGET" ] && budget="$GATE_BUDGET"
+  printf '%s' "$budget"
+}
+
+# gate_verdict json what -> "result<TAB>reason" from a gates.py run or warm; infra when it left none.
+gate_verdict() {
+  python3 -c 'import json,sys
+try: d = json.load(open(sys.argv[1]))
+except (OSError, ValueError): d = None
+if not isinstance(d, dict): d = {"result": "infra", "reason": sys.argv[2] + " left no result"}
+print(d.get("result") or "infra", (d.get("reason") or "-").replace("\t", " ").replace("\n", " "), sep="\t")' "$1" "$2"
+}
+
+# gate_receipt provider sha newhead base-sha manifest-json result reason [run-json] [warm-json] -> GATE_RECEIPT
 gate_receipt() {
   local src blob
   read -r src blob < <(python3 -c 'import json,sys
@@ -707,16 +779,21 @@ print(d.get("source") or "none", d.get("blob") or "-")' "$5")
   [ "$blob" = - ] && blob=""
   GATE_RECEIPT="$(python3 "$SCRIPTS/gates.py" receipt --state "$STATE" --repo "$REPO" --pr "$JOB_PR" \
     --attempt "$ATTEMPT" --provider "$1" --base-sha "$4" --pr-head "$2" --head "$3" --source "$src" \
-    --blob "$blob" --result "$6" --reason "$7" ${8:+--run "$8"} 2>>"$LOG")"
+    --blob "$blob" --result "$6" --reason "$7" ${8:+--run "$8"} ${9:+--warm "$9"} 2>>"$LOG")"
 }
 
 # run_gates provider sha newhead base -> 0 with GATE_RECEIPT naming a passing receipt, else 1
-# with PUB set: fail:<why> (a red gate, protected paths, no manifest), gateinfra:<why> or lost.
-# The worker's process group is already dead; nothing here reads the worker's worktree.
+# with PUB set: fail:<why> (a red gate, protected paths, no manifest), gateinfra:<why>,
+# cacheinfra:<why> or lost. GATE_TERMINAL=1 when no provider retry could change the outcome
+# (protected paths, no manifest). The worker's process group is already dead; nothing here reads
+# the worker's worktree. A manifest with [[deps]] first has its caches under $STATE/gate-cache
+# warmed from BASE_SHA (gates.py warm: base-branch code, network, no credentials); a failed warm
+# records this repo's gate cache fault and is cacheinfra, and a passing one clears that fault.
 run_gates() {
-  local p="$1" sha="$2" newhead="$3" base="$4" tag base_sha manifest raw hits names budget left run res why
+  local p="$1" sha="$2" newhead="$3" base="$4" tag base_sha manifest raw hits names budget run res why deps rc fault
+  local warm=""
   tag="$JOB_PR-${ATTEMPT:0:8}"; manifest="$RUNS/gates-manifest-$tag.json"; raw="$RUNS/gates-diff-$tag"
-  run="$RUNS/gates-run-$tag.json"; GATE_RECEIPT=""
+  run="$RUNS/gates-run-$tag.json"; GATE_RECEIPT=""; GATE_TERMINAL=0
   gate_config_intact || { PUB="gateinfra:the main clone's git config changed during the job; refusing to gate or push"; return 1; }
   [ "$(gate_git rev-parse --verify -q "$newhead^{commit}")" = "$newhead" ] \
     || { PUB="gateinfra:the candidate $newhead is not a commit in the main clone"; return 1; }
@@ -737,7 +814,7 @@ run_gates() {
   if [ "$hits" != none ]; then
     why="the worker's edits change gate-defining files ($(printf '%s\n' "$hits" | head -5 | tr '\n' ' ' | sed 's/ $//')); a human must review them"
     gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" protected "$why"
-    PUB="fail:$why"; return 1
+    GATE_TERMINAL=1; PUB="fail:$why"; return 1
   fi
   if [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source"))' "$manifest" 2>/dev/null)" = none ]; then
     if python3 "$SCRIPTS/gates.py" docs-only --changed "$raw.changed"; then
@@ -747,7 +824,7 @@ run_gates() {
     fi
     why="$REPO has no gate manifest (.agent-pool/gates.toml on $base or a controller override), so the worker's code changes cannot be gated"
     gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" no-manifest "$why"
-    PUB="fail:$why"; return 1
+    GATE_TERMINAL=1; PUB="fail:$why"; return 1
   fi
   names="$(python3 "$SCRIPTS/gates.py" select --manifest "$manifest" --changed "$raw.changed")" \
     || { PUB="gateinfra:could not select the gates for the worker's changes"; return 1; }
@@ -756,8 +833,42 @@ run_gates() {
     [ -n "$GATE_RECEIPT" ] || { PUB="gateinfra:could not write the gate receipt"; return 1; }
     jlog "gates: none apply to the changed paths at $newhead"; return 0
   fi
-  left="$(claim_secs_left)"; budget=$(( ${left:-0} - 60 ))
-  [ "$budget" -gt "$GATE_BUDGET" ] && budget="$GATE_BUDGET"
+  deps="$(python3 -c 'import json,sys; print(len((json.load(open(sys.argv[1])).get("manifest") or {}).get("deps") or []))' \
+    "$manifest" 2>/dev/null)" || { PUB="gateinfra:could not read the manifest's [[deps]]"; return 1; }
+  if [ "$deps" != 0 ]; then
+    budget="$(gate_secs)"
+    [ "$budget" -ge 1 ] || { PUB="gateinfra:no time left on the claim to warm the dependency caches (budget ${budget}s)"; return 1; }
+    warm="$RUNS/gates-warm-$tag.json"
+    jlog "gates: warming $deps dependency cache(s) from $base_sha (budget ${budget}s)"
+    # Watched like the gate run below; a crash or bad JSON reads as infra.
+    setsid python3 "$SCRIPTS/gates.py" warm --manifest "$manifest" --main "$MAIN" --base-sha "$base_sha" \
+      --cache-root "$STATE/gate-cache" --repo "$REPO" --budget "$budget" > "$warm" 2>>"$LOG" &
+    WORKER_PG=$!
+    watch_start
+    wait "$WORKER_PG"; rc=$?
+    watch_stop; kill_worker_group
+    if ! still_held; then PUB=lost; return 1; fi
+    IFS=$'\t' read -r res why < <(gate_verdict "$warm" "the dependency warm")
+    [ "$why" = - ] && why=""
+    [ "$rc" -eq 0 ] || { res=infra; why="the dependency warm exited $rc${why:+ ($why)}"; }
+    if [ "$res" != pass ]; then
+      why="${why:-the dependency warm failed}"
+      gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" infra "$why" "" "$warm"
+      jlog "gates: dependency warm failed, so no gate ran at $newhead ($why)"
+      if fault="$(python3 "$SCRIPTS/gates.py" cache-fault --state "$STATE" --repo "$REPO" --base-sha "$base_sha" \
+           --warm "$warm" --reason "$why" 2>>"$LOG")"; then
+        log "GATE CACHE FAULT [$REPO]: $why (only $REPO's resolve jobs pause, for ${AGENT_POOL_GATE_CACHE_PAUSE_SECS:-3600}s or until $fault is deleted; no provider cooldown)"
+      else
+        log "GATE CACHE FAULT [$REPO]: $why (the fault could not be recorded, so the next tick warms again)"
+      fi
+      PUB="cacheinfra:$why"; return 1
+    fi
+    jlog "gates: dependency caches ready ($(python3 -c 'import json,sys
+print(" ".join("%s=%s" % (d.get("name"), d.get("status")) for d in json.load(open(sys.argv[1])).get("deps", [])))' "$warm" 2>/dev/null))"
+    fault="$(python3 "$SCRIPTS/gates.py" cache-clear --state "$STATE" --repo "$REPO" 2>>"$LOG")"
+    [ -n "$fault" ] && jlog "gates: the warm passed, so $REPO's gate cache fault is cleared ($fault)"
+  fi
+  budget="$(gate_secs)"
   # No time left, or the claim could not be read: a controller fault, not a red gate.
   [ "$budget" -ge 1 ] || { PUB="gateinfra:no time left on the claim to run the gates (budget ${budget}s)"; return 1; }
   gate_config_intact || { PUB="gateinfra:the main clone's git config changed during the job; refusing to gate or push"; return 1; }
@@ -766,19 +877,17 @@ run_gates() {
   jlog "gates: running $(printf '%s' "$names" | tr '\n' ' ')at $newhead (budget ${budget}s)"
   # Its own process group, watched like a worker: a superseded claim kills the gate run too.
   setsid python3 "$SCRIPTS/gates.py" run --manifest "$manifest" --gate-dir "$GATE_DIR" --select "$raw.select" \
-    --runs "$RUNS" --tag "$tag" --budget "$budget" --lock "$STATE/gates.lock" > "$run" 2>>"$LOG" &
+    --runs "$RUNS" --tag "$tag" --budget "$budget" --lock "$STATE/gates.lock" \
+    --cache-root "$STATE/gate-cache" --repo "$REPO" > "$run" 2>>"$LOG" &
   WORKER_PG=$!
   watch_start
   wait "$WORKER_PG"
   watch_stop; kill_worker_group
   gate_cleanup
   if ! still_held; then PUB=lost; return 1; fi
-  IFS=$'\t' read -r res why < <(python3 -c 'import json,sys
-try: d = json.load(open(sys.argv[1]))
-except (OSError, ValueError): d = {"result": "infra", "reason": "the gate runner left no result"}
-print(d.get("result") or "infra", (d.get("reason") or "-").replace("\t", " ").replace("\n", " "), sep="\t")' "$run")
+  IFS=$'\t' read -r res why < <(gate_verdict "$run" "the gate runner")
   [ "$why" = - ] && why=""
-  gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" "$res" "$why" "$run"
+  gate_receipt "$p" "$sha" "$newhead" "$base_sha" "$manifest" "$res" "$why" "$run" "$warm"
   [ -n "$GATE_RECEIPT" ] || { PUB="gateinfra:could not write the gate receipt for $newhead (one may already exist for this attempt)"; return 1; }
   jlog "gates: $res at $newhead${why:+ ($why)}"
   case "$res" in
@@ -796,7 +905,8 @@ COMMIT_IGNORED=(".cursor/*" ".grok/*" ".claude/*" "$CONTEXT_FILE")
 CREDENTIAL_PATHS='/\.env(\.[^/]*)?$|gitea_token|/id_(rsa|ecdsa|ed25519)[^/]*$|\.pem$|/\.netrc$|/\.git-credentials$'
 
 # controller_commit provider ability sha base report refuse -> 0 with NEWHEAD, else 1 with PUB
-# set (fail:<why>, gateinfra:<why>, signinfra:<why> or lost). The one commit per ability run.
+# set (fail:<why>, gateinfra:<why>, cacheinfra:<why>, signinfra:<why> or lost). The one commit
+# per ability run.
 # It runs after the worker's process group is dead and the claim re-checked, and reads the
 # worktree's changes against sha through a private index of the main clone; it never runs git
 # inside the worktree, whose .git, config and hooks are the worker's. NEWHEAD is sha when the
@@ -878,8 +988,8 @@ controller_commit() {
 
 # ---------------------------------------------------------------- controller-side publication
 # publish provider sha headref report result base -> PUB: published | nomarker:<why> |
-# requeue:<why> | fail:<why> | gateinfra:<why> | signinfra:<why> | lost. The only path by which
-# a worker's work reaches Gitea.
+# requeue:<why> | fail:<why> | gateinfra:<why> | cacheinfra:<why> | signinfra:<why> | lost. The
+# only path by which a worker's work reaches Gitea.
 publish() {
   local p="$1" sha="$2" headref="$3" report="$4" result="$5" base="$6" chk alt head fixed newhead remote rc refuse
   local args=(--marker-module "$MARKER")
@@ -981,7 +1091,7 @@ render_prompt() { # provider sha headref base report -> prompt file path
 # Runs in the calling shell: it sets JOB_WT and may record setup faults.
 attempt() {
   local p="$1" sha="$2" headref="$3" base="$4" tag prompt report result out err rc t0 elapsed cls session v
-  VERDICT=""; DETAIL=""; CURRENT_PROVIDER="$p"
+  VERDICT=""; DETAIL=""; GATE_TERMINAL=0; CURRENT_PROVIDER="$p"
   prepare_worktree "$sha" "$headref" || { VERDICT=setup; DETAIL="could not prepare a worktree at $sha"; return; }
   tag="$JOB_PR-${ATTEMPT:0:8}-$p"
   report="$RUNS/report-$tag.md"; result="$RUNS/result-$tag.txt"; rm -f "$report" "$result"
@@ -1011,6 +1121,10 @@ attempt() {
     gateinfra:*)
       setup_fault gates "${PUB#*:}"
       VERDICT=requeue; DETAIL="the controller's gate run could not complete (${PUB#*:})"; return ;;
+    # run_gates already recorded this repo's gate cache fault; nothing global is paused.
+    cacheinfra:*)
+      SETUP_FAULTS=$((SETUP_FAULTS + 1))
+      VERDICT=requeue; DETAIL="the controller could not warm $REPO's dependency cache (${PUB#*:})"; return ;;
     signinfra:*)
       setup_fault signing "${PUB#*:}"
       VERDICT=requeue; DETAIL="the controller could not sign the commit (${PUB#*:})"; return ;;
@@ -1030,6 +1144,11 @@ attempt() {
       if [ "$JOB_KIND" = review ] && [ "$v" = ok ]; then VERDICT=findings; else VERDICT=done; fi
       DETAIL="$p verified"; return ;;
   esac
+  # The controller's own gate refused the candidate: no provider retry can change that.
+  if [ "$GATE_TERMINAL" = 1 ]; then
+    case "$cls" in setup*) setup_fault "$p" "${cls#*$'\t'} (the controller's gate check rejected the candidate anyway)" ;; esac
+    VERDICT=fail; DETAIL="${v#*:} ($p, ${elapsed}s)"; return
+  fi
   case "$cls" in
     setup*)   VERDICT=setup; DETAIL="${cls#*$'\t'}"; return ;;
     limit*)   VERDICT=limit; DETAIL="${cls#*$'\t'}"; return ;;
@@ -1062,14 +1181,19 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
   esac
   jlog "claimed by $WORKER_ID for $job with $1"
   # derive_job already verified it; the claim re-checked the head, so it is not verified again.
-  if [ "$job" = settled ]; then mark_published; finish_job done "$SETTLED_WHY"; return 0; fi
+  # derive_job sets a review head only for a settled resolve; a settled review is a clean one.
+  if [ "$job" = settled ]; then
+    mark_published
+    if [ -n "$rhead" ]; then finish_job done "$SETTLED_WHY" resolved; else finish_job done "$SETTLED_WHY" clean; fi
+    return 0
+  fi
 
   before="$(verify "$job" "$pr" "$vbase" "$headref")"
   case "$before" in clean|ok) mark_published ;; esac
   case "$before" in
-    clean) finish_job done "the review of $sha is already posted and clean"; return 0 ;;
-    ok) if [ "$job" = resolve ]; then finish_job done "the resolve of $vbase is already verified at $sha"
-        else finish_job ready "the review of $sha is already posted; queued for resolve"; fi
+    clean) finish_job done "the review of $sha is already posted and clean" clean; return 0 ;;
+    ok) if [ "$job" = resolve ]; then finish_job done "the resolve of $vbase is already verified at $sha" resolved
+        else finish_job ready "the review of $sha is already posted; queued for resolve" findings; fi
         return 0 ;;
   esac
 
@@ -1083,8 +1207,9 @@ run_job() { # pr headref sha base job verify-base review-head findings remove-la
     attempt "$p" "$sha" "$headref" "$base"
     tried+=("$p=$VERDICT")
     case "$VERDICT" in
-      done)     finish_job done "$DETAIL"; return 0 ;;
-      findings) finish_job ready "$DETAIL; findings queued for resolve"; return 0 ;;
+      done)     if [ "$job" = resolve ]; then finish_job done "$DETAIL" resolved; else finish_job done "$DETAIL" clean; fi
+                return 0 ;;
+      findings) finish_job ready "$DETAIL; findings queued for resolve" findings; return 0 ;;
       lost)     JOB_LOST=1; jlog "$DETAIL; touching nothing on Gitea"; end_job; return 0 ;;
       fail)     finish_job fail "$DETAIL"; return 0 ;;
       requeue)  finish_job ready "$DETAIL; back in the queue, not a needs-human"; return 0 ;;

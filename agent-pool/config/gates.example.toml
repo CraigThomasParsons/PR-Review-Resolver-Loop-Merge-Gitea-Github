@@ -26,7 +26,10 @@ cpu     = "200%"   # cgroup CPUQuota
 budget  = 1200     # total seconds for all gates of one job
 
 # Dependencies are installed offline inside the sandbox, from a cache the controller warms
-# from the BASE branch's lockfile.
+# from the BASE branch's lockfile. Warming runs `warm` with network but no credentials, against
+# an export of the base commit, into $AGENT_POOL_STATE/gate-cache/<owner>_<name>/<name>/; it
+# re-runs only when this lockfile's base blob or this entry changes. To clear a cache, delete
+# that directory. A lockfile is protected like this file: a worker may not change it.
 [[deps]]
 name     = "client-npm"
 cwd      = "clientv2"
