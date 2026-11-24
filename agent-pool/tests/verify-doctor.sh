@@ -378,6 +378,15 @@ expect "a ready PR with a claim record in flight is not swept" "$(rq 'len(r["que
 expect "and keeps its label" "$(labels 8)" "agent:ready"
 reset
 addpr 8 '["agent:ready"]' "$(review_marker "$SHA_A" 2)"
+cat > "$STUB_GITEA.on-list" <<SH
+python3 "$CLAIMREC" claim --repo $R --pr 8 --worker w2 --provider claude --job review --deadline-secs 2700 >/dev/null
+SH
+doctor
+expect "a ready PR claimed during the listing is not swept" "$(rq 'len(r["queue"])')" "0"
+expect "and keeps its label" "$(labels 8)" "agent:ready"
+expect "with no escalation attempted" "$(w="$(writes)"; echo "${w:-none}")" "none"
+reset
+addpr 8 '["agent:ready"]' "$(review_marker "$SHA_A" 2)"
 echo '{"head_sha": "cccccccccccccccccccccccccccccccccccccccc"}' > "$STUB_GITEA.race"
 doctor
 expect "a head that moved before the escalation refuses it" "$(labels 8)" "agent:ready"
