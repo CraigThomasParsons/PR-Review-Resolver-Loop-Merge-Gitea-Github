@@ -841,9 +841,13 @@ expect_not "claude leaves \$ to its hook" "$(rules_of claude review)" 'Bash(*$*)
 expect "claude hook settings still run the policy hook" "$(python3 "$SCRIPTS/policy.py" hook-settings --job review --adapter "$AD_ABS" --worktree /wt --report /runs/r.md)" "policy.py"
 # Review G2 and L1: writes scoped per job, .git never writable.
 r="$(rules_of claude review)"
-expect "claude review may write its report by absolute path" "$r" $'allow\tWrite(//runs/r.md)'
+# Claude Code matches the Write tool against Edit(path) rules only (a path-scoped Write(path)
+# rule never matches), so the report must be allowed as Edit(<report>), not Write(<report>).
+expect "claude review may write its report by absolute path, as an Edit rule" "$r" $'allow\tEdit(//runs/r.md)'
+expect_not "claude review gets no never-matching Write(<report>) rule" "$r" $'allow\tWrite(//runs/r.md)'
 expect_not "claude review has no bare Write" "$r" $'allow\tWrite\n'
-expect_not "claude review cannot edit" "$r" $'allow\tEdit'
+expect_not "claude review cannot edit the worktree" "$r" $'allow\tEdit(//wt'
+expect_not "claude review has no bare Edit" "$r" $'allow\tEdit\n'
 r="$(rules_of claude resolve)"
 expect "claude resolve may edit the worktree" "$r" $'allow\tEdit(//wt/**)'
 expect "claude resolve may write the worktree" "$r" $'allow\tWrite(//wt/**)'

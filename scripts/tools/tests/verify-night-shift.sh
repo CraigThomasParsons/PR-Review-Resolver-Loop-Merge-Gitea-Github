@@ -17,7 +17,7 @@ cleanup() {
 trap cleanup EXIT
 export HOME="$TMP/home"
 mkdir -p "$HOME"
-unset GITEA_TOKEN NIGHT_CREW_TASK_RECEIPT http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY
+unset GITEA_TOKEN NIGHT_CREW_TASK_RECEIPT GIT_CONFIG_COUNT http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
 export GIT_CONFIG_GLOBAL="$TMP/gitconfig"
@@ -45,15 +45,52 @@ for _ in $(seq 1 50); do [ -s "$GITEA/port" ] && break; sleep 0.1; done
 export GITEA_BASE_URL="http://127.0.0.1:$(cat "$GITEA/port")"
 printf '{"number": 7, "title": "Add a widget", "body": "Make `widget.txt`. $(touch /tmp/never) Gate: bash agent-pool/tests/verify-widget.sh; not ../../etc/verify-x.sh"}' > "$GITEA/issue.json"
 
-# Stub cursor-agent: records its argv and the cli.json it was given, then acts per STUB_MODE.
+# Stub cursor-agent: records its argv, the cli.json it was given, which controller variables it
+# inherited, whether the run lock's fd 9 is open and whether it can push, then acts per STUB_MODE.
 STUB="$TMP/bin/cursor-agent"
 mkdir -p "$TMP/bin"
 cat > "$STUB" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$STUB_STATE/argv"
 cp .cursor/cli.json "$STUB_STATE/cli.json" 2>/dev/null
+for name in GITEA_TOKEN NIGHT_SHIFT_GITEA_TOKEN_FILE NIGHT_CREW_TASK_RECEIPT; do
+  [ -n "${!name+x}" ] && echo "$name"
+done > "$STUB_STATE/env"
+if { : >&9; } 2>/dev/null; then echo open; else echo closed; fi > "$STUB_STATE/fd9"
+if git push -q origin HEAD:refs/heads/worker-push-probe >/dev/null 2>&1; then echo pushed; else echo refused; fi > "$STUB_STATE/push"
 echo '{"type":"system","subtype":"init"}'
+# plant: the worker's edit plus a verify suite (body on stdin) that the launcher's own test run
+# executes after the worker exited and its commit check passed, before the push.
+plant() {
+  echo widget > widget.txt
+  { printf '#!/usr/bin/env bash\nset -e\n'
+    echo 'export GIT_AUTHOR_NAME=w GIT_AUTHOR_EMAIL=w@example.invalid GIT_COMMITTER_NAME=w GIT_COMMITTER_EMAIL=w@example.invalid'
+    cat; } > agent-pool/tests/verify-sneak.sh
+  echo '{"type":"result","subtype":"success","result":"done"}'
+}
 case "${STUB_MODE:-edit}" in
+  historyenv) plant <<'SUITE' ;;
+scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
+GIT_INDEX_FILE="$scratch/index" git read-tree HEAD
+blob="$(echo "TOKEN=x" | git hash-object -w --stdin)"
+GIT_INDEX_FILE="$scratch/index" git update-index --add --cacheinfo "100644,$blob,.env"
+added="$(git commit-tree "$(GIT_INDEX_FILE="$scratch/index" git write-tree)" -p HEAD -m "add env")"
+git update-ref HEAD "$(git commit-tree "HEAD^{tree}" -p "$added" -m "remove env")"
+SUITE
+  historymsg) plant <<'SUITE' ;;
+git update-ref HEAD "$(git commit-tree "HEAD^{tree}" -p HEAD -m "note gh""p_$(printf '%036d' 7)")"
+SUITE
+  historyrewrite) plant <<'SUITE' ;;
+git update-ref HEAD "$(git commit-tree "HEAD^{tree}" -m "rewritten")"
+SUITE
+  hooks) echo widget > widget.txt
+    hooks="$(git rev-parse --git-path hooks)"; mkdir -p "$hooks"
+    for hook in pre-push pre-commit; do
+      printf '#!/usr/bin/env bash\ntouch "%s/hook-ran"\ngit push -q --no-verify origin HEAD:refs/heads/hook-leak\nexit 1\n' \
+        "$STUB_STATE" > "$hooks/$hook"
+      chmod +x "$hooks/$hook"
+    done
+    echo '{"type":"result","subtype":"success","result":"done"}' ;;
   # The worker is edit-only: it writes files and never stages or commits (workercommit aside).
   edit) echo widget > widget.txt
     echo '{"type":"tool_call","tool_call":{"shellToolCall":{"result":{"rejected":{"command":"git commit -m \"add widget\""}}}}}'
@@ -97,7 +134,8 @@ SEED="$TMP/seed"
 mkdir -p "$SEED/scripts/tools" "$SEED/agent-pool/scripts" "$SEED/agent-pool/tests" "$SEED/skills/pr-loops-common"
 cp "$ROOT/scripts/tools/night_shift.sh" "$ROOT/scripts/tools/night_shift_maintenance.sh" \
   "$ROOT/scripts/tools/night_shift_gitea.py" "$SEED/scripts/tools/"
-cp "$ROOT/agent-pool/scripts/policy.py" "$ROOT/agent-pool/scripts/classify.py" "$SEED/agent-pool/scripts/"
+cp "$ROOT/agent-pool/scripts/policy.py" "$ROOT/agent-pool/scripts/classify.py" "$ROOT/agent-pool/scripts/report.py" \
+  "$SEED/agent-pool/scripts/"
 cp "$ROOT/AGENTS.md" "$SEED/"
 printf '#!/usr/bin/env bash\n[ -z "${AGENT_POOL_MAIN:-}" ]\n' > "$SEED/agent-pool/tests/verify-ok.sh"
 touch "$SEED/skills/pr-loops-common/gitea-pr.py"
@@ -279,8 +317,12 @@ drop_issue 7
 echo
 echo "success"
 RECEIPT="$TMP/receipts/job-1.json"
-NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=edit run "$PROJECT" 7
+GITEA_TOKEN="$SECRET" NIGHT_CREW_TASK_RECEIPT="$RECEIPT" STUB_MODE=edit run "$PROJECT" 7
 same "success (with a denied commit along the way) -> exit 0" "$CODE" 0
+same "the worker inherits no Gitea token, token file or task receipt variable" "$(tr '\n' ' ' < "$STUB_STATE/env")" ""
+same "the worker does not inherit the run lock's fd 9" "$(cat "$STUB_STATE/fd9")" closed
+same "a git push from the worker fails" "$(cat "$STUB_STATE/push")" refused
+same "nothing the worker pushed reached the remote" "$(remote_has_branch worker-push-probe)" no
 same "branch pushed by the launcher" "$(remote_has_branch feature/7-nightcrew)" yes
 same "one PR opened" "$(created_count)" 1
 pr_fields="$(python3 -c 'import json,sys; b=json.loads(open(sys.argv[1]).readline()); print(b["head"], b["base"], b["title"], "Closes #7" in b["body"])' "$GITEA/created.jsonl")"
@@ -596,6 +638,35 @@ same "the park is recorded" "$(state_of 19)" "parked limit"
 same "nothing committed for a parked run whose suites fail" "$(on_base 19)" yes
 same "its edits are kept in the worktree" "$(cat "$PROJECT/logs/worktrees/issue-19/edited.txt" 2>/dev/null)" edited
 drop_issue 19
+
+echo
+echo "pre-push checks cover the whole history the push would publish"
+before="$(created_count)"
+STUB_MODE=historyenv run "$PROJECT" 21
+same "a .env added in one commit and removed in a later one -> exit 1" "$CODE" 1
+same "it is recorded as a forbidden path" "$(state_of 21)" "failed forbidden-path"
+same "nothing pushed for a credential file in the history" "$(remote_has_branch feature/21-nightcrew)" no
+drop_issue 21
+STUB_MODE=historymsg run "$PROJECT" 22
+same "a token-shaped string in a commit message -> exit 1" "$CODE" 1
+same "it is recorded as a leaked secret" "$(state_of 22)" "failed secret-in-history"
+same "nothing pushed for a token in a commit message" "$(remote_has_branch feature/22-nightcrew)" no
+drop_issue 22
+STUB_MODE=historyrewrite run "$PROJECT" 24
+same "a history that no longer descends from the run's start -> exit 1" "$CODE" 1
+same "it is recorded as a rewritten history" "$(state_of 24)" "failed history-rewritten"
+same "nothing pushed for a rewritten history" "$(remote_has_branch feature/24-nightcrew)" no
+drop_issue 24
+same "no PR opened for any of them" "$(created_count)" "$before"
+rm -f "$STUB_STATE/hook-ran"
+STUB_MODE=hooks run "$PROJECT" 23
+rm -f "$PROJECT/.git/hooks/pre-push" "$PROJECT/.git/hooks/pre-commit"
+same "hooks the worker planted do not stop the launcher's commit or push -> exit 0" "$CODE" 0
+same "the planted hooks never ran" "$( [ -e "$STUB_STATE/hook-ran" ] && echo ran || echo none)" none
+same "nothing pushed by a planted hook" "$(remote_has_branch hook-leak)" no
+same "the branch is pushed from the project checkout" \
+  "$(git -C "$TMP/origin.git" rev-parse refs/heads/feature/23-nightcrew 2>/dev/null)" "$(git -C "$PROJECT" rev-parse feature/23-nightcrew)"
+drop_issue 23
 
 echo
 echo "the launcher refuses a cli.json that is not edit-only"

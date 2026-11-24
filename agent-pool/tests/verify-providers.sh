@@ -354,6 +354,16 @@ cat > "$BIN/stub-systemd-run" <<'SH'
 printf '%s\n' "$*" >> "@CALLS@/scope.log"
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
+# Same peel as verify-gates.sh's fake scope: not a cgroup, so don't publish the host's counters.
+if [ "${3:-}" = scope-guard ]; then
+  shift 3
+  events=""
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+    if [ "$1" = --events-out ]; then events=$2; shift 2; else shift; fi
+  done
+  shift
+  if [ -n "$events" ]; then printf '%s\n' '{"oom_kill": 0, "pids_max": 0}' > "$events"; fi
+fi
 exec "$@"
 SH
 cat > "$BIN/stub-bwrap" <<'PY'
@@ -499,7 +509,8 @@ expect_not "claude gets no python3 * allow" "$(calls claude)" "ARG Bash(python3 
 expect "claude is denied every push" "$(calls claude)" "ARG Bash(git push*)"
 expect "claude may write its report in the runs dir" "$(calls claude | tr '\n' ' ')" "ARG --add-dir ARG $TMP/state/runs"
 expect "claude runs the policy's PreToolUse hook" "$(calls claude)" '"PreToolUse"'
-expect "claude review writes are scoped to the report" "$(calls claude)" "ARG Write(/$TMP/state/runs/report-7-"
+expect "claude review writes are scoped to the report, via an Edit rule" "$(calls claude)" "ARG Edit(/$TMP/state/runs/report-7-"
+expect_not "claude gets no never-matching Write(<report>) rule" "$(calls claude)" "ARG Write(/$TMP/state/runs/report-7-"
 expect_not "claude review gets no bare Write" "$(calls claude)" $'ARG Write\n'
 expect "PROVIDER_ORDER unset means claude only; codex is never in the default" "$(ncalls cursor-agent)$(ncalls grok)$(ncalls agy)$(ncalls codex)" "0000"
 expect "the tick itself is a normal exit" "$TICK_RC" "0"
@@ -543,8 +554,11 @@ tick
 expect "the worker was told where to write its report" "$(calls claude)" "REPORT=$TMP/state/runs/report-7-"
 expect "the controller posted the report" "$(comments)" "## Automated review"
 expect "with the review marker for the head" "$(comments)" "pulse-review:v1 head=$SHA findings=2"
-expect "the claim flip, the comment and the release are the only writes" "$(writes | tr '\n' ' ')" \
-  "label 7 -agent:ready +agent:claimed comment 7 label 7 -agent:claimed +agent:ready"
+expect "the claim flip, the comment, the review result and the release are the only writes" "$(writes | tr '\n' ' ')" \
+  "label 7 -agent:ready +agent:claimed comment 7 label 7 -None +review:findings label 7 -agent:claimed +agent:ready"
+# Regression (FF #175/#180/#182/#183, PRR #69/#71/#72): a review with findings must leave
+# review:findings on the PR beside agent:ready, not agent:ready alone.
+expect "a review with findings is labelled review:findings" "$(labels)" "review:findings,agent:ready"
 expect "the session id is logged" "$(cat "$TMP/out.txt")" "session sess-claude"
 behave claude resolve-push
 tick
@@ -557,11 +571,20 @@ expect_not "the controller pushed its own commit of the worker's edits" "$newhea
 expect "as a fast-forward of the reviewed head" "$(git --git-dir "$ORIGIN" merge-base --is-ancestor "$SHA" "$newhead" && echo ff)" "ff"
 expect "and posted the resolve report" "$(comments)" "pulse-resolve:v1 head=$newhead reviewed=$SHA fixed=1"
 expect "a verified resolve is agent:done" "$(labels)" "agent:done"
+expect "and review:resolved, in place of review:findings" "$(labels)" "review:resolved,agent:done"
+expect_not "  ... review:findings is gone" "$(labels)" "review:findings"
 expect "the push is logged" "$(cat "$TMP/out.txt")" "pushed $SHA..$newhead to feature/x"
 reset '["agent:ready"]'
 behave claude clean
 tick
 expect "a clean review is agent:done" "$(labels)" "agent:done"
+expect "and review:clean" "$(labels)" "review:clean,agent:done"
+# A PR handed off by pr-loop.sh while it still carried review:requested (or a stale result):
+# the result label replaces both.
+reset '["agent:ready", "review:requested", "review:findings"]'
+behave claude clean
+tick
+expect "a clean review replaces review:requested and a stale review:findings" "$(labels)" "review:clean,agent:done"
 reset '["agent:ready"]'
 behave claude final-only
 tick
@@ -1154,6 +1177,7 @@ echo "pre-verify: already-done work is settled without a provider"
 reset '["agent:ready"]' '[]' "$CLEAN_MARKER"
 tick
 expect "a PR whose head already has a clean review is agent:done" "$(labels)" "agent:done"
+expect "  ... and review:clean" "$(labels)" "review:clean,agent:done"
 expect "without spawning a provider" "$(ncalls claude)" "0"
 RESOLVE_DONE="$(python3 -c 'import json,sys; s,r=sys.argv[1:]; print(json.dumps([
   {"id":1,"user":"bot","created_at":"","body":f"## Automated review\n1. x\n<!-- pulse-review:v1 head={s} findings=1 -->"},
@@ -1162,6 +1186,7 @@ reset '["agent:ready"]' '[]' "$RESOLVE_DONE"
 git --git-dir "$ORIGIN" update-ref refs/heads/feature/x "$RESOLVED"
 PROVIDER_ORDER=agy tick
 expect "G6: an already-verified resolve is settled even when no provider takes resolve jobs" "$(labels)" "agent:done"
+expect "G6: and review:resolved" "$(labels)" "review:resolved,agent:done"
 expect "G6: the log says why" "$(cat "$TMP/out.txt")" "already verified at $RESOLVED"
 expect_not "G6: it is not skipped for want of a resolve provider" "$(cat "$TMP/out.txt")" "no eligible provider takes resolve"
 expect "G6: and no provider ran" "$(ncalls agy)" "0"
