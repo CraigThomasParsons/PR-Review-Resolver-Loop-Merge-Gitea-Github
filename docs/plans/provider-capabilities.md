@@ -92,7 +92,7 @@ With controller-run gates (`docs/plans/controller-gates.md`) and controller-crea
 
 - **`plan` and `review`**:
   - Allowed shell: `git status`, `git diff`, `git log`, `git show` with vetted flags in `GIT_SPECS` (`agent-pool/scripts/policy.py`).
-  - Allowed native tools: `Read`, `Grep`, `Glob` scoped to `read_roots()` (`$JOB_WT` and the per-job run directory), plus `Write(<report>)`.
+  - Allowed native tools: `Read`, `Grep`, `Glob` scoped to `read_roots()` (`$JOB_WT` and the per-job run directory), plus write access to the report (`Edit(<report>)` for Claude, which matches the Write tool against `Edit` rules only; `Write(<report>)` elsewhere).
   - Denied: all `Edit`/`Write` inside `$JOB_WT`, all `git add`/`git commit`/`git push`.
 - **`test-author`**:
   - Everything in `review`, plus `Edit` and `Write` scoped specifically to the repo's `test_paths` globs inside `$JOB_WT` (enforced pre-execution in `policy.py`'s `write_allowed()` for Claude/Cursor hooks and allow-globs for Claude/Cursor/Grok, and post-execution by the controller's diff check in `publish()`).

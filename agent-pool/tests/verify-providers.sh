@@ -354,6 +354,16 @@ cat > "$BIN/stub-systemd-run" <<'SH'
 printf '%s\n' "$*" >> "@CALLS@/scope.log"
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
+# Same peel as verify-gates.sh's fake scope: not a cgroup, so don't publish the host's counters.
+if [ "${3:-}" = scope-guard ]; then
+  shift 3
+  events=""
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+    if [ "$1" = --events-out ]; then events=$2; shift 2; else shift; fi
+  done
+  shift
+  if [ -n "$events" ]; then printf '%s\n' '{"oom_kill": 0, "pids_max": 0}' > "$events"; fi
+fi
 exec "$@"
 SH
 cat > "$BIN/stub-bwrap" <<'PY'
@@ -499,7 +509,8 @@ expect_not "claude gets no python3 * allow" "$(calls claude)" "ARG Bash(python3 
 expect "claude is denied every push" "$(calls claude)" "ARG Bash(git push*)"
 expect "claude may write its report in the runs dir" "$(calls claude | tr '\n' ' ')" "ARG --add-dir ARG $TMP/state/runs"
 expect "claude runs the policy's PreToolUse hook" "$(calls claude)" '"PreToolUse"'
-expect "claude review writes are scoped to the report" "$(calls claude)" "ARG Write(/$TMP/state/runs/report-7-"
+expect "claude review writes are scoped to the report, via an Edit rule" "$(calls claude)" "ARG Edit(/$TMP/state/runs/report-7-"
+expect_not "claude gets no never-matching Write(<report>) rule" "$(calls claude)" "ARG Write(/$TMP/state/runs/report-7-"
 expect_not "claude review gets no bare Write" "$(calls claude)" $'ARG Write\n'
 expect "PROVIDER_ORDER unset means claude only; codex is never in the default" "$(ncalls cursor-agent)$(ncalls grok)$(ncalls agy)$(ncalls codex)" "0000"
 expect "the tick itself is a normal exit" "$TICK_RC" "0"
