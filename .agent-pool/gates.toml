@@ -1,0 +1,43 @@
+# Gates the agent pool runs on a resolve candidate before it pushes (docs/plans/controller-gates.md).
+# Each gate runs one justfile recipe in the gate sandbox. Measured there on cachyos-x8664
+# (2026-11-20): pool-core 29s, loops 44s, night-shift 19s, pool-gates 8s, pool-lease 82s,
+# pool-providers 266s; about 450s with every gate selected.
+version = 1
+protect = ["justfile"]
+
+[defaults]
+budget = 1200
+timeout = 300
+memory = "4G"
+
+# The catch-all: any change outside docs runs at least this.
+[[gate]]
+name = "pool-core"
+argv = ["just", "pool-core"]
+paths = ["**"]
+
+[[gate]]
+name = "pool-lease"
+argv = ["just", "pool-lease"]
+paths = ["agent-pool/**", "skills/pr-loops-common/**"]
+
+[[gate]]
+name = "pool-providers"
+argv = ["just", "pool-providers"]
+paths = ["agent-pool/**", "skills/pr-loops-common/**"]
+timeout = 600
+
+[[gate]]
+name = "pool-gates"
+argv = ["just", "pool-gates"]
+paths = ["agent-pool/**"]
+
+[[gate]]
+name = "loops"
+argv = ["just", "loops"]
+paths = ["skills/**"]
+
+[[gate]]
+name = "night-shift"
+argv = ["just", "night-shift"]
+paths = ["scripts/**"]

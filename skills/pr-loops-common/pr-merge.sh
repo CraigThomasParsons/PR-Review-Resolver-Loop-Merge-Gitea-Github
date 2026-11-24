@@ -109,6 +109,7 @@ fail_pr() { # pr reason; called only after a real claim
 }
 
 ACTIVE_PR=""
+MERGED=0
 cleanup_claim() {
   local rc=$?
   if [ -n "$ACTIVE_PR" ]; then
@@ -186,4 +187,16 @@ for row in "${CANDIDATES[@]}"; do
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   comment "$pr" "Automated merge completed: head=$sha style=$STYLE utc=$now" || log "warning: failed to comment on merged #$pr"
   log "#$pr merged head $sha into $BASE with style $STYLE"
+  MERGED=$((MERGED + 1))
 done
+
+# After a merge to the integration branch, bring every other open PR up to date with it
+# (pr-update.sh: merge, gate, push, review:requested; needs-human on red gates or a large
+# conflict). Its own lock, so the merge lock is released first. PR_UPDATE_AFTER_MERGE=0 turns
+# it off.
+if [ "$MERGED" -gt 0 ] && [ "${PR_UPDATE_AFTER_MERGE:-1}" != 0 ]; then
+  exec 9>&-
+  log "$MERGED PR(s) merged into $BASE; updating the other open PRs"
+  PR_UPDATE_BASE="$BASE" PR_LOOP_REPO="$REPO" "${PR_UPDATE_BIN:-$COMMON/pr-update.sh}" \
+    || log "warning: pr-update.sh exited $? for $REPO"
+fi

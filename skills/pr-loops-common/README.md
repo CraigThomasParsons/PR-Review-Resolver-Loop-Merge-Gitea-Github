@@ -6,6 +6,14 @@ no `SKILL.md` on purpose.
 
 - `pr-loop.sh review|resolve` one tick of the loop
 - `pr-merge.sh` one mechanical, opt-in merge tick (no model worker)
+- `pr-update.sh` after a merge to develop (pr-merge.sh calls it; also safe on a timer or by
+  hand), merges develop into every other open PR targeting develop, one at a time: a merge commit,
+  never a rebase; a small conflict goes to `pr-update-resolve.sh`; the repo's gate manifest runs
+  on the result; a plain push, never a force push; then `review:requested`. A red gate, a
+  conflict too large or a failed resolution is `review:needs-human` with nothing pushed. It never
+  merges a PR. `PR_UPDATE_AFTER_MERGE=0` turns the pr-merge.sh hook off
+- `pr-update-resolve.sh` the AI conflict resolver: claude, then cursor (`PR_UPDATE_PROVIDERS`),
+  under the agent pool's `policy.py` edit policy, skipping providers the pool has cooling down
 - `pr-trigger.sh` the event entry point, installed as `~/.local/bin/pr-trigger`: validates
   `--repo --pr --sha [--event] [--label]` and queues the PR (exit 0/2/3)
 - `pr-drain.sh` installed as `~/.local/bin/pr-drain`, run by `pr-trigger-drain.service`: takes

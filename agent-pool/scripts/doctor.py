@@ -247,7 +247,9 @@ class Doctor:
             return
         for pr, info in sorted(prs.items()):
             labels = info.get("labels", [])
-            if READY in labels and CLAIMED not in labels and pr not in records:
+            # records is a start-of-run snapshot; a prod tick may have claimed since.
+            if READY in labels and CLAIMED not in labels and pr not in records \
+                    and not (self.state / "claims" / f"{poolstate.slug(repo)}__{pr}.json").exists():
                 self.queued(repo, pr, info)
 
     def claim(self, repo: str, pr: int, doc: dict | None, info: dict | None, allowed: bool) -> None:
