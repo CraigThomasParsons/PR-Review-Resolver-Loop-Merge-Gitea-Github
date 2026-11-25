@@ -19,7 +19,8 @@ db_path = "~/Code/TheNightCrew/database/database.sqlite"
 # A claimed/running/parked job with no heartbeat for this long (or a lapsed lease) is stuck.
 stuck_after_minutes = 90
 # Failures older than this (UTC, "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS") are not asked about.
-# Set it on first install so the backlog of old failures does not arrive at once.
+# Left empty, it defaults to the first real (non-dry-run) tick, i.e. the day the service is
+# enabled, saved as watch_since in state.json: the backlog of older failures is skipped.
 ignore_failed_before = ""
 repos = []
 

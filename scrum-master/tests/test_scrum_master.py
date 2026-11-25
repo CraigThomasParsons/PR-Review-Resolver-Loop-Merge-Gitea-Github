@@ -261,7 +261,10 @@ craig_user_id = "{CRAIG}"
         self.assertEqual(len(comments), 1)
         body = comments[0]["body"]
         self.assertIn("> " + words, body)
-        self.assertTrue(body.splitlines()[1].startswith("@doctor Craig answered"))
+        lines = body.splitlines()
+        self.assertTrue(lines[1].startswith("**Relayed by Hermes Scrum Master** from Craig's Slack DM"))
+        self.assertIn("only the quoted words below are Craig's", lines[1])
+        self.assertTrue(lines[3].startswith("@doctor Craig answered"))
         self.assertIn(sm.MARKER, body)
         self.tick()
         self.tick()
@@ -340,6 +343,8 @@ craig_user_id = "{CRAIG}"
         ]
 
     def test_nightcrew_failed_and_stuck_jobs_are_asked_about(self) -> None:
+        self.config.write_text(self.config.read_text().replace(
+            "stuck_after_minutes = 60", 'stuck_after_minutes = 60\nignore_failed_before = "2026-11-01"'))
         self.db.unlink()
         make_nightcrew(self.db, self.nightcrew_rows())
         self.tick()
@@ -370,6 +375,25 @@ craig_user_id = "{CRAIG}"
         with self.assertRaises(sqlite3.OperationalError):
             conn.execute("UPDATE night_crew_jobs SET status = 'queued'")
         conn.close()
+
+    def test_failures_before_the_first_tick_are_skipped_by_default(self) -> None:
+        self.db.unlink()
+        rows = self.nightcrew_rows()[:1]
+        make_nightcrew(self.db, rows)
+        self.tick()
+        self.assertEqual(self.world.slack_posts, [], "the backlog from before enabling is skipped")
+        state = json.loads((self.tmp / "state" / "state.json").read_text())
+        self.assertEqual(state["watch_since"], "2026-11-17T08:26:40Z")
+        conn = sqlite3.connect(self.db)  # the test's own fixture, not the code under test
+        conn.execute("INSERT INTO night_crew_jobs (id, repo, kind, reference, status, attempt, "
+                     "last_failure_reason, last_failed_at) VALUES (87, 'ElasticGun/AMPB-API', "
+                     "'issue', '#23', 'failed', 1, 'exit_code_1', '2026-11-17 09:00:00')")
+        conn.commit()
+        conn.close()
+        os.environ["HSM_NOW"] = str(NOW + 3600)
+        self.tick()
+        self.assertEqual(len(self.world.slack_posts), 1)
+        self.assertIn("job 87", self.world.slack_posts[0]["text"])
 
     def test_ignore_failed_before_skips_old_failures(self) -> None:
         self.db.unlink()

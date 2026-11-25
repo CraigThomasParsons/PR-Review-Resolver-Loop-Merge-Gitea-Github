@@ -64,9 +64,13 @@ Nothing in this repo installs, enables or starts it.
    install it to the workspace and put the bot token (`xoxb-...`) in
    `~/.config/hermes-scrum-master/slack_bot_token` (`chmod 600`).
 2. `mkdir -p ~/.config/hermes-scrum-master` and copy `config/config.example.toml` to
-   `~/.config/hermes-scrum-master/config.toml`. Check `craig_user_id`, and set
-   `ignore_failed_before` so old NightCrew failures do not all arrive at once.
-   The Gitea token defaults to `~/.config/pulse/gitea_token`, the one the PR loops use.
+   `~/.config/hermes-scrum-master/config.toml`. Check `craig_user_id`. Leave
+   `ignore_failed_before` empty: NightCrew failures from before the first real tick (the day
+   the service is enabled) are then skipped, so the old backlog never arrives. That time is
+   saved as `watch_since` in `state.json`; set `ignore_failed_before` only to pick another date.
+   The Gitea token defaults to `~/.config/pulse/gitea_token`, the one the PR loops use, so
+   relayed answers post as that account (`craigpars`). Each one opens with a
+   **Relayed by Hermes Scrum Master** header so it is not mistaken for Craig typing in Gitea.
 3. Check it, then see what it would ask without sending anything:
    ```bash
    python3 scrum-master/scrum_master.py check

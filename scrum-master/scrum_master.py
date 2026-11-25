@@ -381,7 +381,7 @@ JOB_COLUMNS = ("id", "repo", "kind", "reference", "status", "attempt", "consecut
                "resets_at", "payload", "updated_at")
 
 
-def nightcrew_items(cfg: dict[str, Any], at: float) -> list[dict[str, Any]]:
+def nightcrew_items(cfg: dict[str, Any], at: float, watch_since: float | None = None) -> list[dict[str, Any]]:
     nc = cfg["nightcrew"]
     conn = open_nightcrew(expand(nc["db_path"]))
     try:
@@ -395,7 +395,9 @@ def nightcrew_items(cfg: dict[str, Any], at: float) -> list[dict[str, Any]]:
     finally:
         conn.close()
     stuck_after = float(nc["stuck_after_minutes"]) * 60
-    cutoff = parse_db_time(nc.get("ignore_failed_before") or "")
+    # An explicit ignore_failed_before wins; otherwise failures from before the first real tick
+    # (the day the service was enabled) are the backlog, and are not asked about.
+    cutoff = parse_db_time(nc.get("ignore_failed_before") or "") or watch_since
     repos = nc.get("repos") or []
     out = []
     for row in rows:
@@ -567,6 +569,9 @@ def relay_body(item: dict[str, Any], answer: str, answered_at: float) -> str:
                             item["options"] + ["Something else (own words)."]))
     return "\n".join([
         f"<!-- {MARKER} key={item['key']} fp={item['fingerprint']} slack_ts={item['answer_ts']} -->",
+        "**Relayed by Hermes Scrum Master** from Craig's Slack DM. The bot posts this under "
+        "this Gitea account; only the quoted words below are Craig's.",
+        "",
         f"{head}Craig answered in his Slack DM at {et_label(answered_at)}, word for word:",
         "",
         quoted,
@@ -575,8 +580,7 @@ def relay_body(item: dict[str, Any], answer: str, answered_at: float) -> str:
         "",
         options,
         "",
-        "_Relayed by Hermes Scrum Master. Only the quoted words are Craig's; the relay "
-        "itself has taken no action._",
+        "_The relay itself has taken no action._",
     ])
 
 
@@ -637,7 +641,10 @@ class Tick:
             self.errors.append(f"gitea: {error}")
         if self.cfg["nightcrew"].get("enabled", True):
             try:
-                for job in nightcrew_items(self.cfg, self.at):
+                since = self.state.setdefault("watch_since", iso(self.at))
+                watch_since = dt.datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=dt.timezone.utc).timestamp()
+                for job in nightcrew_items(self.cfg, self.at, watch_since):
                     items.append(job_item(job, self.gitea, self.cfg))
             except (RuntimeError, sqlite3.Error) as error:
                 self.errors.append(f"nightcrew: {error}")
