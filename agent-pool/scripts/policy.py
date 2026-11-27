@@ -403,6 +403,12 @@ def git_paths(a: argparse.Namespace) -> list[str]:
     return [f"{wt}/.git", f"{wt}/.git/**", "**/.git/**"]
 
 
+def tool_config_write_paths(wt: str) -> list[str]:
+    """Absolute Write targets that must stay denied under Write(<worktree>/**)."""
+    wt = wt.rstrip("/")
+    return [f"{wt}/.cursor", f"{wt}/.cursor/**", f"{wt}/.claude/**", f"{wt}/.grok/**"]
+
+
 def read_roots(a: argparse.Namespace) -> list[str]:
     return [x for x in (a.worktree.rstrip("/"), os.path.dirname(a.report).rstrip("/")) if x]
 
@@ -436,6 +442,8 @@ def rules(a: argparse.Namespace) -> tuple[list[str], list[str]]:
         allow_rules = [f"Read({r}/**)" for r in read_roots(a)] + [f"Write({a.report})"] + ([f"Write({wt}/**)"] if a.job in WRITING_JOBS else [])
         denies = [f"Shell({p})" for p in cursor_deny(a)]
         denies += [f"Write({p})" for p in git_paths(a)] + [f"Read({p})" for p in credential_globs()]
+        if a.job in WRITING_JOBS:
+            denies += [f"Write({p})" for p in tool_config_write_paths(wt)]
         return allow_rules + [f"Shell({p})" for p in dict.fromkeys(prefixes)], denies
     raise SystemExit(f"policy: no rule translation for provider {a.provider}")
 

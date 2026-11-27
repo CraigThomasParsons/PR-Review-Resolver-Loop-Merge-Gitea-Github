@@ -322,6 +322,18 @@ PY
 )"
 same "cli.json: project adapter; tests and issue-named gates allowed; push, commit, add, credential reads, ../ paths denied" \
   "$cli" "True True True True False True"
+token_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$TOKEN_FILE")"
+tool_cfg="$(python3 - "$STUB_STATE/cli.json" "$PROJECT/logs/worktrees/issue-7" "$token_real" <<'PY'
+import json, sys
+deny = json.load(open(sys.argv[1]))["permissions"]["deny"]
+wt, token = sys.argv[2], sys.argv[3]
+needed = [f"Write({wt}/.cursor)", f"Write({wt}/.cursor/**)", f"Write({wt}/.claude/**)",
+          f"Write({wt}/.grok/**)", f"Read({token})"]
+print(" ".join("yes" if r in deny else "no:"+r for r in needed))
+PY
+)"
+same "cli.json denies Write on .cursor/.claude/.grok and Read on NIGHT_SHIFT_GITEA_TOKEN_FILE" \
+  "$tool_cfg" "yes yes yes yes yes"
 # Effective decision, as Cursor applies it: allowed only when an allow prefix matches and no deny
 # prefix does. Checked under both readings of "prefix" (whole tokens, and plain string), since
 # a test command a deny rule shadows would leave the worker unable to run its gate.

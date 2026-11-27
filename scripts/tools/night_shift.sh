@@ -230,6 +230,15 @@ allow += [f"Shell({command})" for command in dict.fromkeys(tests) if f"Shell({co
 deny = [rule for rule in config["permissions"]["deny"] if rule not in ("Shell(bash)", "Shell(python3 -)")]
 deny += [rule for rule in ("Shell(bash -)", "Shell(bash -c)", "Shell(bash -s)", "Shell(python3 -c)")
          if rule not in deny]
+# Write(<worktree>/**) would otherwise let the worker rewrite .cursor/cli.json (and plant
+# .claude/.grok tool configs); a custom NIGHT_SHIFT_GITEA_TOKEN_FILE is outside the standard
+# credential globs, so deny its real path when set.
+extra_deny = [f"Write({worktree}/.cursor)", f"Write({worktree}/.cursor/**)",
+              f"Write({worktree}/.claude/**)", f"Write({worktree}/.grok/**)"]
+token_file = os.environ.get("NIGHT_SHIFT_GITEA_TOKEN_FILE", "").strip()
+if token_file:
+    extra_deny.append(f"Read({os.path.realpath(token_file)})")
+deny += [rule for rule in extra_deny if rule not in deny]
 config["permissions"]["deny"] = deny
 granted = [rule for rule in allow if re.match(r"Shell\(git (add|commit|push)\b", rule)]
 missing = [rule for rule in ("Shell(git add)", "Shell(git commit)", "Shell(git push)") if rule not in deny]
